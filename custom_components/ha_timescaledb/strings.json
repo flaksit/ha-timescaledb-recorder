@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to TimescaleDB",
+        "data": {
+          "dsn": "PostgreSQL connection string (DSN)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to TimescaleDB"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "TimescaleDB Options",
+        "data": {
+          "batch_size": "Batch size",
+          "flush_interval": "Flush interval (seconds)",
+          "compress_after_days": "Compress after (days)",
+          "ingest_unavailable": "Ingest unavailable states"
+        }
+      }
+    }
+  }
+}

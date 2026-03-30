@@ -7,7 +7,6 @@ import asyncpg
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entityfilter import (
-    INCLUDE_EXCLUDE_BASE_FILTER_SCHEMA,
     convert_filter,
     convert_include_exclude_filter,
 )
@@ -27,8 +26,6 @@ from .ingester import StateIngester
 from .schema import async_setup_schema
 
 _LOGGER = logging.getLogger(__name__)
-
-PLATFORM_SCHEMA = INCLUDE_EXCLUDE_BASE_FILTER_SCHEMA
 
 
 @dataclass
@@ -54,6 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
         max_inactive_connection_lifetime=300.0,
         max_queries=50_000,
         command_timeout=30.0,
+        ssl=False,
     )
 
     compress_after_days = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_DAYS)

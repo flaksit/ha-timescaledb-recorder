@@ -1,4 +1,5 @@
 """StateIngester: buffered batch writer for TimescaleDB."""
+import json
 import logging
 from datetime import timedelta
 
@@ -69,7 +70,7 @@ class StateIngester:
         self._buffer.append((
             entity_id,
             state,
-            dict(new_state.attributes),
+            json.dumps(dict(new_state.attributes), default=str),
             new_state.last_updated,
             new_state.last_changed,
         ))
@@ -93,9 +94,11 @@ class StateIngester:
             self._pool.expire_connections()
             self._buffer.extend(rows)
             _LOGGER.warning("Connection error during flush; %d rows re-queued", len(rows))
-        except asyncpg.PostgresError:
+        except asyncpg.PostgresError as err:
             # Bad SQL or other PG error — drop batch to avoid retrying corrupt data
-            _LOGGER.error("PostgresError during flush; %d rows dropped", len(rows))
+            _LOGGER.error("PostgresError during flush; %d rows dropped: %s", len(rows), err)
+            if rows:
+                _LOGGER.debug("First failed row: %r", rows[0])
 
     async def _async_flush_timer(self, _now) -> None:
         """Timer-triggered flush — only flushes if buffer is non-empty."""

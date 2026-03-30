@@ -52,7 +52,10 @@ Click **Configure** next to the integration entry to adjust:
 |--------|---------|-------------|
 | `batch_size` | 200 | Number of state rows buffered before a forced flush |
 | `flush_interval` | 10 | Seconds between timer-triggered flushes |
-| `compress_after_days` | 7 | Age threshold before chunks are compressed (passed to the compression policy) |
+| `chunk_interval_days` | 7 | Days per hypertable chunk (only affects new chunks) |
+| `compress_after_days` | 7 | Age threshold before chunks are compressed |
+
+Options take effect immediately — the integration reloads automatically when you save.
 
 ### Entity Filtering
 

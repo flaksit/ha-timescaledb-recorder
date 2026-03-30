@@ -13,6 +13,7 @@ from homeassistant.helpers.entityfilter import (
 
 from .const import (
     CONF_BATCH_SIZE,
+    CONF_CHUNK_INTERVAL,
     CONF_COMPRESS_AFTER,
     CONF_DSN,
     CONF_FLUSH_INTERVAL,
@@ -38,6 +39,21 @@ class HaTimescaleDBData:
 HaTimescaleDBConfigEntry = ConfigEntry[HaTimescaleDBData]
 
 
+def _get_entity_filter(entry):
+    """Build entity filter from config entry data."""
+    raw_filter = entry.data.get("filter", {})
+    if raw_filter:
+        return convert_include_exclude_filter(raw_filter)
+    return convert_filter({
+        "include_domains": [],
+        "include_entity_globs": [],
+        "include_entities": [],
+        "exclude_domains": [],
+        "exclude_entity_globs": [],
+        "exclude_entities": [],
+    })
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:
     """Set up the TimescaleDB integration from a config entry."""
     dsn = entry.data[CONF_DSN]
@@ -53,23 +69,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
         ssl=False,
     )
 
+    chunk_interval_days = options.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS)
     compress_after_days = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_DAYS)
     await async_setup_schema(
         pool,
-        chunk_interval_days=DEFAULT_CHUNK_INTERVAL_DAYS,
+        chunk_interval_days=chunk_interval_days,
         compress_after_days=compress_after_days,
     )
 
-    raw_filter = entry.data.get("filter", {})
-    entity_filter = convert_include_exclude_filter(raw_filter) if raw_filter else convert_filter({
-        "include_domains": [],
-        "include_entity_globs": [],
-        "include_entities": [],
-        "exclude_domains": [],
-        "exclude_entity_globs": [],
-        "exclude_entities": [],
-    })
-
+    entity_filter = _get_entity_filter(entry)
     batch_size = options.get(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE)
     flush_interval = options.get(CONF_FLUSH_INTERVAL, DEFAULT_FLUSH_INTERVAL)
 
@@ -83,7 +91,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
     ingester.async_start()
 
     entry.runtime_data = HaTimescaleDBData(ingester=ingester, pool=pool)
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> None:
+    """Restart the ingester when options change (applies new values immediately)."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:

@@ -13,6 +13,7 @@ CONF_DSN = "dsn"
 CONF_BATCH_SIZE = "batch_size"
 CONF_FLUSH_INTERVAL = "flush_interval"
 CONF_COMPRESS_AFTER = "compress_after_days"
+CONF_CHUNK_INTERVAL = "chunk_interval_days"
 
 TABLE_NAME = "ha_states"
 

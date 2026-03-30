@@ -3,14 +3,15 @@ import asyncpg
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.helpers import selector
 
 from .const import (
     CONF_BATCH_SIZE,
+    CONF_CHUNK_INTERVAL,
     CONF_COMPRESS_AFTER,
     CONF_DSN,
     CONF_FLUSH_INTERVAL,
     DEFAULT_BATCH_SIZE,
+    DEFAULT_CHUNK_INTERVAL_DAYS,
     DEFAULT_COMPRESS_AFTER_DAYS,
     DEFAULT_FLUSH_INTERVAL,
     DOMAIN,
@@ -75,6 +76,10 @@ class TimescaleDBOptionsFlow(config_entries.OptionsFlow):
                 CONF_FLUSH_INTERVAL,
                 default=current.get(CONF_FLUSH_INTERVAL, DEFAULT_FLUSH_INTERVAL),
             ): vol.All(int, vol.Range(min=1, max=300)),
+            vol.Optional(
+                CONF_CHUNK_INTERVAL,
+                default=current.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS),
+            ): vol.All(int, vol.Range(min=1, max=365)),
             vol.Optional(
                 CONF_COMPRESS_AFTER,
                 default=current.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_DAYS),

@@ -1,5 +1,5 @@
 [project]
-name = "ha-integration-timescaledb"
+name = "ha-timescaledb-recorder"
 version = "0.1.0"
 requires-python = ">=3.14.2"
 

@@ -23,7 +23,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 
 1. Open HACS in your Home Assistant UI
 2. Go to **Integrations** and click the three-dot menu in the top-right corner
-3. Select **Custom repositories**, paste `https://github.com/flaksit/ha-integration-timescaledb`, choose category **Integration**, and click **Add**
+3. Select **Custom repositories**, paste `https://github.com/flaksit/ha-timescaledb-recorder`, choose category **Integration**, and click **Add**
 4. Search for "TimescaleDB Recorder" and click **Install**
 5. Restart Home Assistant
 

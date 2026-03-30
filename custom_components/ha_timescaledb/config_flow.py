@@ -1,4 +1,4 @@
-"""Config flow and options flow for TimescaleDB State Ingestion."""
+"""Config flow and options flow for TimescaleDB Recorder."""
 import asyncpg
 import voluptuous as vol
 

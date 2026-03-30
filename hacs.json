@@ -1,5 +1,5 @@
 {
-  "name": "TimescaleDB State Ingestion",
+  "name": "TimescaleDB Recorder",
   "content_in_root": false,
   "render_readme": true
 }

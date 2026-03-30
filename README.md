@@ -1,4 +1,4 @@
-# TimescaleDB State Ingestion for Home Assistant
+# TimescaleDB Recorder for Home Assistant
 
 A custom integration that writes Home Assistant entity state changes to a TimescaleDB hypertable for long-term analytics. Every state change on the HA event bus is buffered in memory and flushed in batches to PostgreSQL, giving you a fully queryable time-series record of your home with better performance and storage efficiency than the built-in recorder.
 
@@ -24,7 +24,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 1. Open HACS in your Home Assistant UI
 2. Go to **Integrations** and click the three-dot menu in the top-right corner
 3. Select **Custom repositories**, paste `https://github.com/flaksit/ha-integration-timescaledb`, choose category **Integration**, and click **Add**
-4. Search for "TimescaleDB State Ingestion" and click **Install**
+4. Search for "TimescaleDB Recorder" and click **Install**
 5. Restart Home Assistant
 
 ### Manual

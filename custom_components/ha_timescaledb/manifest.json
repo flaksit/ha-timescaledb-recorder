@@ -1,6 +1,6 @@
 {
   "domain": "ha_timescaledb",
-  "name": "TimescaleDB State Ingestion",
+  "name": "TimescaleDB Recorder",
   "version": "0.1.0",
   "documentation": "https://github.com/flaksit/ha-integration-timescaledb",
   "issue_tracker": "https://github.com/flaksit/ha-integration-timescaledb/issues",

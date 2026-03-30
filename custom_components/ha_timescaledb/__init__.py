@@ -1,4 +1,4 @@
-"""TimescaleDB State Ingestion custom component for Home Assistant."""
+"""TimescaleDB Recorder custom component for Home Assistant."""
 from dataclasses import dataclass
 import logging
 

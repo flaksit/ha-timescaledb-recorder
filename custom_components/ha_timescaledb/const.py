@@ -1,4 +1,4 @@
-"""Constants for the TimescaleDB State Ingestion integration."""
+"""Constants for the TimescaleDB Recorder integration."""
 
 DOMAIN = "ha_timescaledb"
 

@@ -13,8 +13,6 @@ from .const import DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL, INSERT_SQL
 
 _LOGGER = logging.getLogger(__name__)
 
-_SKIP_STATES = frozenset({"unavailable", "unknown"})
-
 
 class StateIngester:
     """Buffer state changes and flush them to TimescaleDB in batches."""
@@ -26,14 +24,12 @@ class StateIngester:
         entity_filter: EntityFilter,
         batch_size: int = DEFAULT_BATCH_SIZE,
         flush_interval: int = DEFAULT_FLUSH_INTERVAL,
-        ingest_unavailable: bool = False,
     ) -> None:
         self._hass = hass
         self._pool = pool
         self._entity_filter = entity_filter
         self._batch_size = batch_size
         self._flush_interval = flush_interval
-        self._ingest_unavailable = ingest_unavailable
         self._buffer: list[tuple] = []
         self._cancel_listener = None
         self._cancel_timer = None
@@ -59,17 +55,13 @@ class StateIngester:
         if new_state is None:
             return
 
-        state = new_state.state
-        if not self._ingest_unavailable and state in _SKIP_STATES:
-            return
-
         entity_id = new_state.entity_id
         if not self._entity_filter(entity_id):
             return
 
         self._buffer.append((
             entity_id,
-            state,
+            new_state.state,
             json.dumps(dict(new_state.attributes), default=str),
             new_state.last_updated,
             new_state.last_changed,

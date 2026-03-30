@@ -22,14 +22,12 @@
         "data": {
           "batch_size": "Batch size",
           "flush_interval": "Flush interval",
-          "compress_after_days": "Compress after",
-          "ingest_unavailable": "Record unavailable states"
+          "compress_after_days": "Compress after"
         },
         "data_description": {
           "batch_size": "Number of state changes to buffer before writing to the database. Higher values reduce write frequency but increase memory use.",
           "flush_interval": "Maximum seconds between database writes, even if the batch is not full.",
-          "compress_after_days": "Days before a hypertable chunk is compressed. Compressed chunks are read-only. Must be at least the chunk interval (7 days).",
-          "ingest_unavailable": "When disabled, 'unavailable' and 'unknown' states are skipped. Enable to track device connectivity and uptime."
+          "compress_after_days": "Days before a hypertable chunk is compressed. Compressed chunks are read-only. Must be at least the chunk interval (7 days)."
         }
       }
     }

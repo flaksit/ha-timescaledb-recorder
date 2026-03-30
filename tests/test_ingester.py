@@ -66,7 +66,6 @@ def ingester(hass, mock_pool, entity_filter):
         entity_filter=entity_filter,
         batch_size=3,
         flush_interval=DEFAULT_FLUSH_INTERVAL,
-        ingest_unavailable=False,
     )
 
 
@@ -87,30 +86,20 @@ def test_skip_none_new_state(ingester):
     assert len(ingester._buffer) == 0
 
 
-def test_skip_unavailable(ingester):
+def test_records_unavailable(ingester):
+    """Unavailable states are recorded — unlike the HA recorder, no data gaps."""
     event = _make_state_event("sensor.temp", "unavailable")
     ingester._handle_state_changed(event)
-    assert len(ingester._buffer) == 0
+    assert len(ingester._buffer) == 1
+    assert ingester._buffer[0][1] == "unavailable"
 
 
-def test_skip_unknown(ingester):
+def test_records_unknown(ingester):
+    """Unknown states are recorded — unlike the HA recorder, no data gaps."""
     event = _make_state_event("sensor.temp", "unknown")
     ingester._handle_state_changed(event)
-    assert len(ingester._buffer) == 0
-
-
-def test_ingest_unavailable_when_enabled(hass, mock_pool, entity_filter):
-    ing = StateIngester(
-        hass=hass,
-        pool=mock_pool,
-        entity_filter=entity_filter,
-        batch_size=3,
-        flush_interval=DEFAULT_FLUSH_INTERVAL,
-        ingest_unavailable=True,
-    )
-    event = _make_state_event("sensor.temp", "unavailable")
-    ing._handle_state_changed(event)
-    assert len(ing._buffer) == 1
+    assert len(ingester._buffer) == 1
+    assert ingester._buffer[0][1] == "unknown"
 
 
 def test_skip_excluded_entity(hass, mock_pool):
@@ -121,7 +110,6 @@ def test_skip_excluded_entity(hass, mock_pool):
         entity_filter=ef,
         batch_size=3,
         flush_interval=DEFAULT_FLUSH_INTERVAL,
-        ingest_unavailable=False,
     )
     event = _make_state_event("light.kitchen", "on")
     ing._handle_state_changed(event)
@@ -136,7 +124,6 @@ def test_include_filter(hass, mock_pool):
         entity_filter=ef,
         batch_size=5,
         flush_interval=DEFAULT_FLUSH_INTERVAL,
-        ingest_unavailable=False,
     )
     ing._handle_state_changed(_make_state_event("sensor.temp", "22"))
     ing._handle_state_changed(_make_state_event("light.kitchen", "on"))
@@ -151,7 +138,6 @@ def test_batch_flush_on_size(hass, mock_pool, entity_filter):
         entity_filter=entity_filter,
         batch_size=3,
         flush_interval=DEFAULT_FLUSH_INTERVAL,
-        ingest_unavailable=False,
     )
     for i in range(3):
         ing._handle_state_changed(_make_state_event(f"sensor.s{i}", "1"))

@@ -10,7 +10,6 @@ from .const import (
     CONF_COMPRESS_AFTER,
     CONF_DSN,
     CONF_FLUSH_INTERVAL,
-    CONF_INGEST_UNAVAILABLE,
     DEFAULT_BATCH_SIZE,
     DEFAULT_COMPRESS_AFTER_DAYS,
     DEFAULT_FLUSH_INTERVAL,
@@ -80,9 +79,5 @@ class TimescaleDBOptionsFlow(config_entries.OptionsFlow):
                 CONF_COMPRESS_AFTER,
                 default=current.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_DAYS),
             ): vol.All(int, vol.Range(min=1, max=365)),
-            vol.Optional(
-                CONF_INGEST_UNAVAILABLE,
-                default=current.get(CONF_INGEST_UNAVAILABLE, False),
-            ): bool,
         })
         return self.async_show_form(step_id="init", data_schema=schema)

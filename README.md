@@ -52,8 +52,7 @@ Click **Configure** next to the integration entry to adjust:
 |--------|---------|-------------|
 | `batch_size` | 200 | Number of state rows buffered before a forced flush |
 | `flush_interval` | 10 | Seconds between timer-triggered flushes |
-| `compress_after_days` | 14 | Age threshold before chunks are compressed (passed to the compression policy) |
-| `ingest_unavailable` | false | When true, states with value `unavailable` are also written |
+| `compress_after_days` | 7 | Age threshold before chunks are compressed (passed to the compression policy) |
 
 ### Entity Filtering
 
@@ -93,7 +92,7 @@ CREATE TABLE IF NOT EXISTS ha_states (
 
 **Hypertable partitioning** — chunks are 7 days wide (default), partitioned on `last_updated`.
 
-**Compression** — segments by `entity_id`, ordered by `last_updated DESC`. Chunks older than `compress_after_days` (default 14) are compressed automatically by the background policy.
+**Compression** — segments by `entity_id`, ordered by `last_updated DESC`. Chunks older than `compress_after_days` (default 7, matching the chunk interval) are compressed automatically by the background policy.
 
 **Index** — `idx_ha_states_entity_time ON ha_states (entity_id, last_updated DESC)` for fast per-entity time-series lookups.
 
@@ -140,6 +139,16 @@ SELECT *
 FROM timescaledb_information.compression_settings
 WHERE hypertable_name = 'ha_states';
 ```
+
+## Differences from the built-in recorder
+
+### Unavailable and unknown states are always recorded
+
+The built-in HA recorder skips `unavailable` and `unknown` states to save SQLite storage. This integration records them because they carry meaningful information: an "unavailable" reading means the sensor was offline, which is fundamentally different from "the value stayed the same." Omitting these states creates a false impression of continuity in the time series and makes it impossible to accurately track device reliability or uptime.
+
+### Entity filtering is additive, not a replacement
+
+Entity filtering works the same way (same include/exclude syntax), but this integration runs alongside the built-in recorder — it does not replace it. Both can have independent filter configurations.
 
 ## Troubleshooting
 

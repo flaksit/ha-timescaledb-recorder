@@ -40,10 +40,10 @@ async def test_custom_compress_after(mock_pool, mock_conn):
 
 
 async def test_default_values(mock_pool, mock_conn):
-    """Default chunk interval (7 days) and compress after (14 days) are applied."""
+    """Default chunk interval (7 days) and compress after (7 days) are applied."""
     await async_setup_schema(mock_pool)
 
     calls = [call.args[0] for call in mock_conn.execute.call_args_list]
 
     assert "7 days" in calls[1]
-    assert "14 days" in calls[3]
+    assert "7 days" in calls[3]

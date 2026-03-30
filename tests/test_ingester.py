@@ -1,4 +1,5 @@
 """Unit tests for StateIngester."""
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
 
@@ -76,7 +77,7 @@ def test_buffer_appends_state(ingester):
     row = ingester._buffer[0]
     assert row[0] == "sensor.temp"
     assert row[1] == "21.5"
-    assert row[2] == {"unit_of_measurement": "°C"}
+    assert json.loads(row[2]) == {"unit_of_measurement": "°C"}
 
 
 def test_skip_none_new_state(ingester):
@@ -194,7 +195,7 @@ async def test_jsonb_attributes_passed(ingester, mock_conn):
     await ingester._async_flush()
     call_args = mock_conn.executemany.call_args
     rows = call_args[0][1]
-    assert rows[0][2] == attrs
+    assert json.loads(rows[0][2]) == attrs
 
 
 async def test_connection_error_requeues(ingester, mock_conn, mock_pool):
@@ -207,7 +208,7 @@ async def test_connection_error_requeues(ingester, mock_conn, mock_pool):
 
 
 async def test_postgres_error_drops_batch(ingester, mock_conn):
-    mock_conn.executemany.side_effect = asyncpg.PostgresError()
+    mock_conn.executemany.side_effect = asyncpg.PostgresError("test error")
     ingester._handle_state_changed(_make_state_event("sensor.temp", "22"))
     await ingester._async_flush()
     assert len(ingester._buffer) == 0

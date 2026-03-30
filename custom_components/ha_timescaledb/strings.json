@@ -5,22 +5,31 @@
         "title": "Connect to TimescaleDB",
         "data": {
           "dsn": "PostgreSQL connection string (DSN)"
+        },
+        "data_description": {
+          "dsn": "Example: postgresql://homeassistant:password@hostname:5432/homeassistant"
         }
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to TimescaleDB"
+      "cannot_connect": "Failed to connect to TimescaleDB. Check the DSN, ensure the database is running, and verify the user has CREATE TABLE privileges."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "TimescaleDB Options",
+        "title": "TimescaleDB Recorder",
         "data": {
           "batch_size": "Batch size",
-          "flush_interval": "Flush interval (seconds)",
-          "compress_after_days": "Compress after (days)",
-          "ingest_unavailable": "Ingest unavailable states"
+          "flush_interval": "Flush interval",
+          "compress_after_days": "Compress after",
+          "ingest_unavailable": "Record unavailable states"
+        },
+        "data_description": {
+          "batch_size": "Number of state changes to buffer before writing to the database. Higher values reduce write frequency but increase memory use.",
+          "flush_interval": "Maximum seconds between database writes, even if the batch is not full.",
+          "compress_after_days": "Days before a hypertable chunk is compressed. Compressed chunks are read-only. Must be at least the chunk interval (7 days).",
+          "ingest_unavailable": "When disabled, 'unavailable' and 'unknown' states are skipped. Enable to track device connectivity and uptime."
         }
       }
     }

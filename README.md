@@ -145,13 +145,9 @@ WHERE hypertable_name = 'ha_states';
 
 ## Differences from the built-in recorder
 
-### Unavailable and unknown states are always recorded
+### Runs alongside the recorder, not a replacement
 
-The built-in HA recorder skips `unavailable` and `unknown` states to save SQLite storage. This integration records them because they carry meaningful information: an "unavailable" reading means the sensor was offline, which is fundamentally different from "the value stayed the same." Omitting these states creates a false impression of continuity in the time series and makes it impossible to accurately track device reliability or uptime.
-
-### Entity filtering is additive, not a replacement
-
-Entity filtering works the same way (same include/exclude syntax), but this integration runs alongside the built-in recorder — it does not replace it. Both can have independent filter configurations.
+This integration runs alongside the built-in recorder — it does not replace it. Both can have independent entity filter configurations.
 
 ## Troubleshooting
 

@@ -1,4 +1,4 @@
-"""Shared test fixtures for ha_timescaledb tests."""
+"""Shared test fixtures for ha_timescaledb_recorder tests."""
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 

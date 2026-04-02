@@ -24,6 +24,7 @@ from .const import (
 )
 from .ingester import StateIngester
 from .schema import async_setup_schema
+from .syncer import MetadataSyncer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class HaTimescaleDBData:
     """Runtime data stored on a config entry."""
 
     ingester: StateIngester
+    syncer: MetadataSyncer
     pool: asyncpg.Pool
 
 
@@ -90,7 +92,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
     )
     ingester.async_start()
 
-    entry.runtime_data = HaTimescaleDBData(ingester=ingester, pool=pool)
+    syncer = MetadataSyncer(hass=hass, pool=pool)
+    await syncer.async_start()
+
+    entry.runtime_data = HaTimescaleDBData(ingester=ingester, syncer=syncer, pool=pool)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 
@@ -104,5 +109,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntr
     """Unload a config entry — stop ingester, close pool."""
     data: HaTimescaleDBData = entry.runtime_data
     await data.ingester.async_stop()
+    await data.syncer.async_stop()
     await data.pool.close()
     return True

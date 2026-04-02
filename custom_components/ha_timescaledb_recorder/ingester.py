@@ -45,7 +45,7 @@ class StateIngester:
             self._hass,
             self._async_flush_timer,
             timedelta(seconds=self._flush_interval),
-            name="ha_timescaledb_flush",
+            name="ha_timescaledb_recorder_flush",
         )
 
     @callback

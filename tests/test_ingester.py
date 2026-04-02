@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 import asyncpg
 import pytest
 
-from custom_components.ha_timescaledb.const import DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL, INSERT_SQL
-from custom_components.ha_timescaledb.ingester import StateIngester
+from custom_components.ha_timescaledb_recorder.const import DEFAULT_BATCH_SIZE, DEFAULT_FLUSH_INTERVAL, INSERT_SQL
+from custom_components.ha_timescaledb_recorder.ingester import StateIngester
 from homeassistant.helpers.entityfilter import convert_filter
 
 

@@ -1,7 +1,7 @@
 """Tests for the schema module."""
 import pytest
 
-from custom_components.ha_timescaledb.schema import async_setup_schema
+from custom_components.ha_timescaledb_recorder.schema import async_setup_schema
 
 
 async def test_create_schema_executes_all_statements(mock_pool, mock_conn):

@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.ha_timescaledb.config_flow import TimescaleDBConfigFlow
-from custom_components.ha_timescaledb.const import CONF_DSN
+from custom_components.ha_timescaledb_recorder.config_flow import TimescaleDBConfigFlow
+from custom_components.ha_timescaledb_recorder.const import CONF_DSN
 
 
 async def test_show_form():

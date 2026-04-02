@@ -29,7 +29,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 
 ### Manual
 
-1. Copy the `custom_components/ha_timescaledb/` directory into your HA config's `custom_components/` folder
+1. Copy the `custom_components/ha_timescaledb_recorder/` directory into your HA config's `custom_components/` folder
 2. Restart Home Assistant
 
 ## Configuration
@@ -62,7 +62,7 @@ Options take effect immediately — the integration reloads automatically when y
 Entity filtering is configured in `configuration.yaml` using the same include/exclude syntax as the recorder integration. Add the filter under the integration domain:
 
 ```yaml
-ha_timescaledb:
+ha_timescaledb_recorder:
   include:
     domains:
       - sensor
@@ -159,7 +159,7 @@ This integration runs alongside the built-in recorder — it does not replace it
 
 **No data appearing in `ha_states`**
 
-- Open the HA log viewer and filter for `custom_components.ha_timescaledb` — any connection errors appear here
+- Open the HA log viewer and filter for `custom_components.ha_timescaledb_recorder` — any connection errors appear here
 - Check your entity filter: if you added an `include` block, only listed domains/entities are written
 - The default `flush_interval` is 10 seconds — wait at least 10 seconds after a state change before querying
 

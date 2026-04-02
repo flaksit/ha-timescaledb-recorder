@@ -1,6 +1,6 @@
 """Constants for the TimescaleDB Recorder integration."""
 
-DOMAIN = "ha_timescaledb"
+DOMAIN = "ha_timescaledb_recorder"
 
 # Defaults
 DEFAULT_BATCH_SIZE = 200

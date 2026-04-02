@@ -1,4 +1,4 @@
-"""Idempotent schema setup for the ha_timescaledb hypertable."""
+"""Idempotent schema setup for the ha_timescaledb_recorder hypertable."""
 import logging
 
 import asyncpg

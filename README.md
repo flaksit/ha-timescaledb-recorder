@@ -143,6 +143,105 @@ FROM timescaledb_information.compression_settings
 WHERE hypertable_name = 'ha_states';
 ```
 
+## Metadata Sync
+
+In addition to state ingestion, the integration syncs HA registry metadata (entities, devices, areas, labels) to PostgreSQL dimension tables. These tables use **SCD2 (Slowly Changing Dimension Type 2)** temporal tracking, which means every historical version of a registry object is preserved with a time range indicating when it was current.
+
+This enables historically correct joins: for any row in `ha_states`, you can join to the metadata that was current at that exact moment — entity name, area, device, labels, device class, and more.
+
+### Dimension tables
+
+All four tables follow the same SCD2 pattern. The current row for any object has `valid_to IS NULL`. When metadata changes, the existing row is closed (`valid_to` set to the timestamp of the change) and a new row is inserted (`valid_from` = that same timestamp, `valid_to = NULL`). Historical rows are never deleted.
+
+Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`.
+
+#### dim_entities
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `entity_id` | TEXT | HA entity ID (e.g. `sensor.living_room_temperature`) |
+| `ha_entity_uuid` | TEXT | HA's internal stable UUID — survives entity_id renames |
+| `name` | TEXT | Friendly name |
+| `domain` | TEXT | Domain (e.g. `sensor`, `switch`) |
+| `platform` | TEXT | Integration that provides the entity |
+| `device_id` | TEXT | FK to `dim_devices.device_id` |
+| `area_id` | TEXT | FK to `dim_areas.area_id` |
+| `labels` | TEXT[] | Array of label IDs |
+| `device_class` | TEXT | Device class (e.g. `temperature`, `power`) |
+| `unit_of_measurement` | TEXT | Unit (e.g. `°C`, `W`) |
+| `disabled_by` | TEXT | Non-null when entity is disabled |
+| `valid_from` | TIMESTAMPTZ | When this version became current |
+| `valid_to` | TIMESTAMPTZ | When this version was superseded (NULL = current) |
+| `extra` | JSONB | Full registry entry serialisation |
+
+#### dim_devices
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `device_id` | TEXT | HA device ID |
+| `name` | TEXT | Device name |
+| `manufacturer` | TEXT | Manufacturer |
+| `model` | TEXT | Model |
+| `area_id` | TEXT | FK to `dim_areas.area_id` |
+| `labels` | TEXT[] | Array of label IDs |
+| `valid_from` | TIMESTAMPTZ | When this version became current |
+| `valid_to` | TIMESTAMPTZ | When this version was superseded (NULL = current) |
+| `extra` | JSONB | Full registry entry serialisation |
+
+#### dim_areas
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `area_id` | TEXT | HA area ID |
+| `name` | TEXT | Area name |
+| `valid_from` | TIMESTAMPTZ | When this version became current |
+| `valid_to` | TIMESTAMPTZ | When this version was superseded (NULL = current) |
+| `extra` | JSONB | Full registry entry serialisation |
+
+#### dim_labels
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `label_id` | TEXT | HA label ID |
+| `name` | TEXT | Label name |
+| `color` | TEXT | Display color |
+| `valid_from` | TIMESTAMPTZ | When this version became current |
+| `valid_to` | TIMESTAMPTZ | When this version was superseded (NULL = current) |
+| `extra` | JSONB | Full registry entry serialisation |
+
+### How it works
+
+On integration load, a full snapshot of all four registries is taken and inserted into the dimension tables. The snapshot uses idempotent `WHERE NOT EXISTS` inserts so restarting the integration never creates duplicate open rows.
+
+After the snapshot, the integration subscribes to four HA registry events:
+
+- `EVENT_ENTITY_REGISTRY_UPDATED`
+- `EVENT_DEVICE_REGISTRY_UPDATED`
+- `EVENT_AREA_REGISTRY_UPDATED`
+- `EVENT_LABEL_REGISTRY_UPDATED`
+
+Each event triggers the SCD2 close-and-insert cycle: the current open row is closed (`valid_to = now()`), and a new row is inserted with the updated fields (`valid_from = now()`). Entity renames (entity_id changes) are handled the same way — the old entity_id row closes and a new one opens under the new entity_id.
+
+The dimension tables are created idempotently on every integration startup (same as `ha_states`), so no manual schema migration is needed after updates.
+
+### Example query: point-in-time metadata join
+
+```sql
+SELECT s.entity_id, s.state, e.name, e.area_id, a.name AS area_name
+FROM ha_states s
+JOIN dim_entities e ON e.entity_id = s.entity_id
+  AND s.last_updated >= e.valid_from
+  AND (e.valid_to IS NULL OR s.last_updated < e.valid_to)
+LEFT JOIN dim_areas a ON a.area_id = e.area_id
+  AND s.last_updated >= a.valid_from
+  AND (a.valid_to IS NULL OR s.last_updated < a.valid_to)
+WHERE s.entity_id = 'sensor.living_room_temperature'
+ORDER BY s.last_updated DESC
+LIMIT 10;
+```
+
+The join conditions (`>= valid_from AND (valid_to IS NULL OR < valid_to)`) ensure you get the metadata row that was current at the time each state was recorded — not necessarily the current metadata. This is what makes the join historically correct.
+
 ## Differences from the built-in recorder
 
 ### Runs alongside the recorder, not a replacement

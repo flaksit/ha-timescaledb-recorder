@@ -5,9 +5,15 @@ from custom_components.ha_timescaledb_recorder.schema import async_setup_schema
 
 
 async def test_create_schema_executes_all_statements(mock_pool, mock_conn):
-    """async_setup_schema must execute exactly 5 SQL statements."""
+    """async_setup_schema must execute exactly 14 SQL statements.
+
+    5 original (ha_states hypertable + compression + index)
+    + 4 dimension table DDL
+    + 5 dimension table indexes
+    = 14 total
+    """
     await async_setup_schema(mock_pool)
-    assert mock_conn.execute.call_count == 5
+    assert mock_conn.execute.call_count == 14
 
 
 async def test_create_schema_order(mock_pool, mock_conn):
@@ -16,11 +22,17 @@ async def test_create_schema_order(mock_pool, mock_conn):
 
     calls = [call.args[0] for call in mock_conn.execute.call_args_list]
 
+    # Original 5 statements (hypertable setup)
     assert "CREATE TABLE" in calls[0]
     assert "create_hypertable" in calls[1]
     assert "timescaledb.compress" in calls[2]
     assert "add_compression_policy" in calls[3]
     assert "CREATE INDEX" in calls[4]
+    # Dimension table DDL follows
+    assert "dim_entities" in calls[5]
+    assert "dim_devices" in calls[6]
+    assert "dim_areas" in calls[7]
+    assert "dim_labels" in calls[8]
 
 
 async def test_custom_chunk_interval(mock_pool, mock_conn):
@@ -47,3 +59,29 @@ async def test_default_values(mock_pool, mock_conn):
 
     assert "7 days" in calls[1]
     assert "7 days" in calls[3]
+
+
+async def test_dim_tables_ddl_executed(mock_pool, mock_conn):
+    """Dimension table DDL must be executed for all four registries (META-01)."""
+    await async_setup_schema(mock_pool)
+
+    all_sql = " ".join(call.args[0] for call in mock_conn.execute.call_args_list)
+
+    assert "CREATE TABLE IF NOT EXISTS dim_entities" in all_sql
+    assert "CREATE TABLE IF NOT EXISTS dim_devices" in all_sql
+    assert "CREATE TABLE IF NOT EXISTS dim_areas" in all_sql
+    assert "CREATE TABLE IF NOT EXISTS dim_labels" in all_sql
+
+
+async def test_dim_indexes_created(mock_pool, mock_conn):
+    """Index DDL must be executed for all four dimension tables."""
+    await async_setup_schema(mock_pool)
+
+    all_sql = " ".join(call.args[0] for call in mock_conn.execute.call_args_list)
+
+    # Five indexes: compound + partial current-row for entities; one each for the rest
+    assert "idx_dim_entities_entity_time" in all_sql
+    assert "idx_dim_entities_current" in all_sql
+    assert "idx_dim_devices_device_time" in all_sql
+    assert "idx_dim_areas_area_time" in all_sql
+    assert "idx_dim_labels_label_time" in all_sql

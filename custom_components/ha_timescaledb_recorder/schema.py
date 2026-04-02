@@ -11,6 +11,15 @@ from .const import (
     DEFAULT_CHUNK_INTERVAL_DAYS,
     DEFAULT_COMPRESS_AFTER_DAYS,
     SET_COMPRESSION_SQL,
+    CREATE_DIM_ENTITIES_SQL,
+    CREATE_DIM_DEVICES_SQL,
+    CREATE_DIM_AREAS_SQL,
+    CREATE_DIM_LABELS_SQL,
+    CREATE_DIM_ENTITIES_IDX_SQL,
+    CREATE_DIM_ENTITIES_CURRENT_IDX_SQL,
+    CREATE_DIM_DEVICES_IDX_SQL,
+    CREATE_DIM_AREAS_IDX_SQL,
+    CREATE_DIM_LABELS_IDX_SQL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,6 +41,18 @@ async def async_setup_schema(
             ADD_COMPRESSION_POLICY_SQL.format(compress_days=compress_after_days)
         )
         await conn.execute(CREATE_INDEX_SQL)
+
+        # Dimension tables for SCD2 metadata sync (Phase 4).
+        # All DDL is idempotent — safe to re-execute on every startup (D-11).
+        await conn.execute(CREATE_DIM_ENTITIES_SQL)
+        await conn.execute(CREATE_DIM_DEVICES_SQL)
+        await conn.execute(CREATE_DIM_AREAS_SQL)
+        await conn.execute(CREATE_DIM_LABELS_SQL)
+        await conn.execute(CREATE_DIM_ENTITIES_IDX_SQL)
+        await conn.execute(CREATE_DIM_ENTITIES_CURRENT_IDX_SQL)
+        await conn.execute(CREATE_DIM_DEVICES_IDX_SQL)
+        await conn.execute(CREATE_DIM_AREAS_IDX_SQL)
+        await conn.execute(CREATE_DIM_LABELS_IDX_SQL)
 
     _LOGGER.debug(
         "Schema setup complete (chunk=%d days, compress_after=%d days)",

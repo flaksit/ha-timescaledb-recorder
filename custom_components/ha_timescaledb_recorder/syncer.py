@@ -51,14 +51,19 @@ _LABEL_TYPED_KEYS = frozenset({"label_id", "name", "color"})
 def _build_extra(entry, exclude_keys: frozenset) -> str:
     """Serialize non-typed registry entry fields to a JSONB string.
 
-    Tries attrs.asdict() first (HA RegistryEntry uses @attr.s), then falls back
-    to __dict__ for any entry type that is not an attrs class.  The default=str
-    encoder handles HA-specific types (sets, enums, datetime, nested dataclasses).
+    Tries attrs.asdict() first (HA EntityEntry/DeviceEntry use @attr.s), then
+    dataclasses.fields() for __slots__ dataclasses (AreaEntry, LabelEntry), then
+    falls back to __dict__ as a last resort.  The default=str encoder handles
+    HA-specific types (sets, enums, datetime, nested dataclasses).
     """
     try:
         raw = attrs.asdict(entry)
     except attrs.exceptions.NotAnAttrsClassError:
-        raw = {k: v for k, v in vars(entry).items()}
+        try:
+            import dataclasses
+            raw = {f.name: getattr(entry, f.name) for f in dataclasses.fields(entry)}
+        except TypeError:
+            raw = vars(entry)
     filtered = {k: v for k, v in raw.items() if k not in exclude_keys}
     return json.dumps(filtered, default=str)
 

@@ -80,16 +80,18 @@ def _build_extra(entry, exclude_keys: frozenset) -> str:
 _EXTRA_COMPARE_IGNORE = frozenset({"modified_at"})
 
 
-def _extra_changed(stored: dict, new_json: str) -> bool:
+def _extra_changed(stored, new_json: str) -> bool:
     """Return True if extra JSONB changed in a way that warrants a new SCD2 row.
 
+    asyncpg returns JSONB columns as strings, so `stored` may be a str or dict.
     Ignores fields in _EXTRA_COMPARE_IGNORE (e.g. modified_at) which HA updates
     on every internal write regardless of whether user-visible metadata changed.
     """
-    new = json.loads(new_json)
+    stored_dict = json.loads(stored) if isinstance(stored, str) else (stored or {})
+    new_dict = json.loads(new_json)
     return (
-        {k: v for k, v in stored.items() if k not in _EXTRA_COMPARE_IGNORE}
-        != {k: v for k, v in new.items() if k not in _EXTRA_COMPARE_IGNORE}
+        {k: v for k, v in stored_dict.items() if k not in _EXTRA_COMPARE_IGNORE}
+        != {k: v for k, v in new_dict.items() if k not in _EXTRA_COMPARE_IGNORE}
     )
 
 

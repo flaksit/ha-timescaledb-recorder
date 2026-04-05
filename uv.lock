@@ -918,7 +918,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "asyncpg", specifier = "==0.31.0" },
-    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-homeassistant-custom-component", specifier = ">=0.13.320" },
 ]

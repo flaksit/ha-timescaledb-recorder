@@ -17,8 +17,8 @@ CONF_CHUNK_INTERVAL = "chunk_interval_days"
 
 TABLE_NAME = "ha_states"
 
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS ha_states (
+CREATE_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     last_updated  TIMESTAMPTZ NOT NULL,
     last_changed  TIMESTAMPTZ NOT NULL,
     entity_id     TEXT        NOT NULL,
@@ -34,8 +34,8 @@ SELECT create_hypertable('ha_states', 'last_updated',
     if_not_exists => TRUE);
 """
 
-SET_COMPRESSION_SQL = """
-ALTER TABLE ha_states SET (
+SET_COMPRESSION_SQL = f"""
+ALTER TABLE {TABLE_NAME} SET (
     timescaledb.compress = TRUE,
     timescaledb.compress_segmentby = 'entity_id',
     timescaledb.compress_orderby = 'last_updated DESC');
@@ -47,13 +47,13 @@ SELECT add_compression_policy('ha_states',
     INTERVAL '{compress_days} days', if_not_exists => TRUE);
 """
 
-CREATE_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_ha_states_entity_time
-    ON ha_states (entity_id, last_updated DESC);
+CREATE_INDEX_SQL = f"""
+CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_entity_time
+    ON {TABLE_NAME} (entity_id, last_updated DESC);
 """
 
-INSERT_SQL = """
-INSERT INTO ha_states (entity_id, state, attributes, last_updated, last_changed)
+INSERT_SQL = f"""
+INSERT INTO {TABLE_NAME} (entity_id, state, attributes, last_updated, last_changed)
 VALUES ($1, $2, $3, $4, $5)
 """
 

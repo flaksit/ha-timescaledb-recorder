@@ -64,7 +64,13 @@ def _build_extra(entry, exclude_keys: frozenset) -> str:
             raw = {f.name: getattr(entry, f.name) for f in dataclasses.fields(entry)}
         except TypeError:
             raw = vars(entry)
-    filtered = {k: v for k, v in raw.items() if k not in exclude_keys}
+    # Also strip underscore-prefixed keys — HA uses these for internal caches
+    # (e.g. _cache on EntityEntry) that change without meaningful metadata changes
+    # and would produce spurious SCD2 rows if included.
+    filtered = {
+        k: v for k, v in raw.items()
+        if k not in exclude_keys and not k.startswith("_")
+    }
     return json.dumps(filtered, default=str)
 
 
@@ -216,6 +222,94 @@ class MetadataSyncer:
         return (entry.label_id, entry.name, entry.color, valid_from, extra)
 
     # ------------------------------------------------------------------
+    # Change detection helpers
+    # ------------------------------------------------------------------
+
+    async def _entity_row_changed(self, conn, entity_id: str, new_params: tuple) -> bool:
+        """Return True if the current open row differs from new_params.
+
+        Fetches typed columns from the current open row and compares field-by-field.
+        A no-op event (e.g. HA invalidating _cache) returns False — skip SCD2 write.
+        new_params indices: 0=entity_id, 1=ha_entity_uuid, 2=name, 3=domain,
+        4=platform, 5=device_id, 6=area_id, 7=labels, 8=device_class,
+        9=unit_of_measurement, 10=disabled_by, 11=valid_from, 12=extra
+        """
+        row = await conn.fetchrow(
+            "SELECT name, platform, device_id, area_id, labels, device_class,"
+            " unit_of_measurement, disabled_by, extra"
+            " FROM dim_entities WHERE entity_id = $1 AND valid_to IS NULL",
+            entity_id,
+        )
+        if row is None:
+            return True
+        return (
+            row["name"] != new_params[2]
+            or row["platform"] != new_params[4]
+            or row["device_id"] != new_params[5]
+            or row["area_id"] != new_params[6]
+            or sorted(row["labels"] or []) != sorted(new_params[7] or [])
+            or row["device_class"] != new_params[8]
+            or row["unit_of_measurement"] != new_params[9]
+            or row["disabled_by"] != new_params[10]
+            or row["extra"] != json.loads(new_params[12])
+        )
+
+    async def _device_row_changed(self, conn, device_id: str, new_params: tuple) -> bool:
+        """Return True if the current open device row differs from new_params.
+
+        new_params indices: 0=device_id, 1=name, 2=manufacturer, 3=model,
+        4=area_id, 5=labels, 6=valid_from, 7=extra
+        """
+        row = await conn.fetchrow(
+            "SELECT name, manufacturer, model, area_id, labels, extra"
+            " FROM dim_devices WHERE device_id = $1 AND valid_to IS NULL",
+            device_id,
+        )
+        if row is None:
+            return True
+        return (
+            row["name"] != new_params[1]
+            or row["manufacturer"] != new_params[2]
+            or row["model"] != new_params[3]
+            or row["area_id"] != new_params[4]
+            or sorted(row["labels"] or []) != sorted(new_params[5] or [])
+            or row["extra"] != json.loads(new_params[7])
+        )
+
+    async def _area_row_changed(self, conn, area_id: str, new_params: tuple) -> bool:
+        """Return True if the current open area row differs from new_params.
+
+        new_params indices: 0=area_id, 1=name, 2=valid_from, 3=extra
+        """
+        row = await conn.fetchrow(
+            "SELECT name, extra FROM dim_areas WHERE area_id = $1 AND valid_to IS NULL",
+            area_id,
+        )
+        if row is None:
+            return True
+        return (
+            row["name"] != new_params[1]
+            or row["extra"] != json.loads(new_params[3])
+        )
+
+    async def _label_row_changed(self, conn, label_id: str, new_params: tuple) -> bool:
+        """Return True if the current open label row differs from new_params.
+
+        new_params indices: 0=label_id, 1=name, 2=color, 3=valid_from, 4=extra
+        """
+        row = await conn.fetchrow(
+            "SELECT name, color, extra FROM dim_labels WHERE label_id = $1 AND valid_to IS NULL",
+            label_id,
+        )
+        if row is None:
+            return True
+        return (
+            row["name"] != new_params[1]
+            or row["color"] != new_params[2]
+            or row["extra"] != json.loads(new_params[4])
+        )
+
+    # ------------------------------------------------------------------
     # Entity registry event handling
     # ------------------------------------------------------------------
 
@@ -247,16 +341,21 @@ class MetadataSyncer:
                     await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, entity_id)
 
                 elif action == "update":
-                    if old_entity_id is not None:
-                        # Rename: close old entity_id row, insert new entity_id row (D-09)
-                        await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, old_entity_id)
-                    else:
-                        # Normal field update: close current row
-                        await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, entity_id)
-                    # Insert new row for the current (possibly renamed) entity
                     entry = self._entity_reg.async_get(entity_id)
                     params = self._extract_entity_params(entry, now)
-                    await conn.execute(SCD2_INSERT_ENTITY_SQL, *params)
+                    if old_entity_id is not None:
+                        # Rename: always write — old and new entity_id are different rows (D-09)
+                        await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, old_entity_id)
+                        await conn.execute(SCD2_INSERT_ENTITY_SQL, *params)
+                    elif await self._entity_row_changed(conn, entity_id, params):
+                        # Field change: close current row, insert updated row
+                        await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, entity_id)
+                        await conn.execute(SCD2_INSERT_ENTITY_SQL, *params)
+                    else:
+                        _LOGGER.debug(
+                            "Skipping SCD2 write for entity %s — no meaningful field change",
+                            entity_id,
+                        )
 
         except (asyncpg.PostgresConnectionError, OSError):
             self._pool.expire_connections()
@@ -291,10 +390,16 @@ class MetadataSyncer:
                     await conn.execute(SCD2_CLOSE_DEVICE_SQL, now, device_id)
 
                 elif action == "update":
-                    await conn.execute(SCD2_CLOSE_DEVICE_SQL, now, device_id)
                     entry = self._device_reg.async_get(device_id)
                     params = self._extract_device_params(entry, now)
-                    await conn.execute(SCD2_INSERT_DEVICE_SQL, *params)
+                    if await self._device_row_changed(conn, device_id, params):
+                        await conn.execute(SCD2_CLOSE_DEVICE_SQL, now, device_id)
+                        await conn.execute(SCD2_INSERT_DEVICE_SQL, *params)
+                    else:
+                        _LOGGER.debug(
+                            "Skipping SCD2 write for device %s — no meaningful field change",
+                            device_id,
+                        )
 
         except (asyncpg.PostgresConnectionError, OSError):
             self._pool.expire_connections()
@@ -336,10 +441,16 @@ class MetadataSyncer:
                     await conn.execute(SCD2_CLOSE_AREA_SQL, now, area_id)
 
                 elif action == "update":
-                    await conn.execute(SCD2_CLOSE_AREA_SQL, now, area_id)
                     entry = self._area_reg.async_get_area(area_id)
                     params = self._extract_area_params(entry, now)
-                    await conn.execute(SCD2_INSERT_AREA_SQL, *params)
+                    if await self._area_row_changed(conn, area_id, params):
+                        await conn.execute(SCD2_CLOSE_AREA_SQL, now, area_id)
+                        await conn.execute(SCD2_INSERT_AREA_SQL, *params)
+                    else:
+                        _LOGGER.debug(
+                            "Skipping SCD2 write for area %s — no meaningful field change",
+                            area_id,
+                        )
 
         except (asyncpg.PostgresConnectionError, OSError):
             self._pool.expire_connections()
@@ -374,10 +485,16 @@ class MetadataSyncer:
                     await conn.execute(SCD2_CLOSE_LABEL_SQL, now, label_id)
 
                 elif action == "update":
-                    await conn.execute(SCD2_CLOSE_LABEL_SQL, now, label_id)
                     entry = self._label_reg.async_get_label(label_id)
                     params = self._extract_label_params(entry, now)
-                    await conn.execute(SCD2_INSERT_LABEL_SQL, *params)
+                    if await self._label_row_changed(conn, label_id, params):
+                        await conn.execute(SCD2_CLOSE_LABEL_SQL, now, label_id)
+                        await conn.execute(SCD2_INSERT_LABEL_SQL, *params)
+                    else:
+                        _LOGGER.debug(
+                            "Skipping SCD2 write for label %s — no meaningful field change",
+                            label_id,
+                        )
 
         except (asyncpg.PostgresConnectionError, OSError):
             self._pool.expire_connections()

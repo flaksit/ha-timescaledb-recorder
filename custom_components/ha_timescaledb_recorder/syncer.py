@@ -74,6 +74,25 @@ def _build_extra(entry, exclude_keys: frozenset) -> str:
     return json.dumps(filtered, default=str)
 
 
+# Fields present in extra that change on every HA internal registry write without
+# reflecting a meaningful metadata change — excluded from SCD2 change detection
+# but kept in extra for auditability.
+_EXTRA_COMPARE_IGNORE = frozenset({"modified_at"})
+
+
+def _extra_changed(stored: dict, new_json: str) -> bool:
+    """Return True if extra JSONB changed in a way that warrants a new SCD2 row.
+
+    Ignores fields in _EXTRA_COMPARE_IGNORE (e.g. modified_at) which HA updates
+    on every internal write regardless of whether user-visible metadata changed.
+    """
+    new = json.loads(new_json)
+    return (
+        {k: v for k, v in stored.items() if k not in _EXTRA_COMPARE_IGNORE}
+        != {k: v for k, v in new.items() if k not in _EXTRA_COMPARE_IGNORE}
+    )
+
+
 class MetadataSyncer:
     """Capture HA registry metadata into PostgreSQL dimension tables with SCD2 tracking.
 
@@ -251,7 +270,7 @@ class MetadataSyncer:
             or row["device_class"] != new_params[8]
             or row["unit_of_measurement"] != new_params[9]
             or row["disabled_by"] != new_params[10]
-            or row["extra"] != json.loads(new_params[12])
+            or _extra_changed(row["extra"], new_params[12])
         )
 
     async def _device_row_changed(self, conn, device_id: str, new_params: tuple) -> bool:
@@ -273,7 +292,7 @@ class MetadataSyncer:
             or row["model"] != new_params[3]
             or row["area_id"] != new_params[4]
             or sorted(row["labels"] or []) != sorted(new_params[5] or [])
-            or row["extra"] != json.loads(new_params[7])
+            or _extra_changed(row["extra"], new_params[7])
         )
 
     async def _area_row_changed(self, conn, area_id: str, new_params: tuple) -> bool:
@@ -289,7 +308,7 @@ class MetadataSyncer:
             return True
         return (
             row["name"] != new_params[1]
-            or row["extra"] != json.loads(new_params[3])
+            or _extra_changed(row["extra"], new_params[3])
         )
 
     async def _label_row_changed(self, conn, label_id: str, new_params: tuple) -> bool:
@@ -306,7 +325,7 @@ class MetadataSyncer:
         return (
             row["name"] != new_params[1]
             or row["color"] != new_params[2]
-            or row["extra"] != json.loads(new_params[4])
+            or _extra_changed(row["extra"], new_params[4])
         )
 
     # ------------------------------------------------------------------

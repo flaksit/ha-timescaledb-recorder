@@ -5,14 +5,15 @@ DOMAIN = "ha_timescaledb_recorder"
 # Defaults
 DEFAULT_BATCH_SIZE = 200
 DEFAULT_FLUSH_INTERVAL = 10  # seconds
-DEFAULT_COMPRESS_AFTER_DAYS = 7
 DEFAULT_CHUNK_INTERVAL_DAYS = 7
+# 2 hours keeps at most ~1 day of uncompressed data on disk (2-day chunk + 12h policy window).
+DEFAULT_COMPRESS_AFTER_HOURS = 2
 
 # Config keys
 CONF_DSN = "dsn"
 CONF_BATCH_SIZE = "batch_size"
 CONF_FLUSH_INTERVAL = "flush_interval"
-CONF_COMPRESS_AFTER = "compress_after_days"
+CONF_COMPRESS_AFTER = "compress_after_hours"
 CONF_CHUNK_INTERVAL = "chunk_interval_days"
 
 TABLE_NAME = "ha_states"
@@ -41,10 +42,17 @@ ALTER TABLE {TABLE_NAME} SET (
     timescaledb.compress_orderby = 'last_updated DESC');
 """
 
-# {compress_days} must be formatted before execution
+REMOVE_COMPRESSION_POLICY_SQL = """
+SELECT remove_compression_policy('ha_states', if_exists => TRUE);
+"""
+
+# {compress_hours} and {schedule_hours} must be formatted before execution.
+# schedule_hours = max(1, min(12, compress_hours // 2)) — runs at half the
+# compression window, capped at 12 h to avoid excessive polling.
 ADD_COMPRESSION_POLICY_SQL = """
 SELECT add_compression_policy('ha_states',
-    INTERVAL '{compress_days} days', if_not_exists => TRUE);
+    INTERVAL '{compress_hours} hours',
+    schedule_interval => INTERVAL '{schedule_hours} hours');
 """
 
 CREATE_INDEX_SQL = f"""

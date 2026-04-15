@@ -18,7 +18,7 @@ from .const import (
     CONF_DSN,
     CONF_FLUSH_INTERVAL,
     DEFAULT_BATCH_SIZE,
-    DEFAULT_COMPRESS_AFTER_DAYS,
+    DEFAULT_COMPRESS_AFTER_HOURS,
     DEFAULT_CHUNK_INTERVAL_DAYS,
     DEFAULT_FLUSH_INTERVAL,
 )
@@ -72,11 +72,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
     )
 
     chunk_interval_days = options.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS)
-    compress_after_days = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_DAYS)
+    compress_after_hours = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_HOURS)
     await async_setup_schema(
         pool,
         chunk_interval_days=chunk_interval_days,
-        compress_after_days=compress_after_days,
+        compress_after_hours=compress_after_hours,
     )
 
     entity_filter = _get_entity_filter(entry)

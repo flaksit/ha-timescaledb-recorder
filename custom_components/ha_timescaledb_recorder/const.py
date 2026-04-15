@@ -11,8 +11,8 @@ DEFAULT_COMPRESS_AFTER_HOURS = 2
 
 # Config keys
 CONF_DSN = "dsn"
-CONF_BATCH_SIZE = "batch_size"
-CONF_FLUSH_INTERVAL = "flush_interval"
+CONF_BATCH_SIZE = "write_batch_size_records"
+CONF_FLUSH_INTERVAL = "flush_interval_seconds"
 CONF_COMPRESS_AFTER = "compress_after_hours"
 CONF_CHUNK_INTERVAL = "chunk_interval_days"
 

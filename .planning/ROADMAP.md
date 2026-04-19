@@ -30,8 +30,8 @@ The v1.1 milestone refactors the write path from an async, event-loop-resident a
 
 Plans:
 - [x] 01-01-PLAN.md — Migrate const.py SQL placeholders $N→%s; add SELECT_*_CURRENT_SQL constants
-- [ ] 01-02-PLAN.md — Convert schema.py to sync sync_setup_schema(conn, ...)
-- [ ] 01-03-PLAN.md — Create worker.py: DbWorker, StateRow, MetaCommand, _STOP
+- [x] 01-02-PLAN.md — Convert schema.py to sync sync_setup_schema(conn, ...)
+- [x] 01-03-PLAN.md — Create worker.py: DbWorker, StateRow, MetaCommand, _STOP
 - [ ] 01-04-PLAN.md — Refactor ingester.py to thin queue relay (StateRow enqueue)
 - [ ] 01-05-PLAN.md — Refactor syncer.py to thin relay + sync change-detection helpers
 - [ ] 01-06-PLAN.md — Wire __init__.py lifecycle; update manifest.json to psycopg[binary]==3.3.3

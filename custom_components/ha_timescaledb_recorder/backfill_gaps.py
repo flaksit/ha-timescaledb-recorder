@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Backfill gaps in ha_states (TimescaleDB) from Home Assistant's SQLite recorder.
 
-Run on the HA host where the SQLite file is accessible:
+From the HA host terminal (SSH addon):
 
-    /homeassistant/bin/python3 scripts/backfill_gaps.py
+    docker exec homeassistant python3 \
+        /config/custom_components/ha_timescaledb_recorder/backfill_gaps.py
 
-Both --sqlite and --pg-dsn are optional: the script auto-detects the SQLite path
-(/config/home-assistant_v2.db) and reads the DSN from the ha_timescaledb_recorder
-integration config (/config/.storage/core.config_entries).
-
-Requires psycopg[binary] — already present in HA's Python environment once the
-ha_timescaledb_recorder integration is installed.
+No arguments needed — auto-detects SQLite path (/config/home-assistant_v2.db)
+and reads the DSN from the ha_timescaledb_recorder integration config.
+psycopg[binary] is already present in the HA container once the integration
+is installed.
 
 Safe to run while HA is running — SQLite is opened read-only. Re-running is safe:
 (entity_id, last_updated) fingerprint comparison skips rows already in TimescaleDB.

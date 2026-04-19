@@ -3,9 +3,11 @@
 
 Run on the HA host where the SQLite file is accessible:
 
-    /homeassistant/bin/python3 scripts/backfill_gaps.py \\
-        --sqlite /config/home-assistant_v2.db \\
-        --pg-dsn "postgresql://user:pass@host/db"
+    /homeassistant/bin/python3 scripts/backfill_gaps.py
+
+Both --sqlite and --pg-dsn are optional: the script auto-detects the SQLite path
+(/config/home-assistant_v2.db) and reads the DSN from the ha_timescaledb_recorder
+integration config (/config/.storage/core.config_entries).
 
 Requires psycopg[binary] — already present in HA's Python environment once the
 ha_timescaledb_recorder integration is installed.
@@ -164,10 +166,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--sqlite", required=True, metavar="PATH",
-                   help="Path to home-assistant_v2.db (opened read-only).")
-    p.add_argument("--pg-dsn", required=True, metavar="DSN",
-                   help="PostgreSQL/TimescaleDB DSN, e.g. postgresql://user:pass@host/db")
+    p.add_argument("--sqlite", default=None, metavar="PATH",
+                   help="Path to home-assistant_v2.db. Default: /config/home-assistant_v2.db")
+    p.add_argument("--pg-dsn", default=None, metavar="DSN",
+                   help="PostgreSQL/TimescaleDB DSN. Default: read from HA config entries.")
     p.add_argument("--start", metavar="ISO8601", default=None,
                    help="Earliest timestamp (UTC, inclusive). Default: earliest SQLite row.")
     p.add_argument("--end", metavar="ISO8601", default=None,
@@ -295,9 +297,35 @@ async def insert_batches(
     return inserted
 
 
+_DEFAULT_SQLITE = "/config/home-assistant_v2.db"
+_HA_CONFIG_ENTRIES = "/config/.storage/core.config_entries"
+_HA_DOMAIN = "ha_timescaledb_recorder"
+
+
+def _detect_pg_dsn() -> str:
+    """Read DSN from HA config entries storage."""
+    try:
+        with open(_HA_CONFIG_ENTRIES) as f:
+            data = json.load(f)
+        for entry in data.get("data", {}).get("entries", []):
+            if entry.get("domain") == _HA_DOMAIN:
+                dsn = entry.get("data", {}).get("dsn")
+                if dsn:
+                    return dsn
+    except (OSError, json.JSONDecodeError):
+        pass
+    raise ValueError(
+        f"Could not auto-detect DSN from {_HA_CONFIG_ENTRIES}. "
+        "Pass --pg-dsn explicitly."
+    )
+
+
 async def main() -> None:
     args = parse_args()
-    sqlite_path = str(Path(args.sqlite).expanduser().resolve())
+    sqlite_path = str(Path(args.sqlite or _DEFAULT_SQLITE).expanduser().resolve())
+    pg_dsn = args.pg_dsn or _detect_pg_dsn()
+    print(f"SQLite: {sqlite_path}")
+    print(f"PG DSN: {pg_dsn[:pg_dsn.index('@') + 1]}… (credentials hidden)" if "@" in pg_dsn else f"PG DSN: {pg_dsn}")
 
     entities_filter: set[str] | None = (
         {e.strip() for e in args.entities.split(",") if e.strip()}
@@ -320,7 +348,7 @@ async def main() -> None:
     )
 
     # ── Connect ───────────────────────────────────────────────────────────────
-    pg_conn = await psycopg.AsyncConnection.connect(args.pg_dsn, autocommit=True)
+    pg_conn = await psycopg.AsyncConnection.connect(pg_dsn, autocommit=True)
 
     total_scanned = total_gaps = total_inserted = 0
     buckets_skipped = bucket_idx = 0

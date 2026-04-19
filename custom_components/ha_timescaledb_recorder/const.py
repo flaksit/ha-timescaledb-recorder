@@ -62,7 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_entity_time
 
 INSERT_SQL = f"""
 INSERT INTO {TABLE_NAME} (entity_id, state, attributes, last_updated, last_changed)
-VALUES ($1, $2, $3, $4, $5)
+VALUES (%s, %s, %s, %s, %s)
 """
 
 # Dimension table DDL — SCD2 temporal tracking for HA registry metadata.
@@ -159,75 +159,79 @@ CREATE INDEX IF NOT EXISTS idx_dim_labels_label_time
 # SQL strings explicit, grep-able, and safe from accidental table injection.
 
 # Close (expire) the currently-open row for an entity.
-# $1 = valid_to timestamp, $2 = entity_id.
+# %s = valid_to timestamp, %s = entity_id.
 SCD2_CLOSE_ENTITY_SQL = """
 UPDATE dim_entities
-SET valid_to = $1
-WHERE entity_id = $2 AND valid_to IS NULL;
+SET valid_to = %s
+WHERE entity_id = %s AND valid_to IS NULL;
 """
 
 SCD2_CLOSE_DEVICE_SQL = """
 UPDATE dim_devices
-SET valid_to = $1
-WHERE device_id = $2 AND valid_to IS NULL;
+SET valid_to = %s
+WHERE device_id = %s AND valid_to IS NULL;
 """
 
 SCD2_CLOSE_AREA_SQL = """
 UPDATE dim_areas
-SET valid_to = $1
-WHERE area_id = $2 AND valid_to IS NULL;
+SET valid_to = %s
+WHERE area_id = %s AND valid_to IS NULL;
 """
 
 SCD2_CLOSE_LABEL_SQL = """
 UPDATE dim_labels
-SET valid_to = $1
-WHERE label_id = $2 AND valid_to IS NULL;
+SET valid_to = %s
+WHERE label_id = %s AND valid_to IS NULL;
 """
 
 # Idempotent snapshot inserts (Pitfall 3 mitigation).
 # Uses WHERE NOT EXISTS so re-running on HA restart does not create duplicate
 # open rows for entities already present in the dimension table.
-# $1=entity_id, $2=ha_entity_uuid, $3=name, $4=domain, $5=platform,
-# $6=device_id, $7=area_id, $8=labels, $9=device_class,
-# $10=unit_of_measurement, $11=disabled_by, $12=valid_from, $13=extra
+# %s=entity_id, %s=ha_entity_uuid, %s=name, %s=domain, %s=platform,
+# %s=device_id, %s=area_id, %s=labels, %s=device_class,
+# %s=unit_of_measurement, %s=disabled_by, %s=valid_from, %s=extra
+# NOTE: first positional param (%s for entity_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_ENTITY_SQL = """
 INSERT INTO dim_entities
     (entity_id, ha_entity_uuid, name, domain, platform, device_id, area_id,
      labels, device_class, unit_of_measurement, disabled_by, valid_from, valid_to, extra)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, $13
+SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_entities WHERE entity_id = $1 AND valid_to IS NULL
+    SELECT 1 FROM dim_entities WHERE entity_id = %s AND valid_to IS NULL
 );
 """
 
-# $1=device_id, $2=name, $3=manufacturer, $4=model,
-# $5=area_id, $6=labels, $7=valid_from, $8=extra
+# %s=device_id, %s=name, %s=manufacturer, %s=model,
+# %s=area_id, %s=labels, %s=valid_from, %s=extra
+# NOTE: first positional param (%s for device_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_DEVICE_SQL = """
 INSERT INTO dim_devices
     (device_id, name, manufacturer, model, area_id, labels, valid_from, valid_to, extra)
-SELECT $1, $2, $3, $4, $5, $6, $7, NULL, $8
+SELECT %s, %s, %s, %s, %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_devices WHERE device_id = $1 AND valid_to IS NULL
+    SELECT 1 FROM dim_devices WHERE device_id = %s AND valid_to IS NULL
 );
 """
 
-# $1=area_id, $2=name, $3=valid_from, $4=extra
+# %s=area_id, %s=name, %s=valid_from, %s=extra
+# NOTE: first positional param (%s for area_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_AREA_SQL = """
 INSERT INTO dim_areas
     (area_id, name, valid_from, valid_to, extra)
-SELECT $1, $2, $3, NULL, $4
+SELECT %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_areas WHERE area_id = $1 AND valid_to IS NULL
+    SELECT 1 FROM dim_areas WHERE area_id = %s AND valid_to IS NULL
 );
 """
 
-# $1=label_id, $2=name, $3=color, $4=valid_from, $5=extra
+# %s=label_id, %s=name, %s=color, %s=valid_from, %s=extra
+# NOTE: first positional param (%s for label_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_LABEL_SQL = """
 INSERT INTO dim_labels
     (label_id, name, color, valid_from, valid_to, extra)
-SELECT $1, $2, $3, $4, NULL, $5
+SELECT %s, %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_labels WHERE label_id = $1 AND valid_to IS NULL
+    SELECT 1 FROM dim_labels WHERE label_id = %s AND valid_to IS NULL
 );
 """
 
@@ -238,23 +242,45 @@ SCD2_INSERT_ENTITY_SQL = """
 INSERT INTO dim_entities
     (entity_id, ha_entity_uuid, name, domain, platform, device_id, area_id,
      labels, device_class, unit_of_measurement, disabled_by, valid_from, valid_to, extra)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, $13);
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s);
 """
 
 SCD2_INSERT_DEVICE_SQL = """
 INSERT INTO dim_devices
     (device_id, name, manufacturer, model, area_id, labels, valid_from, valid_to, extra)
-VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8);
+VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s);
 """
 
 SCD2_INSERT_AREA_SQL = """
 INSERT INTO dim_areas
     (area_id, name, valid_from, valid_to, extra)
-VALUES ($1, $2, $3, NULL, $4);
+VALUES (%s, %s, %s, NULL, %s);
 """
 
 SCD2_INSERT_LABEL_SQL = """
 INSERT INTO dim_labels
     (label_id, name, color, valid_from, valid_to, extra)
-VALUES ($1, $2, $3, $4, NULL, $5);
+VALUES (%s, %s, %s, %s, NULL, %s);
 """
+
+# Change-detection SELECT constants — read the current open row for each registry type.
+# Moved from inline strings in syncer.py per project convention (all SQL in const.py).
+# %s = the registry ID (entity_id / device_id / area_id / label_id).
+SELECT_ENTITY_CURRENT_SQL = (
+    "SELECT name, platform, device_id, area_id, labels, device_class,"
+    " unit_of_measurement, disabled_by, extra"
+    " FROM dim_entities WHERE entity_id = %s AND valid_to IS NULL"
+)
+
+SELECT_DEVICE_CURRENT_SQL = (
+    "SELECT name, manufacturer, model, area_id, labels, extra"
+    " FROM dim_devices WHERE device_id = %s AND valid_to IS NULL"
+)
+
+SELECT_AREA_CURRENT_SQL = (
+    "SELECT name, extra FROM dim_areas WHERE area_id = %s AND valid_to IS NULL"
+)
+
+SELECT_LABEL_CURRENT_SQL = (
+    "SELECT name, color, extra FROM dim_labels WHERE label_id = %s AND valid_to IS NULL"
+)

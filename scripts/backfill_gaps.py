@@ -1,88 +1,129 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "asyncpg>=0.29",
-#   "tqdm>=4.66",
-# ]
-# ///
+#!/usr/bin/env python3
 """Backfill gaps in ha_states (TimescaleDB) from Home Assistant's SQLite recorder.
 
-Usage
------
-    uv run scripts/backfill_gaps.py \\
-        --sqlite /path/to/home-assistant_v2.db \\
+Run on the HA host where the SQLite file is accessible:
+
+    /homeassistant/bin/python3 scripts/backfill_gaps.py \\
+        --sqlite /config/home-assistant_v2.db \\
         --pg-dsn "postgresql://user:pass@host/db"
 
-The script is safe to run while HA is running — SQLite is opened read-only
-(file URI mode) and TimescaleDB inserts use ON CONFLICT DO NOTHING so they are
-idempotent as long as a unique constraint exists on (entity_id, last_updated).
+Requires psycopg[binary] — already present in HA's Python environment once the
+ha_timescaledb_recorder integration is installed.
 
-Algorithm
----------
-1. Read every (entity_id, last_updated_ts, last_changed_ts) from SQLite.
-2. Query TimescaleDB for existing (entity_id, last_updated) fingerprints, filtered
-   to only the entity_ids present in the SQLite export.
-3. Set-subtract to find rows absent from TimescaleDB.
-4. For each missing row, fetch state + attributes from SQLite and insert into PG.
+Safe to run while HA is running — SQLite is opened read-only. Re-running is safe:
+(entity_id, last_updated) fingerprint comparison skips rows already in TimescaleDB.
+
+Memory is bounded to one time bucket at a time (default 60 min). At 40k rows/hour
+a bucket occupies ~8 MB.
+
+Pre-check: each bucket compares COUNT(*) between SQLite and TimescaleDB before
+fetching individual rows. Matching counts → skip with zero row fetches.
+
+The PG password in --pg-dsn is visible in the process list. Use PGPASSWORD or
+a .pgpass file if that is a concern.
+
+Algorithm (per bucket)
+----------------------
+1. Fast COUNT(*) in SQLite (no join).
+2. Fast COUNT(*) in TimescaleDB.
+3. If counts match → skip (no gaps possible without count divergence).
+4. If --entities set and counts differ → filtered re-count before row fetches.
+5. Fetch candidate rows from SQLite for the bucket.
+6. Fetch (entity_id, last_updated) fingerprints from TimescaleDB.
+7. Set-subtract; insert missing rows in batches inside transactions.
 """
 
 import argparse
 import asyncio
+import json
+import math
 import sqlite3
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-import asyncpg
-from tqdm import tqdm
+import psycopg
+from psycopg.types.json import Jsonb
 
-# Matches ha_states table column order in INSERT_SQL from const.py:
-#   (entity_id, state, attributes, last_updated, last_changed)
+# ha_states has no unique constraint; deduplication handled by fingerprint
+# comparison before this INSERT runs. Placeholders are %s (psycopg3 style).
 INSERT_SQL = """
 INSERT INTO ha_states (entity_id, state, attributes, last_updated, last_changed)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT DO NOTHING
+VALUES (%s, %s, %s, %s, %s)
 """
 
-# Fetch existing (entity_id, last_updated) fingerprints from TimescaleDB for
-# entities that appear in the SQLite export.  Filtering by entity_id up front
-# avoids scanning the entire TimescaleDB table on large installations.
-#
-# $1 = start TIMESTAMPTZ (inclusive), $2 = end TIMESTAMPTZ (inclusive),
-# $3 = text[] of entity_ids to restrict the scan.
+# Bucket-level count pre-check — cheap aggregate, no row fetching.
+PG_COUNT_SQL = """
+SELECT COUNT(*) FROM ha_states
+WHERE last_updated >= %s AND last_updated < %s
+"""
+
+# Filtered count — only used when --entities is set and full counts differ.
+PG_COUNT_FILTERED_SQL = """
+SELECT COUNT(*) FROM ha_states
+WHERE last_updated >= %s AND last_updated < %s
+  AND entity_id = ANY(%s::text[])
+"""
+
 PG_FINGERPRINT_SQL = """
 SELECT entity_id, last_updated
 FROM ha_states
-WHERE last_updated BETWEEN $1 AND $2
-  AND entity_id = ANY($3::text[])
+WHERE last_updated >= %s AND last_updated < %s
+  AND entity_id = ANY(%s::text[])
 """
 
-# Fetch all candidate rows from SQLite within the time window.
-# COALESCE: last_changed_ts is NULL when it equals last_updated_ts (HA
-# normalises it away to save space).
-SQLITE_CANDIDATES_SQL = """
+# Fast count — no join. Every states row has a metadata_id so count is identical
+# to the join-based count.
+SQLITE_COUNT_SQL = """
+SELECT COUNT(*) FROM states
+WHERE last_updated_ts >= :start_ts AND last_updated_ts < :end_ts
+"""
+
+# Filtered count — join required to access entity_id. Only used when --entities
+# is set AND the fast counts differ (avoids the join in the common case).
+SQLITE_COUNT_FILTERED_SQL = """
+SELECT COUNT(*) FROM states s
+JOIN states_meta sm ON sm.metadata_id = s.metadata_id
+WHERE s.last_updated_ts >= :start_ts AND s.last_updated_ts < :end_ts
+  AND sm.entity_id IN ({placeholders})
+"""
+
+# In modern HA (2023.3+) entity_id lives in states_meta, not states directly.
+# COALESCE: last_changed_ts is NULL when it equals last_updated_ts (HA normalises
+# it away to save space). Bucket end is exclusive to avoid double-counting edges.
+SQLITE_BUCKET_SQL = """
 SELECT
-    s.entity_id,
+    sm.entity_id,
     s.state,
     sa.shared_attrs,
     s.last_updated_ts,
     COALESCE(s.last_changed_ts, s.last_updated_ts) AS last_changed_ts
 FROM states s
+JOIN states_meta sm ON sm.metadata_id = s.metadata_id
 LEFT JOIN state_attributes sa ON sa.attributes_id = s.attributes_id
-WHERE s.last_updated_ts BETWEEN :start_ts AND :end_ts
-  AND s.entity_id IS NOT NULL
+WHERE s.last_updated_ts >= :start_ts AND s.last_updated_ts < :end_ts
 ORDER BY s.last_updated_ts
 """
 
+SQLITE_RANGE_SQL = """
+SELECT MIN(last_updated_ts), MAX(last_updated_ts) FROM states
+"""
 
-def _ts_to_dt(ts_float: float) -> datetime:
-    """Convert a UNIX timestamp (float seconds) to an aware UTC datetime."""
-    return datetime.fromtimestamp(ts_float, tz=timezone.utc)
+
+def _ts_to_dt(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 def _dt_to_ts(dt: datetime) -> float:
-    """Convert an aware UTC datetime to a UNIX timestamp (float seconds)."""
     return dt.timestamp()
+
+
+def _parse_iso_utc(s: str) -> datetime:
+    """Parse ISO 8601 → UTC. Naive strings assumed UTC; aware strings converted."""
+    dt = datetime.fromisoformat(s)
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,261 +135,240 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument(
-        "--sqlite",
-        required=True,
-        metavar="PATH",
-        help="Path to home-assistant_v2.db (opened read-only).",
-    )
-    p.add_argument(
-        "--pg-dsn",
-        required=True,
-        metavar="DSN",
-        help="PostgreSQL/TimescaleDB connection string, e.g. postgresql://user:pass@host/db",
-    )
-    p.add_argument(
-        "--start",
-        metavar="ISO8601",
-        default=None,
-        help=(
-            "Earliest timestamp to consider (UTC, inclusive). "
-            "Default: earliest row in SQLite."
-        ),
-    )
-    p.add_argument(
-        "--end",
-        metavar="ISO8601",
-        default=None,
-        help=(
-            "Latest timestamp to consider (UTC, inclusive). "
-            "Default: latest row in SQLite."
-        ),
-    )
-    p.add_argument(
-        "--batch-size",
-        type=int,
-        default=500,
-        metavar="N",
-        help="Number of rows per INSERT batch (default: 500).",
-    )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would be inserted without writing to TimescaleDB.",
-    )
+    p.add_argument("--sqlite", required=True, metavar="PATH",
+                   help="Path to home-assistant_v2.db (opened read-only).")
+    p.add_argument("--pg-dsn", required=True, metavar="DSN",
+                   help="PostgreSQL/TimescaleDB DSN, e.g. postgresql://user:pass@host/db")
+    p.add_argument("--start", metavar="ISO8601", default=None,
+                   help="Earliest timestamp (UTC, inclusive). Default: earliest SQLite row.")
+    p.add_argument("--end", metavar="ISO8601", default=None,
+                   help="Latest timestamp (UTC, exclusive). Default: latest SQLite row + 1 µs.")
+    p.add_argument("--bucket-minutes", type=float, default=60.0, metavar="M",
+                   help="Bucket width in minutes (default: 60). Larger = fewer PG queries, more memory.")
+    p.add_argument("--batch-size", type=int, default=500, metavar="N",
+                   help="Rows per INSERT batch (default: 500).")
+    p.add_argument("--entities", metavar="ENTITY_IDS", default=None,
+                   help="Comma-separated entity_ids to backfill. Default: all.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show what would be inserted without writing to TimescaleDB.")
     return p.parse_args()
 
 
-def read_sqlite_candidates(
-    db_path: str,
-    start_ts: float,
-    end_ts: float,
-) -> tuple[list[dict], list[str]]:
-    """Read candidate rows from SQLite.
-
-    Returns (rows, entity_ids) where rows is a list of dicts with keys
-    entity_id, state, shared_attrs, last_updated_ts, last_changed_ts, and
-    entity_ids is a deduplicated list of all entity_ids found.
-
-    The connection uses file URI mode (mode=ro) so HA can stay running.
-    shared_attrs may be None if state_attributes row is missing — the script
-    skips those rows (they cannot be backfilled without attributes data).
-    """
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        cursor = conn.execute(
-            SQLITE_CANDIDATES_SQL,
-            {"start_ts": start_ts, "end_ts": end_ts},
-        )
-        rows = [dict(r) for r in cursor.fetchall()]
-    finally:
-        conn.close()
-
-    entity_ids = list({r["entity_id"] for r in rows})
-    return rows, entity_ids
-
-
-def detect_sqlite_time_range(db_path: str) -> tuple[float, float]:
-    """Return (min_ts, max_ts) of last_updated_ts from the SQLite states table."""
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    try:
-        row = conn.execute(
-            "SELECT MIN(last_updated_ts), MAX(last_updated_ts) FROM states"
-        ).fetchone()
-    finally:
-        conn.close()
-
+def fetch_sqlite_range(db_path: str) -> tuple[float, float]:
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        row = conn.execute(SQLITE_RANGE_SQL).fetchone()
     if row is None or row[0] is None:
         raise ValueError("SQLite states table is empty — nothing to backfill.")
     return float(row[0]), float(row[1])
 
 
+def sqlite_bucket_count(
+    db_path: str,
+    start_ts: float,
+    end_ts: float,
+    entities_filter: set[str] | None = None,
+) -> int:
+    """COUNT(*) for the bucket. No join without filter; join + IN with filter."""
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        if entities_filter:
+            placeholders = ",".join("?" * len(entities_filter))
+            sql = SQLITE_COUNT_FILTERED_SQL.format(placeholders=placeholders)
+            params: tuple[Any, ...] = (start_ts, end_ts, *entities_filter)
+            row = conn.execute(sql, params).fetchone()
+        else:
+            row = conn.execute(
+                SQLITE_COUNT_SQL, {"start_ts": start_ts, "end_ts": end_ts}
+            ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def fetch_sqlite_bucket(
+    db_path: str,
+    start_ts: float,
+    end_ts: float,
+    entities_filter: set[str] | None,
+) -> list[dict[str, Any]]:
+    """Fetch one bucket's rows from SQLite. Memory bounded to bucket size."""
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(SQLITE_BUCKET_SQL, {"start_ts": start_ts, "end_ts": end_ts})
+        rows: list[dict[str, Any]] = [
+            dict(r) for r in cursor
+            if entities_filter is None or r["entity_id"] in entities_filter
+        ]
+    return rows
+
+
+async def pg_bucket_count(
+    conn: psycopg.AsyncConnection,
+    start: datetime,
+    end: datetime,
+    entities_filter: set[str] | None = None,
+) -> int:
+    if entities_filter:
+        cur = await conn.execute(PG_COUNT_FILTERED_SQL, (start, end, list(entities_filter)))
+    else:
+        cur = await conn.execute(PG_COUNT_SQL, (start, end))
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
 async def fetch_pg_fingerprints(
-    conn: asyncpg.Connection,
+    conn: psycopg.AsyncConnection,
     start: datetime,
     end: datetime,
     entity_ids: list[str],
 ) -> set[tuple[str, datetime]]:
-    """Fetch (entity_id, last_updated) pairs already in TimescaleDB.
-
-    Filtering by entity_id = ANY($3) avoids a full table scan.  TimescaleDB
-    uses the time partition + the idx_ha_states_entity_time index for
-    entity_id lookups, so this is efficient even on large tables.
-    """
-    rows = await conn.fetch(PG_FINGERPRINT_SQL, start, end, entity_ids)
-    # Normalise to (entity_id, last_updated rounded to microsecond) so that
-    # float precision differences between SQLite and PG don't cause false misses.
-    return {(r["entity_id"], r["last_updated"]) for r in rows}
+    cur = await conn.execute(PG_FINGERPRINT_SQL, (start, end, entity_ids))
+    rows = await cur.fetchall()
+    return {(r[0], r[1]) for r in rows}
 
 
 def build_missing_rows(
-    sqlite_rows: list[dict],
+    sqlite_rows: list[dict[str, Any]],
     pg_fingerprints: set[tuple[str, datetime]],
-) -> list[tuple]:
+) -> list[tuple[Any, ...]]:
     """Return rows present in SQLite but absent from TimescaleDB.
 
-    Each output tuple matches INSERT_SQL parameter order:
-      (entity_id, state, attributes_json, last_updated, last_changed)
-
-    Rows with NULL shared_attrs are skipped — they cannot be stored without
-    attributes data and are typically internal HA housekeeping rows.
-
-    Timestamp comparison uses microsecond rounding to absorb float→datetime
-    conversion noise (SQLite stores floats; PG stores TIMESTAMPTZ at µs).
+    NULL shared_attrs → insert NULL attributes (ha_states.attributes is nullable).
+    Non-null shared_attrs → wrap in Jsonb() as required by psycopg3 for JSONB columns.
     """
-    missing = []
+    missing: list[tuple[Any, ...]] = []
     for row in sqlite_rows:
-        if row["shared_attrs"] is None:
-            # No attributes row — skip; these are typically synthetic or
-            # corrupted states that HA itself does not surface to users.
-            continue
-
         last_updated_dt = _ts_to_dt(row["last_updated_ts"])
-        # Round to microsecond to match PostgreSQL TIMESTAMPTZ resolution.
-        last_updated_dt = last_updated_dt.replace(
-            microsecond=round(last_updated_dt.microsecond, -0)
-        )
-
         if (row["entity_id"], last_updated_dt) in pg_fingerprints:
-            continue  # Already in TimescaleDB
-
-        last_changed_dt = _ts_to_dt(row["last_changed_ts"])
-
+            continue
+        attrs = Jsonb(json.loads(row["shared_attrs"])) if row["shared_attrs"] is not None else None
         missing.append((
             row["entity_id"],
             row["state"],
-            # Pass the raw JSON string — asyncpg accepts a JSON string for
-            # JSONB columns in text protocol mode (no round-trip through
-            # json.loads + json.dumps needed).
-            row["shared_attrs"],
+            attrs,
             last_updated_dt,
-            last_changed_dt,
+            _ts_to_dt(row["last_changed_ts"]),
         ))
     return missing
 
 
 async def insert_batches(
-    conn: asyncpg.Connection,
-    rows: list[tuple],
+    conn: psycopg.AsyncConnection,
+    rows: list[tuple[Any, ...]],
     batch_size: int,
     dry_run: bool,
 ) -> int:
-    """Insert rows in batches; returns count of rows inserted (or would-insert)."""
-    if not rows:
-        return 0
-
+    """Insert in batches, each in its own transaction. Returns count inserted."""
     inserted = 0
-    with tqdm(total=len(rows), unit="rows", desc="Inserting") as pbar:
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i : i + batch_size]
-            if dry_run:
-                # Dry-run: just count and advance progress bar.
-                inserted += len(batch)
-                pbar.update(len(batch))
-                continue
-
-            # executemany is safe here: single connection, no pool, no
-            # concurrent writers — TimescaleDB deadlock risk is eliminated.
-            await conn.executemany(INSERT_SQL, batch)
-            inserted += len(batch)
-            pbar.update(len(batch))
-
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        if not dry_run:
+            async with conn.transaction():
+                await conn.executemany(INSERT_SQL, batch)
+        inserted += len(batch)
     return inserted
 
 
 async def main() -> None:
     args = parse_args()
-
     sqlite_path = str(Path(args.sqlite).expanduser().resolve())
 
-    # ── Determine time window ──────────────────────────────────────────────
+    entities_filter: set[str] | None = (
+        {e.strip() for e in args.entities.split(",") if e.strip()}
+        if args.entities else None
+    )
+
+    # ── Time window ───────────────────────────────────────────────────────────
     print("Detecting time range from SQLite …")
-    min_ts, max_ts = detect_sqlite_time_range(sqlite_path)
+    min_ts, max_ts = fetch_sqlite_range(sqlite_path)
 
-    if args.start is not None:
-        start_dt = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
-        start_ts = _dt_to_ts(start_dt)
-    else:
-        start_ts = min_ts
-        start_dt = _ts_to_dt(start_ts)
+    start_ts = _dt_to_ts(_parse_iso_utc(args.start)) if args.start else min_ts
+    end_ts = _dt_to_ts(_parse_iso_utc(args.end)) if args.end else max_ts + 1e-6
 
-    if args.end is not None:
-        end_dt = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
-        end_ts = _dt_to_ts(end_dt)
-    else:
-        end_ts = max_ts
-        end_dt = _ts_to_dt(end_ts)
+    bucket_secs = args.bucket_minutes * 60
+    n_buckets = math.ceil((end_ts - start_ts) / bucket_secs)
 
-    print(f"Time window: {start_dt.isoformat()} → {end_dt.isoformat()}")
+    print(
+        f"Time window: {_ts_to_dt(start_ts).isoformat()} → {_ts_to_dt(end_ts).isoformat()}\n"
+        f"Buckets: {n_buckets} × {args.bucket_minutes:.0f}min"
+    )
 
-    # ── Read SQLite candidates ─────────────────────────────────────────────
-    print("Reading SQLite candidates …")
-    sqlite_rows, entity_ids = read_sqlite_candidates(sqlite_path, start_ts, end_ts)
-    print(f"  Found {len(sqlite_rows):,} rows across {len(entity_ids):,} entities.")
+    # ── Connect ───────────────────────────────────────────────────────────────
+    pg_conn = await psycopg.AsyncConnection.connect(args.pg_dsn, autocommit=True)
 
-    if not sqlite_rows:
-        print("Nothing to backfill.")
-        return
-
-    # ── Connect to TimescaleDB ─────────────────────────────────────────────
-    print("Connecting to TimescaleDB …")
-    # Single connection (not pool) — this is a one-shot script.
-    pg_conn = await asyncpg.connect(args.pg_dsn)
+    total_scanned = total_gaps = total_inserted = 0
+    buckets_skipped = bucket_idx = 0
+    last_print = time.monotonic()
 
     try:
-        # ── Fetch existing fingerprints ────────────────────────────────────
-        print("Fetching existing fingerprints from TimescaleDB …")
-        pg_fingerprints = await fetch_pg_fingerprints(
-            pg_conn, start_dt, end_dt, entity_ids
-        )
-        print(f"  TimescaleDB already has {len(pg_fingerprints):,} matching rows.")
+        ts = start_ts
+        while ts < end_ts:
+            bucket_end = min(ts + bucket_secs, end_ts)
+            start_dt, end_dt = _ts_to_dt(ts), _ts_to_dt(bucket_end)
+            bucket_idx += 1
 
-        # ── Compute gap ────────────────────────────────────────────────────
-        missing = build_missing_rows(sqlite_rows, pg_fingerprints)
-        print(f"  Gap: {len(missing):,} rows to backfill.")
+            # ── Count pre-check ───────────────────────────────────────────────
+            sq_count = sqlite_bucket_count(sqlite_path, ts, bucket_end)
+            if sq_count == 0:
+                buckets_skipped += 1
+                ts = bucket_end
+                continue
 
-        if not missing:
-            print("No gaps found — TimescaleDB is up to date.")
-            return
+            pg_count = await pg_bucket_count(pg_conn, start_dt, end_dt)
+            if pg_count != sq_count and entities_filter:
+                # Other entities may explain the mismatch — recount with filter.
+                sq_count = sqlite_bucket_count(sqlite_path, ts, bucket_end, entities_filter)
+                pg_count = await pg_bucket_count(pg_conn, start_dt, end_dt, entities_filter)
 
-        # ── Insert ────────────────────────────────────────────────────────
-        if args.dry_run:
-            print("[DRY RUN] Would insert the following (first 5):")
-            for row in missing[:5]:
-                print(f"  {row[0]} @ {row[3].isoformat()} — state={row[1]!r}")
+            if pg_count == sq_count:
+                # Same count → assume in sync (count collision for timestamped
+                # state events is astronomically unlikely).
+                buckets_skipped += 1
+                ts = bucket_end
+                continue
 
-        inserted = await insert_batches(pg_conn, missing, args.batch_size, args.dry_run)
+            # ── Counts differ → full fingerprint comparison ───────────────────
+            sqlite_rows = fetch_sqlite_bucket(sqlite_path, ts, bucket_end, entities_filter)
+            if sqlite_rows:
+                entity_ids = list({r["entity_id"] for r in sqlite_rows})
+                fingerprints = await fetch_pg_fingerprints(pg_conn, start_dt, end_dt, entity_ids)
+                missing = build_missing_rows(sqlite_rows, fingerprints)
 
-        if args.dry_run:
-            print(f"[DRY RUN] Would have inserted {inserted:,} rows.")
-        else:
-            print(f"Done. Inserted {inserted:,} rows into ha_states.")
+                if missing:
+                    if args.dry_run and total_gaps == 0:
+                        print("\n[DRY RUN] First 5 rows that would be inserted:")
+                        for row in missing[:5]:
+                            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]!r}")
+
+                    inserted = await insert_batches(
+                        pg_conn, missing, args.batch_size, args.dry_run
+                    )
+                    total_inserted += inserted
+                    total_gaps += len(missing)
+
+                total_scanned += len(sqlite_rows)
+
+            # ── Progress (every 10 s) ─────────────────────────────────────────
+            now = time.monotonic()
+            if now - last_print >= 10.0:
+                print(
+                    f"  [{bucket_idx}/{n_buckets}] "
+                    f"scanned={total_scanned:,} gaps={total_gaps:,} inserted={total_inserted:,}",
+                    flush=True,
+                )
+                last_print = now
+
+            ts = bucket_end
 
     finally:
         await pg_conn.close()
 
+    dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
+    print(
+        f"Buckets skipped (in sync): {buckets_skipped:,} / {n_buckets:,}\n"
+        f"Scanned: {total_scanned:,} | Gaps: {total_gaps:,} | Inserted: {total_inserted:,}{dry_suffix}"
+    )
 
-asyncio.run(main())
+
+try:
+    asyncio.run(main())
+except Exception as exc:
+    print(f"Error: {exc}", file=sys.stderr)
+    sys.exit(1)

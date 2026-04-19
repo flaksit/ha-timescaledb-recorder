@@ -357,6 +357,14 @@ class MetadataSyncer:
             params = None
         else:
             entry = self._entity_reg.async_get(entity_id)
+            if entry is None:
+                # Race: event fired just before entry was deleted; skip to avoid AttributeError
+                # in _extract_entity_params. The SCD2 history gap is acceptable (D-04).
+                _LOGGER.warning(
+                    "Entity %s not found in registry during %s event; skipping",
+                    entity_id, action,
+                )
+                return
             params = self._extract_entity_params(entry, datetime.now(timezone.utc))
 
         self._queue.put_nowait(MetaCommand(
@@ -381,6 +389,14 @@ class MetadataSyncer:
             params = None
         else:
             entry = self._device_reg.async_get(device_id)
+            if entry is None:
+                # Race: event fired just before entry was deleted; skip to avoid AttributeError
+                # in _extract_device_params. The SCD2 history gap is acceptable (D-04).
+                _LOGGER.warning(
+                    "Device %s not found in registry during %s event; skipping",
+                    device_id, action,
+                )
+                return
             params = self._extract_device_params(entry, datetime.now(timezone.utc))
 
         self._queue.put_nowait(MetaCommand(
@@ -411,6 +427,14 @@ class MetadataSyncer:
             params = None
         else:
             entry = self._area_reg.async_get_area(area_id)
+            if entry is None:
+                # Race: event fired just before entry was deleted; skip to avoid AttributeError
+                # in _extract_area_params. The SCD2 history gap is acceptable (D-04).
+                _LOGGER.warning(
+                    "Area %s not found in registry during %s event; skipping",
+                    area_id, action,
+                )
+                return
             params = self._extract_area_params(entry, datetime.now(timezone.utc))
 
         self._queue.put_nowait(MetaCommand(
@@ -435,6 +459,14 @@ class MetadataSyncer:
             params = None
         else:
             entry = self._label_reg.async_get_label(label_id)
+            if entry is None:
+                # Race: event fired just before entry was deleted; skip to avoid AttributeError
+                # in _extract_label_params. The SCD2 history gap is acceptable (D-04).
+                _LOGGER.warning(
+                    "Label %s not found in registry during %s event; skipping",
+                    label_id, action,
+                )
+                return
             params = self._extract_label_params(entry, datetime.now(timezone.utc))
 
         self._queue.put_nowait(MetaCommand(

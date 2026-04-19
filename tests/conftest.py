@@ -153,3 +153,26 @@ def mock_label_registry():
     # Labels use async_list_labels() (not .values())
     reg.async_list_labels = MagicMock(return_value=entries)
     return reg
+
+
+# ---------------------------------------------------------------------------
+# psycopg3 fixtures (used by test_worker.py, Plan 07)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_psycopg_conn():
+    """Return (conn, cur) — a mock psycopg3 connection with cursor context manager.
+
+    conn.cursor() returns cur. The cursor is a context manager (supports `with` statement).
+    Use conn for patching psycopg.connect(); use cur to assert execute/executemany calls.
+
+    psycopg import is inside the fixture body to avoid ImportError when psycopg is not
+    installed in the test environment (tests that don't use this fixture are unaffected).
+    """
+    import psycopg
+    conn = MagicMock(spec=psycopg.Connection)
+    cur = MagicMock()
+    cur.__enter__ = MagicMock(return_value=cur)
+    cur.__exit__ = MagicMock(return_value=False)
+    conn.cursor = MagicMock(return_value=cur)
+    return conn, cur

@@ -8,8 +8,9 @@ From the HA host terminal (SSH addon):
 
 No arguments needed — auto-detects SQLite path (/config/home-assistant_v2.db)
 and reads the DSN from the ha_timescaledb_recorder integration config.
-psycopg[binary] is already present in the HA container once the integration
-is installed.
+
+Requires psycopg[binary] — already present in the HA container once the
+ha_timescaledb_recorder integration is installed.
 
 Safe to run while HA is running — SQLite is opened read-only. Re-running is safe:
 (entity_id, last_updated) fingerprint comparison skips rows already in TimescaleDB.

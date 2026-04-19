@@ -86,21 +86,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
     )
 
     # Start components in dependency order with rollback on failure.
+    # Flat structure avoids double worker.async_stop() when syncer.async_start() raises:
+    # a nested try/except would call async_stop() in the inner except and again in the
+    # outer except after re-raise. Tracking started components explicitly prevents this.
     worker.start()  # starts daemon thread; returns immediately (D-01)
+    started: list[str] = []
     try:
         ingester.async_start()  # registers STATE_CHANGED listener (sync)
-        try:
-            await syncer.async_start()  # enqueues registry snapshots + registers 4 listeners
-        except Exception:
-            # syncer.async_start() failed — stop ingester and worker before re-raising.
-            _LOGGER.exception("syncer.async_start() failed; rolling back setup")
-            ingester.stop()
-            await worker.async_stop()
-            raise
+        started.append("ingester")
+        await syncer.async_start()  # enqueues registry snapshots + registers 4 listeners
+        started.append("syncer")
     except Exception:
-        # ingester.async_start() failed (or re-raised from syncer block) — stop worker.
-        # Note: ingester.stop() is safe to call even if async_start() never completed
-        # (it guards on self._cancel_listener is not None).
+        _LOGGER.exception("Setup failed after starting %s; rolling back", started)
+        if "ingester" in started:
+            ingester.stop()
         await worker.async_stop()
         raise
 

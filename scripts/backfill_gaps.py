@@ -126,6 +126,38 @@ def _parse_iso_utc(s: str) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
+def _parse_end_exclusive(s: str) -> datetime:
+    """Parse --end as an inclusive boundary; return the equivalent exclusive end.
+
+    Precision is inferred from the input string structure so the whole unit is
+    included: a date includes the full day, a HH:MM includes the full minute, etc.
+
+      2026-04-10          → 2026-04-11T00:00:00  (whole day)
+      2026-04-10T14       → 2026-04-10T15:00:00  (whole hour)
+      2026-04-10T14:30    → 2026-04-10T14:31:00  (whole minute)
+      2026-04-10T14:30:45 → 2026-04-10T14:30:46  (whole second)
+      sub-second / full   → used as-is (already an exact point)
+    """
+    from datetime import timedelta
+    dt = _parse_iso_utc(s)
+    # Strip timezone suffix to inspect the structural precision of the bare string.
+    bare = s.replace("Z", "").split("+")[0].split("-")
+    # bare after split on "-": ["2026", "04", "10"] or ["2026", "04", "10T14:30"]
+    # Simpler: work on the original string directly.
+    b = s.split("+")[0].rstrip("Z").strip()
+    if "T" not in b:
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    time_part = b.split("T")[1]
+    colons = time_part.count(":")
+    if colons == 0:
+        return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    if colons == 1:
+        return dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    if colons == 2 and "." not in time_part:
+        return dt.replace(microsecond=0) + timedelta(seconds=1)
+    return dt  # sub-second precision → treat as exact exclusive boundary
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -280,7 +312,7 @@ async def main() -> None:
     min_ts, max_ts = fetch_sqlite_range(sqlite_path)
 
     start_ts = _dt_to_ts(_parse_iso_utc(args.start)) if args.start else min_ts
-    end_ts = _dt_to_ts(_parse_iso_utc(args.end)) if args.end else max_ts + 1e-6
+    end_ts = _dt_to_ts(_parse_end_exclusive(args.end)) if args.end else max_ts + 1e-6
 
     bucket_secs = args.bucket_minutes * 60
     n_buckets = math.ceil((end_ts - start_ts) / bucket_secs)

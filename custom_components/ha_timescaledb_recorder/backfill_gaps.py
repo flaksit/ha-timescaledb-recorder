@@ -36,7 +36,6 @@ Algorithm (per bucket)
 """
 
 import argparse
-import asyncio
 import json
 import math
 import sqlite3
@@ -56,7 +55,6 @@ INSERT INTO ha_states (entity_id, state, attributes, last_updated, last_changed)
 VALUES (%s, %s, %s, %s, %s)
 """
 
-# Bucket-level count pre-check — cheap aggregate, no row fetching.
 PG_COUNT_SQL = """
 SELECT COUNT(*) FROM ha_states
 WHERE last_updated >= %s AND last_updated < %s
@@ -173,7 +171,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", metavar="ISO8601", default=None,
                    help="Earliest timestamp (UTC, inclusive). Default: earliest SQLite row.")
     p.add_argument("--end", metavar="ISO8601", default=None,
-                   help="Latest timestamp (UTC, exclusive). Default: latest SQLite row + 1 µs.")
+                   help="Latest timestamp (UTC, inclusive, precision-snapped). Default: latest SQLite row.")
     p.add_argument("--bucket-minutes", type=float, default=60.0, metavar="M",
                    help="Bucket width in minutes (default: 60). Larger = fewer PG queries, more memory.")
     p.add_argument("--batch-size", type=int, default=500, metavar="N",
@@ -230,28 +228,26 @@ def fetch_sqlite_bucket(
     return rows
 
 
-async def pg_bucket_count(
-    conn: psycopg.AsyncConnection,
+def pg_bucket_count(
+    conn: psycopg.Connection,
     start: datetime,
     end: datetime,
     entities_filter: set[str] | None = None,
 ) -> int:
     if entities_filter:
-        cur = await conn.execute(PG_COUNT_FILTERED_SQL, (start, end, list(entities_filter)))
+        row = conn.execute(PG_COUNT_FILTERED_SQL, (start, end, list(entities_filter))).fetchone()
     else:
-        cur = await conn.execute(PG_COUNT_SQL, (start, end))
-    row = await cur.fetchone()
+        row = conn.execute(PG_COUNT_SQL, (start, end)).fetchone()
     return int(row[0]) if row else 0
 
 
-async def fetch_pg_fingerprints(
-    conn: psycopg.AsyncConnection,
+def fetch_pg_fingerprints(
+    conn: psycopg.Connection,
     start: datetime,
     end: datetime,
     entity_ids: list[str],
 ) -> set[tuple[str, datetime]]:
-    cur = await conn.execute(PG_FINGERPRINT_SQL, (start, end, entity_ids))
-    rows = await cur.fetchall()
+    rows = conn.execute(PG_FINGERPRINT_SQL, (start, end, entity_ids)).fetchall()
     return {(r[0], r[1]) for r in rows}
 
 
@@ -280,8 +276,8 @@ def build_missing_rows(
     return missing
 
 
-async def insert_batches(
-    conn: psycopg.AsyncConnection,
+def insert_batches(
+    conn: psycopg.Connection,
     rows: list[tuple[Any, ...]],
     batch_size: int,
     dry_run: bool,
@@ -291,8 +287,8 @@ async def insert_batches(
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
         if not dry_run:
-            async with conn.transaction():
-                await conn.executemany(INSERT_SQL, batch)
+            with conn.transaction():
+                conn.executemany(INSERT_SQL, batch)
         inserted += len(batch)
     return inserted
 
@@ -320,7 +316,7 @@ def _detect_pg_dsn() -> str:
     )
 
 
-async def main() -> None:
+def main() -> None:
     args = parse_args()
     sqlite_path = str(Path(args.sqlite or _DEFAULT_SQLITE).expanduser().resolve())
     pg_dsn = args.pg_dsn or _detect_pg_dsn()
@@ -348,13 +344,11 @@ async def main() -> None:
     )
 
     # ── Connect ───────────────────────────────────────────────────────────────
-    pg_conn = await psycopg.AsyncConnection.connect(pg_dsn, autocommit=True)
+    with psycopg.connect(pg_dsn, autocommit=True) as pg_conn:
+        total_scanned = total_gaps = total_inserted = 0
+        buckets_skipped = bucket_idx = 0
+        last_print = time.monotonic()
 
-    total_scanned = total_gaps = total_inserted = 0
-    buckets_skipped = bucket_idx = 0
-    last_print = time.monotonic()
-
-    try:
         ts = start_ts
         while ts < end_ts:
             bucket_end = min(ts + bucket_secs, end_ts)
@@ -368,11 +362,11 @@ async def main() -> None:
                 ts = bucket_end
                 continue
 
-            pg_count = await pg_bucket_count(pg_conn, start_dt, end_dt)
+            pg_count = pg_bucket_count(pg_conn, start_dt, end_dt)
             if pg_count != sq_count and entities_filter:
                 # Other entities may explain the mismatch — recount with filter.
                 sq_count = sqlite_bucket_count(sqlite_path, ts, bucket_end, entities_filter)
-                pg_count = await pg_bucket_count(pg_conn, start_dt, end_dt, entities_filter)
+                pg_count = pg_bucket_count(pg_conn, start_dt, end_dt, entities_filter)
 
             if pg_count == sq_count:
                 # Same count → assume in sync (count collision for timestamped
@@ -385,7 +379,7 @@ async def main() -> None:
             sqlite_rows = fetch_sqlite_bucket(sqlite_path, ts, bucket_end, entities_filter)
             if sqlite_rows:
                 entity_ids = list({r["entity_id"] for r in sqlite_rows})
-                fingerprints = await fetch_pg_fingerprints(pg_conn, start_dt, end_dt, entity_ids)
+                fingerprints = fetch_pg_fingerprints(pg_conn, start_dt, end_dt, entity_ids)
                 missing = build_missing_rows(sqlite_rows, fingerprints)
 
                 if missing:
@@ -394,10 +388,7 @@ async def main() -> None:
                         for row in missing[:5]:
                             print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]!r}")
 
-                    inserted = await insert_batches(
-                        pg_conn, missing, args.batch_size, args.dry_run
-                    )
-                    total_inserted += inserted
+                    total_inserted += insert_batches(pg_conn, missing, args.batch_size, args.dry_run)
                     total_gaps += len(missing)
 
                 total_scanned += len(sqlite_rows)
@@ -414,9 +405,6 @@ async def main() -> None:
 
             ts = bucket_end
 
-    finally:
-        await pg_conn.close()
-
     dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
     print(
         f"Buckets skipped (in sync): {buckets_skipped:,} / {n_buckets:,}\n"
@@ -425,7 +413,7 @@ async def main() -> None:
 
 
 try:
-    asyncio.run(main())
+    main()
 except Exception as exc:
     print(f"Error: {exc}", file=sys.stderr)
     sys.exit(1)

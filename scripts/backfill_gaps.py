@@ -44,8 +44,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import psycopg
-from psycopg.types.json import Jsonb
+import psycopg  # pyright: ignore[reportMissingImports]
+from psycopg.types.json import Jsonb  # pyright: ignore[reportMissingImports]
 
 # ha_states has no unique constraint; deduplication handled by fingerprint
 # comparison before this INSERT runs. Placeholders are %s (psycopg3 style).

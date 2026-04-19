@@ -421,7 +421,11 @@ class MetadataSyncer:
         action = event.data["action"]
         if action == "reorder":
             return
-        area_id = event.data.get("area_id")
+        # Bracket access (not .get()) — reorder is already filtered above, so all remaining
+        # actions (create, update, remove) must carry area_id. KeyError here is intentional:
+        # it surfaces unexpected event shapes immediately rather than silently propagating None,
+        # which would cause NULL = NULL in SQL (matches zero rows) and hide the bug.
+        area_id = event.data["area_id"]
 
         if action == "remove":
             params = None

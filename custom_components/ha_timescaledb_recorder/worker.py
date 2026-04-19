@@ -143,12 +143,17 @@ class DbWorker:
                 item = self._queue.get(timeout=5.0)
             except queue.Empty:
                 # BUF-03: 5-second flush interval — queue timeout IS the flush timer.
+                # Capture count before clear — len(buffer) after clear always yields 0
+                # and gives no useful backpressure signal.
                 if buffer and self._conn is not None:
+                    flushed_count = len(buffer)
                     self._flush(buffer)
                     buffer.clear()
+                else:
+                    flushed_count = 0
                 _LOGGER.debug(
-                    "Flush tick — buffered=%d queue_depth=%d",
-                    len(buffer),
+                    "Flush tick — flushed=%d queue_depth=%d",
+                    flushed_count,
                     self._queue.qsize(),
                 )
                 continue

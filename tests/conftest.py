@@ -5,7 +5,7 @@ import pytest
 
 @pytest.fixture
 def mock_conn():
-    """Return a mock asyncpg connection."""
+    """Return a mock asyncpg connection (retained for legacy test_schema.py compat)."""
     conn = AsyncMock()
     return conn
 
@@ -19,6 +19,28 @@ def mock_pool(mock_conn):
     cm.__aexit__ = AsyncMock(return_value=False)
     pool.acquire = MagicMock(return_value=cm)
     return pool
+
+
+@pytest.fixture
+def mock_psycopg_conn():
+    """Return a (conn, cursor) pair of sync MagicMocks for psycopg3 tests.
+
+    The cursor is returned by conn.cursor().__enter__ so that ``with conn.cursor() as cur``
+    idioms work correctly in test code that calls change-detection helpers directly.
+    ``cur.fetchone`` defaults to returning None — tests override this per-scenario.
+    """
+    cur = MagicMock()
+    cur.fetchone = MagicMock(return_value=None)
+    cur.execute = MagicMock()
+
+    conn = MagicMock()
+    # Support both ``conn.cursor()`` (context manager) and direct assignment
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=cur)
+    cm.__exit__ = MagicMock(return_value=False)
+    conn.cursor = MagicMock(return_value=cm)
+
+    return conn, cur
 
 
 @pytest.fixture

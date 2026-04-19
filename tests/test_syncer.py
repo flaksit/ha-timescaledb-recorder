@@ -1,284 +1,229 @@
-"""Tests for MetadataSyncer — replaces Wave 0 stubs from Plan 01.
-
-Each test exercises one behavioural contract of MetadataSyncer as documented
-in RESEARCH.md (Patterns 1-5, Pitfalls 1-6) and CONTEXT.md (D-01 through D-11).
-"""
-from unittest.mock import AsyncMock, MagicMock, patch, call
+"""Unit tests for MetadataSyncer (queue relay + sync change-detection helpers)."""
+import queue
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
 from custom_components.ha_timescaledb_recorder.syncer import MetadataSyncer
-from custom_components.ha_timescaledb_recorder.const import (
-    SCD2_SNAPSHOT_ENTITY_SQL,
-    SCD2_CLOSE_ENTITY_SQL,
-    SCD2_INSERT_ENTITY_SQL,
-)
+from custom_components.ha_timescaledb_recorder.worker import MetaCommand
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Fixtures
 # ---------------------------------------------------------------------------
 
-def _make_syncer(hass, mock_pool):
-    """Return a MetadataSyncer with hass and pool; registries not yet set."""
-    return MetadataSyncer(hass=hass, pool=mock_pool)
+@pytest.fixture
+def shared_queue():
+    """Return a fresh Queue for each test."""
+    return queue.Queue()
 
 
-def _patch_registries(syncer, mock_entity_registry, device_reg=None, area_reg=None, label_reg=None):
-    """Directly inject mock registries so tests skip async_start() wiring."""
+@pytest.fixture
+def syncer(hass, shared_queue):
+    """Return a MetadataSyncer already wired to shared_queue via bind_queue()."""
+    s = MetadataSyncer(hass=hass)
+    s.bind_queue(shared_queue)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# bind_queue API
+# ---------------------------------------------------------------------------
+
+def test_bind_queue_wires_queue(hass):
+    """bind_queue() must store the queue reference on _queue."""
+    s = MetadataSyncer(hass=hass)
+    assert s._queue is None, "MetadataSyncer constructed without queue arg must have _queue=None"
+    q = queue.Queue()
+    s.bind_queue(q)
+    assert s._queue is q, "bind_queue() must store the exact Queue instance passed"
+
+
+# ---------------------------------------------------------------------------
+# Entity registry callback → MetaCommand enqueue
+# ---------------------------------------------------------------------------
+
+def test_entity_callback_enqueues_metacommand(syncer, shared_queue, mock_entity_registry):
+    """_handle_entity_registry_updated must enqueue a MetaCommand with correct fields."""
     syncer._entity_reg = mock_entity_registry
-    syncer._device_reg = device_reg or _empty_device_reg()
-    syncer._area_reg = area_reg or _empty_area_reg()
-    syncer._label_reg = label_reg or _empty_label_reg()
+
+    event = MagicMock()
+    event.data = {
+        "action": "update",
+        "entity_id": "sensor.living_room_temp",
+        "old_entity_id": None,
+    }
+    syncer._handle_entity_registry_updated(event)
+
+    assert shared_queue.qsize() == 1
+    cmd = shared_queue.get_nowait()
+    assert isinstance(cmd, MetaCommand)
+    assert cmd.registry == "entity"
+    assert cmd.action == "update"
+    # Field name is registry_id, NOT entity_id (MetaCommand is registry-agnostic)
+    assert cmd.registry_id == "sensor.living_room_temp"
+    assert cmd.old_id is None  # Field name is old_id, NOT old_entity_id
+    assert cmd.params is not None, "Non-remove action must extract params from registry entry"
 
 
-def _empty_device_reg():
-    reg = MagicMock()
-    reg.devices = MagicMock()
-    reg.devices.values = MagicMock(return_value=iter([]))
-    return reg
+def test_entity_remove_enqueues_params_none(syncer, shared_queue):
+    """Remove action must enqueue params=None — registry entry is already gone at remove time."""
+    syncer._entity_reg = MagicMock()
+
+    event = MagicMock()
+    event.data = {
+        "action": "remove",
+        "entity_id": "sensor.temp",
+        "old_entity_id": None,
+    }
+    syncer._handle_entity_registry_updated(event)
+
+    assert shared_queue.qsize() == 1
+    cmd = shared_queue.get_nowait()
+    assert cmd.params is None, "Remove action must not fetch params (registry entry already gone)"
+    assert cmd.action == "remove"
+    # async_get must NOT be called on remove — registry entry is gone (D-08)
+    syncer._entity_reg.async_get.assert_not_called()
 
 
-def _empty_area_reg():
-    reg = MagicMock()
-    reg.async_list_areas = MagicMock(return_value=[])
-    return reg
+def test_entity_rename_sets_old_id(syncer, shared_queue, mock_entity_registry):
+    """Rename (update with old_entity_id) must set cmd.old_id to the previous entity_id."""
+    syncer._entity_reg = mock_entity_registry
 
+    event = MagicMock()
+    event.data = {
+        "action": "update",
+        "entity_id": "sensor.living_room_temp",
+        "old_entity_id": "sensor.old_name",
+    }
+    syncer._handle_entity_registry_updated(event)
 
-def _empty_label_reg():
-    reg = MagicMock()
-    reg.async_list_labels = MagicMock(return_value=[])
-    return reg
+    cmd = shared_queue.get_nowait()
+    # old_id carries the pre-rename entity_id for the SCD2 close operation
+    assert cmd.old_id == "sensor.old_name"
+    assert cmd.registry_id == "sensor.living_room_temp"
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Area registry callback — reorder skip
 # ---------------------------------------------------------------------------
 
-async def test_initial_snapshot_inserts_all_entities(
-    hass, mock_pool, mock_conn, mock_entity_registry
-):
-    """Snapshot must call SCD2_SNAPSHOT_ENTITY_SQL once per entity.
+def test_area_reorder_skipped(syncer, shared_queue):
+    """Reorder events carry no data change and must be silently dropped (Pitfall 6)."""
+    event = MagicMock()
+    event.data = {"action": "reorder"}
+    syncer._handle_area_registry_updated(event)
+    assert shared_queue.qsize() == 0, "Reorder action must not enqueue any MetaCommand"
 
-    - Two entities in mock_entity_registry
-    - After _async_snapshot(), mock_conn.execute called exactly twice with
-      SCD2_SNAPSHOT_ENTITY_SQL as the first argument
-    """
-    syncer = _make_syncer(hass, mock_pool)
-    # Inject registries directly — two entities, zero devices/areas/labels
-    _patch_registries(syncer, mock_entity_registry)
 
-    await syncer._async_snapshot()
+# ---------------------------------------------------------------------------
+# Change-detection helpers (sync, called from worker thread via DbWorker)
+# ---------------------------------------------------------------------------
 
-    # Collect all first-argument SQL strings from execute calls
-    executed_sql = [c.args[0] for c in mock_conn.execute.call_args_list]
-    snapshot_calls = [s for s in executed_sql if s == SCD2_SNAPSHOT_ENTITY_SQL]
-    assert len(snapshot_calls) == 2, (
-        f"Expected 2 snapshot entity calls, got {len(snapshot_calls)}. "
-        f"All calls: {executed_sql}"
+def test_entity_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
+    """No existing row → always changed (first write for this entity_id)."""
+    _conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = None
+
+    # 13-element params tuple: entity_id at [0], name at [2], platform at [4], etc.
+    params = (
+        "sensor.temp",   # [0]  entity_id
+        "uuid-001",      # [1]  ha_entity_uuid
+        "Temperature",   # [2]  name
+        "sensor",        # [3]  domain
+        "zha",           # [4]  platform
+        None,            # [5]  device_id
+        None,            # [6]  area_id
+        [],              # [7]  labels
+        "temperature",   # [8]  device_class
+        "°C",            # [9]  unit_of_measurement
+        None,            # [10] disabled_by
+        datetime.now(timezone.utc),  # [11] valid_from
+        "{}",            # [12] extra
     )
+    assert syncer._entity_row_changed(cur, "sensor.temp", params) is True
 
 
-async def test_initial_snapshot_idempotent_on_restart(
-    hass, mock_pool, mock_conn, mock_entity_registry
-):
-    """Running the snapshot twice must use the WHERE NOT EXISTS SQL, not a plain INSERT.
+def test_entity_row_changed_returns_false_when_unchanged(syncer, mock_psycopg_conn):
+    """Identical row data → no change; helper must return False to suppress spurious SCD2 writes."""
+    _conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = {
+        "name": "Temperature",
+        "platform": "zha",
+        "device_id": None,
+        "area_id": None,
+        "labels": [],
+        "device_class": "temperature",
+        "unit_of_measurement": "°C",
+        "disabled_by": None,
+        "extra": "{}",
+    }
 
-    The WHERE NOT EXISTS guard in SCD2_SNAPSHOT_ENTITY_SQL ensures that re-running
-    the snapshot on HA restart is a no-op at the DB level for existing open rows.
-    This test verifies the correct SQL constant is used, not a plain INSERT.
-    """
-    syncer = _make_syncer(hass, mock_pool)
-
-    # Reset mock registry iterator between calls (iter is consumed after one pass)
-    from unittest.mock import MagicMock as MM
-
-    def make_entries():
-        from tests.conftest import _make_registry_entry
-        return [
-            _make_registry_entry(
-                entity_id="sensor.living_room_temp",
-                id="uuid-entity-001",
-                name="Living Room Temperature",
-                original_name="Temperature",
-                domain="sensor",
-                platform="zha",
-                device_id="device-001",
-                area_id="area-living-room",
-                labels={"indoor"},
-                device_class="temperature",
-                unit_of_measurement="°C",
-                disabled_by=None,
-            ),
-        ]
-
-    reg = MagicMock()
-    reg.entities = MagicMock()
-
-    call_count = 0
-
-    def fresh_values():
-        nonlocal call_count
-        call_count += 1
-        return iter(make_entries())
-
-    reg.entities.values = MagicMock(side_effect=fresh_values)
-    reg.async_get = MagicMock(side_effect=lambda eid: make_entries()[0])
-    _patch_registries(syncer, reg)
-
-    await syncer._async_snapshot()
-    await syncer._async_snapshot()
-
-    # Verify the idempotent snapshot SQL is used (not a plain INSERT)
-    executed_sql = [c.args[0] for c in mock_conn.execute.call_args_list]
-    assert all(
-        s == SCD2_SNAPSHOT_ENTITY_SQL for s in executed_sql if "dim_entities" in s
-    ), "Snapshot must use SCD2_SNAPSHOT_ENTITY_SQL (WHERE NOT EXISTS), not plain INSERT"
-    assert "WHERE NOT EXISTS" in SCD2_SNAPSHOT_ENTITY_SQL
-
-
-async def test_scd2_close_and_insert(hass, mock_pool, mock_conn, mock_entity_registry):
-    """An update event must: (a) close the old row, then (b) insert the new row.
-
-    Both calls must use the same timestamp (SCD2 consistency per D-08).
-    """
-    syncer = _make_syncer(hass, mock_pool)
-    _patch_registries(syncer, mock_entity_registry)
-
-    entity_id = "sensor.living_room_temp"
-    await syncer._async_process_entity_event("update", entity_id, None)
-
-    calls = mock_conn.execute.call_args_list
-    assert len(calls) == 2, f"Expected 2 execute calls (close + insert), got {len(calls)}"
-
-    close_sql, close_ts, close_eid = calls[0].args
-    insert_sql = calls[1].args[0]
-    insert_ts = calls[1].args[12]  # valid_from is 12th positional arg ($12)
-
-    assert close_sql == SCD2_CLOSE_ENTITY_SQL
-    assert insert_sql == SCD2_INSERT_ENTITY_SQL
-    assert close_eid == entity_id
-    # Both operations must share the same timestamp (D-08)
-    assert close_ts == insert_ts, "Close and insert must use the same timestamp"
-
-
-async def test_registry_event_create(hass, mock_pool, mock_conn, mock_entity_registry):
-    """A create event must trigger only an INSERT — no preceding close."""
-    syncer = _make_syncer(hass, mock_pool)
-    _patch_registries(syncer, mock_entity_registry)
-
-    await syncer._async_process_entity_event("create", "sensor.living_room_temp", None)
-
-    calls = mock_conn.execute.call_args_list
-    assert len(calls) == 1, f"Expected 1 execute call (insert only), got {len(calls)}"
-    assert calls[0].args[0] == SCD2_INSERT_ENTITY_SQL
-    assert SCD2_CLOSE_ENTITY_SQL not in [c.args[0] for c in calls]
-
-
-async def test_registry_event_remove(hass, mock_pool, mock_conn, mock_entity_registry):
-    """A remove event must close the open row without fetching from registry.
-
-    Registry.async_get must NOT be called — the entry is already gone (Pitfall 4).
-    """
-    syncer = _make_syncer(hass, mock_pool)
-    _patch_registries(syncer, mock_entity_registry)
-
-    entity_id = "sensor.living_room_temp"
-    await syncer._async_process_entity_event("remove", entity_id, None)
-
-    calls = mock_conn.execute.call_args_list
-    assert len(calls) == 1, f"Expected 1 execute call (close only), got {len(calls)}"
-    assert calls[0].args[0] == SCD2_CLOSE_ENTITY_SQL
-    assert SCD2_INSERT_ENTITY_SQL not in [c.args[0] for c in calls]
-
-    # Registry.async_get must NOT be called on remove (Pitfall 4)
-    mock_entity_registry.async_get.assert_not_called()
-
-
-async def test_entity_rename_scd2(hass, mock_pool, mock_conn, mock_entity_registry):
-    """A rename event must close the old entity_id row AND insert a new row.
-
-    Rename arrives as action=update with old_entity_id in event data (D-09, Pitfall 2).
-    """
-    syncer = _make_syncer(hass, mock_pool)
-    _patch_registries(syncer, mock_entity_registry)
-
-    old_entity_id = "sensor.old_name"
-    new_entity_id = "sensor.living_room_temp"
-
-    # Add old_entity_id to the registry mock for the fetch after rename
-    old_entry = MagicMock()
-    old_entry.entity_id = new_entity_id  # after rename, registry has the new entity_id
-    old_entry.id = "uuid-entity-001"
-    old_entry.name = "Living Room Temperature"
-    old_entry.original_name = "Temperature"
-    old_entry.platform = "zha"
-    old_entry.device_id = "device-001"
-    old_entry.area_id = "area-living-room"
-    old_entry.labels = {"indoor"}
-    old_entry.device_class = "temperature"
-    old_entry.unit_of_measurement = "°C"
-    old_entry.disabled_by = None
-
-    mock_entity_registry.async_get = MagicMock(return_value=old_entry)
-
-    await syncer._async_process_entity_event("update", new_entity_id, old_entity_id)
-
-    calls = mock_conn.execute.call_args_list
-    assert len(calls) == 2, f"Expected 2 execute calls (close old + insert new), got {len(calls)}"
-
-    close_sql, _ts, closed_eid = calls[0].args
-    insert_sql = calls[1].args[0]
-    inserted_eid = calls[1].args[1]  # $1 = entity_id
-
-    assert close_sql == SCD2_CLOSE_ENTITY_SQL
-    assert closed_eid == old_entity_id, (
-        f"Close must target old_entity_id '{old_entity_id}', got '{closed_eid}'"
+    params = (
+        "sensor.temp",   # [0]  entity_id
+        "uuid-001",      # [1]  ha_entity_uuid
+        "Temperature",   # [2]  name (matches row)
+        "sensor",        # [3]  domain
+        "zha",           # [4]  platform (matches row)
+        None,            # [5]  device_id (matches row)
+        None,            # [6]  area_id (matches row)
+        [],              # [7]  labels (matches row)
+        "temperature",   # [8]  device_class (matches row)
+        "°C",            # [9]  unit_of_measurement (matches row)
+        None,            # [10] disabled_by (matches row)
+        datetime.now(timezone.utc),  # [11] valid_from
+        "{}",            # [12] extra (matches row)
     )
-    assert insert_sql == SCD2_INSERT_ENTITY_SQL
-    assert inserted_eid == new_entity_id
+    assert syncer._entity_row_changed(cur, "sensor.temp", params) is False
 
 
-async def test_area_reorder_ignored(hass, mock_pool, mock_conn, mock_area_registry):
-    """An area event with action=reorder must be a no-op (Pitfall 6)."""
-    syncer = _make_syncer(hass, mock_pool)
-    _patch_registries(syncer, _empty_entity_reg(), area_reg=mock_area_registry)
+def test_entity_row_changed_returns_true_when_name_differs(syncer, mock_psycopg_conn):
+    """Changed name must trigger a new SCD2 row."""
+    _conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = {
+        "name": "Old Name",
+        "platform": "zha",
+        "device_id": None,
+        "area_id": None,
+        "labels": [],
+        "device_class": "temperature",
+        "unit_of_measurement": "°C",
+        "disabled_by": None,
+        "extra": "{}",
+    }
 
-    await syncer._async_process_area_event("reorder", None)
-
-    mock_conn.execute.assert_not_called()
-
-
-def _empty_entity_reg():
-    reg = MagicMock()
-    reg.entities = MagicMock()
-    reg.entities.values = MagicMock(return_value=iter([]))
-    reg.async_get = MagicMock(return_value=None)
-    return reg
-
-
-async def test_labels_serialized_as_list(
-    hass, mock_pool, mock_conn, mock_entity_registry
-):
-    """Entity labels (set[str]) must be converted to list before passing to asyncpg.
-
-    asyncpg raises TypeError when a Python set is passed as TEXT[] (Pitfall 5).
-    Verify the value reaching conn.execute for the labels parameter is a list.
-    """
-    syncer = _make_syncer(hass, mock_pool)
-    _patch_registries(syncer, mock_entity_registry)
-
-    # Use the first entity which has labels={"indoor", "climate"}
-    await syncer._async_process_entity_event("create", "sensor.living_room_temp", None)
-
-    calls = mock_conn.execute.call_args_list
-    assert len(calls) == 1
-
-    # $8 = labels (8th positional arg, index 8 in args tuple — SQL + 7 typed fields before it)
-    # args: (sql, entity_id, ha_entity_uuid, name, domain, platform, device_id, area_id, labels, ...)
-    # index:   0        1           2          3      4        5         6          7       8
-    labels_arg = calls[0].args[8]
-    assert isinstance(labels_arg, list), (
-        f"labels must be passed as list to asyncpg, got {type(labels_arg).__name__}: {labels_arg!r}"
+    params = (
+        "sensor.temp",   # [0]
+        "uuid-001",      # [1]
+        "New Name",      # [2]  name differs from row
+        "sensor",        # [3]
+        "zha",           # [4]
+        None,            # [5]
+        None,            # [6]
+        [],              # [7]
+        "temperature",   # [8]
+        "°C",            # [9]
+        None,            # [10]
+        datetime.now(timezone.utc),  # [11]
+        "{}",            # [12]
     )
+    assert syncer._entity_row_changed(cur, "sensor.temp", params) is True
+
+
+def test_device_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
+    """No existing device row → always changed."""
+    _conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = None
+    # 8-element params: device_id at [0], name at [1], etc.
+    params = (
+        "device-001",   # [0] device_id
+        "My Device",    # [1] name
+        "IKEA",         # [2] manufacturer
+        "Model X",      # [3] model
+        None,           # [4] area_id
+        [],             # [5] labels
+        datetime.now(timezone.utc),  # [6] valid_from
+        "{}",           # [7] extra
+    )
+    assert syncer._device_row_changed(cur, "device-001", params) is True

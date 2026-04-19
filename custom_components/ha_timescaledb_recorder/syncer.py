@@ -1,11 +1,12 @@
-"""MetadataSyncer: SCD2 dimension table writer for HA registry metadata."""
+"""MetadataSyncer: thin HA registry event relay that enqueues MetaCommand items for DbWorker."""
 import json
 import logging
+import queue
 from datetime import datetime, timezone
 from typing import Callable
 
-import asyncpg
 import attrs
+import psycopg
 
 from homeassistant.core import HomeAssistant, Event, callback
 from homeassistant.helpers import entity_registry as er
@@ -18,19 +19,12 @@ from homeassistant.helpers.area_registry import EVENT_AREA_REGISTRY_UPDATED
 from homeassistant.helpers.label_registry import EVENT_LABEL_REGISTRY_UPDATED
 
 from .const import (
-    SCD2_CLOSE_ENTITY_SQL,
-    SCD2_CLOSE_DEVICE_SQL,
-    SCD2_CLOSE_AREA_SQL,
-    SCD2_CLOSE_LABEL_SQL,
-    SCD2_SNAPSHOT_ENTITY_SQL,
-    SCD2_SNAPSHOT_DEVICE_SQL,
-    SCD2_SNAPSHOT_AREA_SQL,
-    SCD2_SNAPSHOT_LABEL_SQL,
-    SCD2_INSERT_ENTITY_SQL,
-    SCD2_INSERT_DEVICE_SQL,
-    SCD2_INSERT_AREA_SQL,
-    SCD2_INSERT_LABEL_SQL,
+    SELECT_ENTITY_CURRENT_SQL,
+    SELECT_DEVICE_CURRENT_SQL,
+    SELECT_AREA_CURRENT_SQL,
+    SELECT_LABEL_CURRENT_SQL,
 )
+from .worker import MetaCommand
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -83,7 +77,7 @@ _EXTRA_COMPARE_IGNORE = frozenset({"modified_at"})
 def _extra_changed(stored, new_json: str) -> bool:
     """Return True if extra JSONB changed in a way that warrants a new SCD2 row.
 
-    asyncpg returns JSONB columns as strings, so `stored` may be a str or dict.
+    `stored` may be a str or dict (DB drivers may return JSONB columns as either).
     Ignores fields in _EXTRA_COMPARE_IGNORE (e.g. modified_at) which HA updates
     on every internal write regardless of whether user-visible metadata changed.
     """
@@ -96,20 +90,19 @@ def _extra_changed(stored, new_json: str) -> bool:
 
 
 class MetadataSyncer:
-    """Capture HA registry metadata into PostgreSQL dimension tables with SCD2 tracking.
+    """Thin HA registry event relay that enqueues MetaCommand items for DbWorker.
 
-    Lifecycle mirrors StateIngester:
-    - async_start(): take initial full snapshot + subscribe to four registry events
-    - async_stop(): cancel all event subscriptions (no buffer to flush)
+    Lifecycle:
+    - async_start(): snapshot all four registries into the queue, then register event listeners
+    - async_stop(): cancel all event subscriptions (no buffer to flush — queue is owned by DbWorker)
 
-    All four registries (entity, device, area, label) are handled.  Incremental
-    updates use a close-and-insert SCD2 pattern keyed on the registry-level ID
-    (entity_id, device_id, area_id, label_id).
+    Design boundary (D-08): registry param extraction MUST happen in @callback context (event loop).
+    DB writes and change-detection reads run in the worker thread via MetaCommand dispatch.
     """
 
-    def __init__(self, hass: HomeAssistant, pool: asyncpg.Pool) -> None:
+    def __init__(self, hass: HomeAssistant, queue: queue.Queue | None = None) -> None:
         self._hass = hass
-        self._pool = pool
+        self._queue: queue.Queue | None = queue
         self._cancel_listeners: list[Callable] = []
         # Registry references — set in async_start(), used in event handlers
         self._entity_reg = None
@@ -117,15 +110,63 @@ class MetadataSyncer:
         self._area_reg = None
         self._label_reg = None
 
+    def bind_queue(self, q: queue.Queue) -> None:
+        """Wire the shared DbWorker queue after construction.
+
+        Called from async_setup_entry after DbWorker is created (which owns the queue).
+        Using a public method instead of direct _queue attribute mutation provides a
+        stable API and makes the two-phase construction intent explicit.
+        """
+        self._queue = q
+
     async def async_start(self) -> None:
-        """Take initial snapshot and subscribe to registry update events."""
+        """Iterate all four registries in the event loop and enqueue snapshot MetaCommands.
+
+        D-04: snapshot items are enqueued BEFORE registering event listeners to ensure
+        no registry events are missed and initial snapshot data is queued for the worker.
+
+        Accepted race window (D-04 design decision): there is a small window between the
+        snapshot iteration and listener registration where a registry change event could
+        be missed. This is an accepted risk per D-04 — the snapshot + listener ordering
+        minimises the window but does not eliminate it entirely. Phase 1 accepts this;
+        Phase 3 (backfill) can close any gaps via periodic reconciliation if needed.
+        """
         self._entity_reg = er.async_get(self._hass)
         self._device_reg = dr.async_get(self._hass)
         self._area_reg = ar.async_get(self._hass)
         self._label_reg = lr.async_get(self._hass)
 
-        await self._async_snapshot()
+        now = datetime.now(timezone.utc)
 
+        for entry in self._entity_reg.entities.values():
+            params = self._extract_entity_params(entry, now)
+            self._queue.put_nowait(MetaCommand(
+                registry="entity", action="create",
+                registry_id=entry.entity_id, old_id=None, params=params,
+            ))
+
+        for entry in self._device_reg.devices.values():
+            params = self._extract_device_params(entry, now)
+            self._queue.put_nowait(MetaCommand(
+                registry="device", action="create",
+                registry_id=entry.id, old_id=None, params=params,
+            ))
+
+        for entry in self._area_reg.async_list_areas():
+            params = self._extract_area_params(entry, now)
+            self._queue.put_nowait(MetaCommand(
+                registry="area", action="create",
+                registry_id=entry.id, old_id=None, params=params,
+            ))
+
+        for entry in self._label_reg.async_list_labels():
+            params = self._extract_label_params(entry, now)
+            self._queue.put_nowait(MetaCommand(
+                registry="label", action="create",
+                registry_id=entry.label_id, old_id=None, params=params,
+            ))
+
+        # Register listeners AFTER enqueuing snapshot (D-04: no missed events)
         self._cancel_listeners.append(
             self._hass.bus.async_listen(
                 EVENT_ENTITY_REGISTRY_UPDATED, self._handle_entity_registry_updated
@@ -147,32 +188,6 @@ class MetadataSyncer:
             )
         )
 
-    async def _async_snapshot(self) -> None:
-        """Write the initial full snapshot of all four registries.
-
-        Uses WHERE NOT EXISTS inserts so re-running on HA restart is a no-op
-        for entries that already have an open row (Pitfall 3).
-        All rows in a single snapshot share the same valid_from timestamp.
-        """
-        now = datetime.now(timezone.utc)
-
-        async with self._pool.acquire() as conn:
-            for entry in self._entity_reg.entities.values():
-                params = self._extract_entity_params(entry, now)
-                await conn.execute(SCD2_SNAPSHOT_ENTITY_SQL, *params)
-
-            for entry in self._device_reg.devices.values():
-                params = self._extract_device_params(entry, now)
-                await conn.execute(SCD2_SNAPSHOT_DEVICE_SQL, *params)
-
-            for entry in self._area_reg.async_list_areas():
-                params = self._extract_area_params(entry, now)
-                await conn.execute(SCD2_SNAPSHOT_AREA_SQL, *params)
-
-            for entry in self._label_reg.async_list_labels():
-                params = self._extract_label_params(entry, now)
-                await conn.execute(SCD2_SNAPSHOT_LABEL_SQL, *params)
-
     # ------------------------------------------------------------------
     # Field extraction helpers
     # ------------------------------------------------------------------
@@ -187,7 +202,7 @@ class MetadataSyncer:
         """
         name = entry.name if entry.name is not None else entry.original_name
         domain = entry.entity_id.split(".")[0]
-        # Convert set to list — asyncpg requires list for TEXT[] (Pitfall 5)
+        # Convert set to list — psycopg3 requires list for TEXT[] columns
         labels = list(entry.labels)
         disabled_by = entry.disabled_by.value if entry.disabled_by is not None else None
         extra = _build_extra(entry, _ENTITY_TYPED_KEYS)
@@ -243,24 +258,21 @@ class MetadataSyncer:
         return (entry.label_id, entry.name, entry.color, valid_from, extra)
 
     # ------------------------------------------------------------------
-    # Change detection helpers
+    # Change detection helpers (sync, called from worker thread via DbWorker)
     # ------------------------------------------------------------------
 
-    async def _entity_row_changed(self, conn, entity_id: str, new_params: tuple) -> bool:
-        """Return True if the current open row differs from new_params.
+    def _entity_row_changed(
+        self, cur: psycopg.Cursor, entity_id: str, new_params: tuple
+    ) -> bool:
+        """Return True if the current open entity row differs from new_params.
 
-        Fetches typed columns from the current open row and compares field-by-field.
-        A no-op event (e.g. HA invalidating _cache) returns False — skip SCD2 write.
+        Receives a dict_row cursor from DbWorker — row["name"] access is valid.
         new_params indices: 0=entity_id, 1=ha_entity_uuid, 2=name, 3=domain,
         4=platform, 5=device_id, 6=area_id, 7=labels, 8=device_class,
         9=unit_of_measurement, 10=disabled_by, 11=valid_from, 12=extra
         """
-        row = await conn.fetchrow(
-            "SELECT name, platform, device_id, area_id, labels, device_class,"
-            " unit_of_measurement, disabled_by, extra"
-            " FROM dim_entities WHERE entity_id = $1 AND valid_to IS NULL",
-            entity_id,
-        )
+        cur.execute(SELECT_ENTITY_CURRENT_SQL, (entity_id,))
+        row = cur.fetchone()
         if row is None:
             return True
         return (
@@ -275,17 +287,16 @@ class MetadataSyncer:
             or _extra_changed(row["extra"], new_params[12])
         )
 
-    async def _device_row_changed(self, conn, device_id: str, new_params: tuple) -> bool:
+    def _device_row_changed(
+        self, cur: psycopg.Cursor, device_id: str, new_params: tuple
+    ) -> bool:
         """Return True if the current open device row differs from new_params.
 
         new_params indices: 0=device_id, 1=name, 2=manufacturer, 3=model,
         4=area_id, 5=labels, 6=valid_from, 7=extra
         """
-        row = await conn.fetchrow(
-            "SELECT name, manufacturer, model, area_id, labels, extra"
-            " FROM dim_devices WHERE device_id = $1 AND valid_to IS NULL",
-            device_id,
-        )
+        cur.execute(SELECT_DEVICE_CURRENT_SQL, (device_id,))
+        row = cur.fetchone()
         if row is None:
             return True
         return (
@@ -297,15 +308,15 @@ class MetadataSyncer:
             or _extra_changed(row["extra"], new_params[7])
         )
 
-    async def _area_row_changed(self, conn, area_id: str, new_params: tuple) -> bool:
+    def _area_row_changed(
+        self, cur: psycopg.Cursor, area_id: str, new_params: tuple
+    ) -> bool:
         """Return True if the current open area row differs from new_params.
 
         new_params indices: 0=area_id, 1=name, 2=valid_from, 3=extra
         """
-        row = await conn.fetchrow(
-            "SELECT name, extra FROM dim_areas WHERE area_id = $1 AND valid_to IS NULL",
-            area_id,
-        )
+        cur.execute(SELECT_AREA_CURRENT_SQL, (area_id,))
+        row = cur.fetchone()
         if row is None:
             return True
         return (
@@ -313,15 +324,15 @@ class MetadataSyncer:
             or _extra_changed(row["extra"], new_params[3])
         )
 
-    async def _label_row_changed(self, conn, label_id: str, new_params: tuple) -> bool:
+    def _label_row_changed(
+        self, cur: psycopg.Cursor, label_id: str, new_params: tuple
+    ) -> bool:
         """Return True if the current open label row differs from new_params.
 
         new_params indices: 0=label_id, 1=name, 2=color, 3=valid_from, 4=extra
         """
-        row = await conn.fetchrow(
-            "SELECT name, color, extra FROM dim_labels WHERE label_id = $1 AND valid_to IS NULL",
-            label_id,
-        )
+        cur.execute(SELECT_LABEL_CURRENT_SQL, (label_id,))
+        row = cur.fetchone()
         if row is None:
             return True
         return (
@@ -336,53 +347,25 @@ class MetadataSyncer:
 
     @callback
     def _handle_entity_registry_updated(self, event: Event) -> None:
-        """Synchronous callback — schedules async processing on the event loop."""
+        """Extract entity registry params and enqueue MetaCommand (D-08: extract in event loop)."""
         action = event.data["action"]
         entity_id = event.data["entity_id"]
-        # old_entity_id is present only on renames (Pitfall 2)
         old_entity_id = event.data.get("old_entity_id")
-        self._hass.async_create_task(
-            self._async_process_entity_event(action, entity_id, old_entity_id)
-        )
 
-    async def _async_process_entity_event(
-        self, action: str, entity_id: str, old_entity_id: str | None
-    ) -> None:
-        """Apply SCD2 write for an entity registry event."""
-        now = datetime.now(timezone.utc)
-        try:
-            async with self._pool.acquire() as conn:
-                if action == "create":
-                    entry = self._entity_reg.async_get(entity_id)
-                    params = self._extract_entity_params(entry, now)
-                    await conn.execute(SCD2_INSERT_ENTITY_SQL, *params)
+        if action == "remove":
+            # Registry entry is already gone at this point — do NOT call async_get.
+            params = None
+        else:
+            entry = self._entity_reg.async_get(entity_id)
+            params = self._extract_entity_params(entry, datetime.now(timezone.utc))
 
-                elif action == "remove":
-                    # Do NOT fetch from registry — entry is already gone (Pitfall 4)
-                    await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, entity_id)
-
-                elif action == "update":
-                    entry = self._entity_reg.async_get(entity_id)
-                    params = self._extract_entity_params(entry, now)
-                    if old_entity_id is not None:
-                        # Rename: always write — old and new entity_id are different rows (D-09)
-                        await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, old_entity_id)
-                        await conn.execute(SCD2_INSERT_ENTITY_SQL, *params)
-                    elif await self._entity_row_changed(conn, entity_id, params):
-                        # Field change: close current row, insert updated row
-                        await conn.execute(SCD2_CLOSE_ENTITY_SQL, now, entity_id)
-                        await conn.execute(SCD2_INSERT_ENTITY_SQL, *params)
-                    else:
-                        _LOGGER.debug(
-                            "Skipping SCD2 write for entity %s — no meaningful field change",
-                            entity_id,
-                        )
-
-        except (asyncpg.PostgresConnectionError, OSError):
-            self._pool.expire_connections()
-            _LOGGER.warning(
-                "Connection error processing entity registry event for %s", entity_id
-            )
+        self._queue.put_nowait(MetaCommand(
+            registry="entity",
+            action=action,
+            registry_id=entity_id,
+            old_id=old_entity_id,
+            params=params,
+        ))
 
     # ------------------------------------------------------------------
     # Device registry event handling
@@ -390,43 +373,23 @@ class MetadataSyncer:
 
     @callback
     def _handle_device_registry_updated(self, event: Event) -> None:
-        """Synchronous callback — schedules async processing on the event loop."""
+        """Extract device registry params and enqueue MetaCommand."""
         action = event.data["action"]
         device_id = event.data["device_id"]
-        self._hass.async_create_task(
-            self._async_process_device_event(action, device_id)
-        )
 
-    async def _async_process_device_event(self, action: str, device_id: str) -> None:
-        """Apply SCD2 write for a device registry event."""
-        now = datetime.now(timezone.utc)
-        try:
-            async with self._pool.acquire() as conn:
-                if action == "create":
-                    entry = self._device_reg.async_get(device_id)
-                    params = self._extract_device_params(entry, now)
-                    await conn.execute(SCD2_INSERT_DEVICE_SQL, *params)
+        if action == "remove":
+            params = None
+        else:
+            entry = self._device_reg.async_get(device_id)
+            params = self._extract_device_params(entry, datetime.now(timezone.utc))
 
-                elif action == "remove":
-                    await conn.execute(SCD2_CLOSE_DEVICE_SQL, now, device_id)
-
-                elif action == "update":
-                    entry = self._device_reg.async_get(device_id)
-                    params = self._extract_device_params(entry, now)
-                    if await self._device_row_changed(conn, device_id, params):
-                        await conn.execute(SCD2_CLOSE_DEVICE_SQL, now, device_id)
-                        await conn.execute(SCD2_INSERT_DEVICE_SQL, *params)
-                    else:
-                        _LOGGER.debug(
-                            "Skipping SCD2 write for device %s — no meaningful field change",
-                            device_id,
-                        )
-
-        except (asyncpg.PostgresConnectionError, OSError):
-            self._pool.expire_connections()
-            _LOGGER.warning(
-                "Connection error processing device registry event for %s", device_id
-            )
+        self._queue.put_nowait(MetaCommand(
+            registry="device",
+            action=action,
+            registry_id=device_id,
+            old_id=None,
+            params=params,
+        ))
 
     # ------------------------------------------------------------------
     # Area registry event handling
@@ -434,50 +397,29 @@ class MetadataSyncer:
 
     @callback
     def _handle_area_registry_updated(self, event: Event) -> None:
-        """Synchronous callback — schedules async processing on the event loop."""
-        action = event.data["action"]
-        area_id = event.data.get("area_id")
-        self._hass.async_create_task(
-            self._async_process_area_event(action, area_id)
-        )
+        """Extract area registry params and enqueue MetaCommand.
 
-    async def _async_process_area_event(self, action: str, area_id: str | None) -> None:
-        """Apply SCD2 write for an area registry event.
-
-        Reorder events carry area_id=None (Pitfall 6) and are a no-op —
-        they only reorder the UI list, no data change worth tracking.
+        Reorder events (action="reorder") are skipped — these only affect UI ordering,
+        contain no data change, and have area_id=None which would corrupt the MetaCommand.
         """
+        action = event.data["action"]
         if action == "reorder":
             return
+        area_id = event.data.get("area_id")
 
-        now = datetime.now(timezone.utc)
-        try:
-            async with self._pool.acquire() as conn:
-                if action == "create":
-                    entry = self._area_reg.async_get_area(area_id)
-                    params = self._extract_area_params(entry, now)
-                    await conn.execute(SCD2_INSERT_AREA_SQL, *params)
+        if action == "remove":
+            params = None
+        else:
+            entry = self._area_reg.async_get_area(area_id)
+            params = self._extract_area_params(entry, datetime.now(timezone.utc))
 
-                elif action == "remove":
-                    await conn.execute(SCD2_CLOSE_AREA_SQL, now, area_id)
-
-                elif action == "update":
-                    entry = self._area_reg.async_get_area(area_id)
-                    params = self._extract_area_params(entry, now)
-                    if await self._area_row_changed(conn, area_id, params):
-                        await conn.execute(SCD2_CLOSE_AREA_SQL, now, area_id)
-                        await conn.execute(SCD2_INSERT_AREA_SQL, *params)
-                    else:
-                        _LOGGER.debug(
-                            "Skipping SCD2 write for area %s — no meaningful field change",
-                            area_id,
-                        )
-
-        except (asyncpg.PostgresConnectionError, OSError):
-            self._pool.expire_connections()
-            _LOGGER.warning(
-                "Connection error processing area registry event for %s", area_id
-            )
+        self._queue.put_nowait(MetaCommand(
+            registry="area",
+            action=action,
+            registry_id=area_id,
+            old_id=None,
+            params=params,
+        ))
 
     # ------------------------------------------------------------------
     # Label registry event handling
@@ -485,43 +427,23 @@ class MetadataSyncer:
 
     @callback
     def _handle_label_registry_updated(self, event: Event) -> None:
-        """Synchronous callback — schedules async processing on the event loop."""
+        """Extract label registry params and enqueue MetaCommand."""
         action = event.data["action"]
         label_id = event.data["label_id"]
-        self._hass.async_create_task(
-            self._async_process_label_event(action, label_id)
-        )
 
-    async def _async_process_label_event(self, action: str, label_id: str) -> None:
-        """Apply SCD2 write for a label registry event."""
-        now = datetime.now(timezone.utc)
-        try:
-            async with self._pool.acquire() as conn:
-                if action == "create":
-                    entry = self._label_reg.async_get_label(label_id)
-                    params = self._extract_label_params(entry, now)
-                    await conn.execute(SCD2_INSERT_LABEL_SQL, *params)
+        if action == "remove":
+            params = None
+        else:
+            entry = self._label_reg.async_get_label(label_id)
+            params = self._extract_label_params(entry, datetime.now(timezone.utc))
 
-                elif action == "remove":
-                    await conn.execute(SCD2_CLOSE_LABEL_SQL, now, label_id)
-
-                elif action == "update":
-                    entry = self._label_reg.async_get_label(label_id)
-                    params = self._extract_label_params(entry, now)
-                    if await self._label_row_changed(conn, label_id, params):
-                        await conn.execute(SCD2_CLOSE_LABEL_SQL, now, label_id)
-                        await conn.execute(SCD2_INSERT_LABEL_SQL, *params)
-                    else:
-                        _LOGGER.debug(
-                            "Skipping SCD2 write for label %s — no meaningful field change",
-                            label_id,
-                        )
-
-        except (asyncpg.PostgresConnectionError, OSError):
-            self._pool.expire_connections()
-            _LOGGER.warning(
-                "Connection error processing label registry event for %s", label_id
-            )
+        self._queue.put_nowait(MetaCommand(
+            registry="label",
+            action=action,
+            registry_id=label_id,
+            old_id=None,
+            params=params,
+        ))
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -29,9 +29,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
 """
 
 # {chunk_days} must be formatted before execution
-CREATE_HYPERTABLE_SQL = """
-SELECT create_hypertable('ha_states', 'last_updated',
-    chunk_time_interval => INTERVAL '{chunk_days} days',
+CREATE_HYPERTABLE_SQL = f"""
+SELECT create_hypertable('{TABLE_NAME}', 'last_updated',
+    chunk_time_interval => INTERVAL '{{chunk_days}} days',
     if_not_exists => TRUE);
 """
 
@@ -42,17 +42,17 @@ ALTER TABLE {TABLE_NAME} SET (
     timescaledb.compress_orderby = 'last_updated DESC');
 """
 
-REMOVE_COMPRESSION_POLICY_SQL = """
-SELECT remove_compression_policy('ha_states', if_exists => TRUE);
+REMOVE_COMPRESSION_POLICY_SQL = f"""
+SELECT remove_compression_policy('{TABLE_NAME}', if_exists => TRUE);
 """
 
 # {compress_hours} and {schedule_hours} must be formatted before execution.
 # schedule_hours = max(1, min(12, compress_hours // 2)) — runs at half the
 # compression window, capped at 12 h to avoid excessive polling.
-ADD_COMPRESSION_POLICY_SQL = """
-SELECT add_compression_policy('ha_states',
-    INTERVAL '{compress_hours} hours',
-    schedule_interval => INTERVAL '{schedule_hours} hours');
+ADD_COMPRESSION_POLICY_SQL = f"""
+SELECT add_compression_policy('{TABLE_NAME}',
+    INTERVAL '{{compress_hours}} hours',
+    schedule_interval => INTERVAL '{{schedule_hours}} hours');
 """
 
 CREATE_INDEX_SQL = f"""

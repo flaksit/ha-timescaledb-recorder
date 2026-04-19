@@ -2,8 +2,6 @@
 from dataclasses import dataclass
 import logging
 
-import asyncpg
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entityfilter import (
@@ -12,19 +10,15 @@ from homeassistant.helpers.entityfilter import (
 )
 
 from .const import (
-    CONF_BATCH_SIZE,
     CONF_CHUNK_INTERVAL,
     CONF_COMPRESS_AFTER,
     CONF_DSN,
-    CONF_FLUSH_INTERVAL,
-    DEFAULT_BATCH_SIZE,
     DEFAULT_COMPRESS_AFTER_HOURS,
     DEFAULT_CHUNK_INTERVAL_DAYS,
-    DEFAULT_FLUSH_INTERVAL,
 )
 from .ingester import StateIngester
-from .schema import sync_setup_schema as async_setup_schema  # renamed; plan 01-06 rewrites this file
 from .syncer import MetadataSyncer
+from .worker import DbWorker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,9 +27,9 @@ _LOGGER = logging.getLogger(__name__)
 class HaTimescaleDBData:
     """Runtime data stored on a config entry."""
 
+    worker: DbWorker
     ingester: StateIngester
     syncer: MetadataSyncer
-    pool: asyncpg.Pool
 
 
 HaTimescaleDBConfigEntry = ConfigEntry[HaTimescaleDBData]
@@ -57,58 +51,78 @@ def _get_entity_filter(entry):
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:
-    """Set up the TimescaleDB integration from a config entry."""
+    """Set up the TimescaleDB integration from a config entry.
+
+    D-01: no DB calls here — returns True immediately so HA startup is not blocked.
+    Worker thread starts and handles all DB operations asynchronously.
+
+    Rollback: if any component start raises after worker.start(), all started components
+    are stopped in reverse order before re-raising. This prevents orphaned background
+    threads if setup partially fails (e.g., registry enumeration raises in syncer.async_start).
+    """
     dsn = entry.data[CONF_DSN]
     options = entry.options
-
-    pool = await asyncpg.create_pool(
-        dsn,
-        min_size=1,
-        max_size=3,
-        max_inactive_connection_lifetime=300.0,
-        max_queries=50_000,
-        command_timeout=30.0,
-        ssl=False,
-    )
-
     chunk_interval_days = options.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS)
     compress_after_hours = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_HOURS)
-    await async_setup_schema(
-        pool,
+    entity_filter = _get_entity_filter(entry)
+
+    # Construct syncer first with no queue — bind_queue() called after worker creates it.
+    # Worker needs syncer for SCD2 change-detection; syncer needs worker.queue for enqueuing.
+    syncer = MetadataSyncer(hass=hass)
+    worker = DbWorker(
+        hass=hass,
+        dsn=dsn,
         chunk_interval_days=chunk_interval_days,
         compress_after_hours=compress_after_hours,
+        syncer=syncer,
     )
-
-    entity_filter = _get_entity_filter(entry)
-    batch_size = options.get(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE)
-    flush_interval = options.get(CONF_FLUSH_INTERVAL, DEFAULT_FLUSH_INTERVAL)
+    # Wire the real queue via public API (avoids direct _queue attribute mutation).
+    syncer.bind_queue(worker.queue)
 
     ingester = StateIngester(
         hass=hass,
-        pool=pool,
+        queue=worker.queue,
         entity_filter=entity_filter,
-        batch_size=batch_size,
-        flush_interval=flush_interval,
     )
-    ingester.async_start()
 
-    syncer = MetadataSyncer(hass=hass, pool=pool)
-    await syncer.async_start()
+    # Start components in dependency order with rollback on failure.
+    worker.start()  # starts daemon thread; returns immediately (D-01)
+    try:
+        ingester.async_start()  # registers STATE_CHANGED listener (sync)
+        try:
+            await syncer.async_start()  # enqueues registry snapshots + registers 4 listeners
+        except Exception:
+            # syncer.async_start() failed — stop ingester and worker before re-raising.
+            _LOGGER.exception("syncer.async_start() failed; rolling back setup")
+            ingester.stop()
+            await worker.async_stop()
+            raise
+    except Exception:
+        # ingester.async_start() failed (or re-raised from syncer block) — stop worker.
+        # Note: ingester.stop() is safe to call even if async_start() never completed
+        # (it guards on self._cancel_listener is not None).
+        await worker.async_stop()
+        raise
 
-    entry.runtime_data = HaTimescaleDBData(ingester=ingester, syncer=syncer, pool=pool)
+    entry.runtime_data = HaTimescaleDBData(worker=worker, ingester=ingester, syncer=syncer)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> None:
-    """Restart the ingester when options change (applies new values immediately)."""
+    """Restart the integration when options change."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:
-    """Unload a config entry — stop ingester, close pool."""
+    """Unload a config entry.
+
+    Stop event listeners first so no new items are enqueued during shutdown,
+    then stop the worker (puts _STOP sentinel, awaits thread.join(timeout=30) via executor job).
+    WATCH-02: never call run_coroutine_threadsafe().result() here — deadlocks on shutdown.
+    """
     data: HaTimescaleDBData = entry.runtime_data
-    await data.ingester.async_stop()
-    await data.syncer.async_stop()
-    await data.pool.close()
+    data.ingester.stop()            # sync: cancels STATE_CHANGED listener (not async_stop)
+    await data.syncer.async_stop()  # cancels 4 registry listeners
+    await data.worker.async_stop()  # puts _STOP sentinel, awaits thread.join(timeout=30)
     return True

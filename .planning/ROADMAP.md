@@ -26,7 +26,17 @@ The v1.1 milestone refactors the write path from an async, event-loop-resident a
   3. The worker thread is shut down via a sentinel value in the queue; HA's stop handler awaits `async_add_executor_job(thread.join)` and never deadlocks
   4. psycopg3 `Jsonb()` wrappers and `TEXT[]` list adaptation produce correct inserts for the `ha_states` hypertable columns
   5. All `hass.async_*` calls from the worker use `hass.add_job` or `run_coroutine_threadsafe`; no unsafe cross-thread calls
-**Plans**: TBD
+**Plans**: 8 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Migrate const.py SQL placeholders $N→%s; add SELECT_*_CURRENT_SQL constants
+- [ ] 01-02-PLAN.md — Convert schema.py to sync sync_setup_schema(conn, ...)
+- [ ] 01-03-PLAN.md — Create worker.py: DbWorker, StateRow, MetaCommand, _STOP
+- [ ] 01-04-PLAN.md — Refactor ingester.py to thin queue relay (StateRow enqueue)
+- [ ] 01-05-PLAN.md — Refactor syncer.py to thin relay + sync change-detection helpers
+- [ ] 01-06-PLAN.md — Wire __init__.py lifecycle; update manifest.json to psycopg[binary]==3.3.3
+- [ ] 01-07-PLAN.md — Create test_worker.py; add mock_psycopg_conn to conftest.py
+- [ ] 01-08-PLAN.md — Rewrite test_ingester.py, test_syncer.py, test_schema.py
 
 ### Phase 2: Durability Story
 **Goal**: The integration survives DB outages up to ~10 days without data loss; RAM buffer is bounded; gaps are filled from HA sqlite on startup and recovery; transient SQL errors are retried silently
@@ -58,6 +68,6 @@ The v1.1 milestone refactors the write path from an async, event-loop-resident a
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Thread Worker Foundation | 0/TBD | Not started | - |
+| 1. Thread Worker Foundation | 0/8 | In progress | - |
 | 2. Durability Story | 0/TBD | Not started | - |
 | 3. Hardening and Observability | 0/TBD | Not started | - |

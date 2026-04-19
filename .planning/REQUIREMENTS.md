@@ -85,7 +85,7 @@
 
 ## Traceability
 
-Updated during roadmap creation.
+Updated by roadmap creation (2026-04-19).
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
@@ -120,10 +120,12 @@ Updated during roadmap creation.
 | SQLERR-05 | Phase 2 | Pending |
 
 **Coverage:**
-- v1 requirements: 25 total
-- Mapped to phases: 25
+- v1 requirements: 29 total (WORK×5, BUF×3, BACK×6, META×3, WATCH×3, OBS×4, SQLERR×5)
+- Mapped to phases: 29
 - Unmapped: 0 ✓
+
+Note: The pre-roadmap header said "25 total" — actual count is 29 after full enumeration.
 
 ---
 *Requirements defined: 2026-04-19*
-*Last updated: 2026-04-19 after initial definition*
+*Last updated: 2026-04-19 — traceability confirmed during roadmap creation*

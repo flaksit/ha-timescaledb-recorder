@@ -23,7 +23,7 @@ from .const import (
     DEFAULT_FLUSH_INTERVAL,
 )
 from .ingester import StateIngester
-from .schema import async_setup_schema
+from .schema import sync_setup_schema as async_setup_schema  # renamed; plan 01-06 rewrites this file
 from .syncer import MetadataSyncer
 
 _LOGGER = logging.getLogger(__name__)

@@ -34,9 +34,9 @@ Plans:
 - [x] 01-03-PLAN.md — Create worker.py: DbWorker, StateRow, MetaCommand, _STOP
 - [x] 01-04-PLAN.md — Refactor ingester.py to thin queue relay (StateRow enqueue)
 - [x] 01-05-PLAN.md — Refactor syncer.py to thin relay + sync change-detection helpers
-- [ ] 01-06-PLAN.md — Wire __init__.py lifecycle; update manifest.json to psycopg[binary]==3.3.3
-- [ ] 01-07-PLAN.md — Create test_worker.py; add mock_psycopg_conn to conftest.py
-- [ ] 01-08-PLAN.md — Rewrite test_ingester.py, test_syncer.py, test_schema.py
+- [x] 01-06-PLAN.md — Wire __init__.py lifecycle; update manifest.json to psycopg[binary]==3.3.3
+- [x] 01-07-PLAN.md — Create test_worker.py; add mock_psycopg_conn to conftest.py
+- [x] 01-08-PLAN.md — Rewrite test_ingester.py, test_syncer.py, test_schema.py
 
 ### Phase 2: Durability Story
 **Goal**: The integration survives DB outages up to ~10 days without data loss; RAM buffer is bounded; gaps are filled from HA sqlite on startup and recovery; transient SQL errors are retried silently

@@ -140,10 +140,7 @@ def _parse_end_exclusive(s: str) -> datetime:
     """
     from datetime import timedelta
     dt = _parse_iso_utc(s)
-    # Strip timezone suffix to inspect the structural precision of the bare string.
-    bare = s.replace("Z", "").split("+")[0].split("-")
-    # bare after split on "-": ["2026", "04", "10"] or ["2026", "04", "10T14:30"]
-    # Simpler: work on the original string directly.
+    # Strip timezone suffix to inspect structural precision of the input string.
     b = s.split("+")[0].rstrip("Z").strip()
     if "T" not in b:
         return dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)

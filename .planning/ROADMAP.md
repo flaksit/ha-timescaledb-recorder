@@ -49,7 +49,22 @@ Plans:
   4. On DB-healthy transition, all four registry tables (entities, devices, areas, labels) are re-snapshotted idempotently via `WHERE NOT EXISTS`; current state is always correct after recovery
   5. `PostgresConnectionError`, `OSError`, `DeadlockDetected`, and serialization errors keep rows in the buffer and retry on next flush cycle without logging errors
   6. `ON CONFLICT (last_updated, entity_id) DO NOTHING` dedup is only used when TimescaleDB ≥ 2.18.1 is confirmed; a startup check or warning gate enforces this
-**Plans**: TBD
+**Plans**: 13 plans
+
+Plans:
+- [ ] 02-01-PLAN.md — Add Phase 2 tunables + CREATE_UNIQUE_INDEX_SQL + SELECT_WATERMARK/OPEN_ENTITIES SQL to const.py; execute unique index in schema.py
+- [ ] 02-02-PLAN.md — Create issues.py (create/clear buffer_dropping) + strings.json "issues" section
+- [ ] 02-03-PLAN.md — Create retry.py with retry_until_success decorator (D-07)
+- [ ] 02-04-PLAN.md — Create overflow_queue.py with OverflowQueue drop-newest-on-full (D-02 + D-11)
+- [ ] 02-05-PLAN.md — Create persistent_queue.py with file-backed FIFO (D-03)
+- [ ] 02-06-PLAN.md — Retire DbWorker/MetaCommand from worker.py; create states_worker.py with TimescaledbStateRecorderThread (D-04 + D-06 + D-15)
+- [ ] 02-07-PLAN.md — Create meta_worker.py with TimescaledbMetaRecorderThread dispatching via Phase 1 SCD2 helpers (D-05)
+- [ ] 02-08-PLAN.md — Create backfill.py with backfill_orchestrator + _fetch_slice_raw (D-08)
+- [ ] 02-09-PLAN.md — Retarget ingester.py to OverflowQueue; retarget syncer.py to PersistentQueue with JSON-safe dicts (D-15-b/c)
+- [ ] 02-10-PLAN.md — Rewrite __init__.py for D-12 8-step startup + D-13 6-step shutdown + initial registry backfill + overflow watcher
+- [ ] 02-11-PLAN.md — Unit tests for Wave 1 primitives (overflow_queue, persistent_queue, retry, issues)
+- [ ] 02-12-PLAN.md — Unit tests for Wave 2/3 services (states_worker, meta_worker, backfill)
+- [ ] 02-13-PLAN.md — Retarget Phase 1 tests (test_worker, test_ingester, test_syncer, test_schema, test_init); full-suite green check
 
 ### Phase 3: Hardening and Observability
 **Goal**: The integration surfaces ongoing problems in the HA Repairs UI and fires one-shot notifications for critical events; data errors are isolated per-row and never drop an entire batch; code bugs produce critical logs and repair issues
@@ -69,5 +84,5 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Thread Worker Foundation | 0/8 | In progress | - |
-| 2. Durability Story | 0/TBD | Not started | - |
+| 2. Durability Story | 0/13 | Not started | - |
 | 3. Hardening and Observability | 0/TBD | Not started | - |

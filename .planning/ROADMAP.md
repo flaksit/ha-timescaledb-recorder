@@ -77,7 +77,17 @@ Plans:
   4. `ProgrammingError` and `SyntaxError` (code bugs or schema drift) produce a critical-level log entry and a repair issue; no retry occurs
   5. The watchdog async task detects worker thread death, restarts the thread, and fires a `persistent_notification`; unhandled exceptions in the worker are caught and routed through the same restart path
   6. `strings.json` ships an `"issues"` section with title and description for every repair issue `translation_key`; no missing-key warnings appear in HA logs
-**Plans**: TBD
+**Plans**: 8 plans
+
+Plans:
+- [ ] 03-01-PLAN.md — Phase 3 constants + strings.json translation keys + issues.py helpers
+- [ ] 03-02-PLAN.md — notifications.py: notify_watchdog_recovery + notify_backfill_gap
+- [ ] 03-03-PLAN.md — Extend retry_until_success with on_recovery + on_sustained_fail hooks (TDD)
+- [ ] 03-04-PLAN.md — Wire Phase 3 hooks + _last_* context in states_worker and meta_worker
+- [ ] 03-05-PLAN.md — Backfill gap detection + retry-wrap read paths
+- [ ] 03-06-PLAN.md — watchdog.py: watchdog_loop + spawn factories
+- [ ] 03-07-PLAN.md — Wire watchdog + orchestrator done_callback + recorder_disabled in __init__.py
+- [ ] 03-08-PLAN.md — Update REQUIREMENTS.md and ROADMAP.md per D-01 / D-12
 
 ## Progress
 

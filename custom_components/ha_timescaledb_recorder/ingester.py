@@ -1,10 +1,10 @@
 """StateIngester: thin event relay that enqueues state changes to the worker queue."""
 import logging
-import queue
 
 from homeassistant.core import HomeAssistant, Event, callback
 from homeassistant.helpers.entityfilter import EntityFilter
 
+from .overflow_queue import OverflowQueue
 from .worker import StateRow
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class StateIngester:
     def __init__(
         self,
         hass: HomeAssistant,
-        queue: queue.Queue,
+        queue: OverflowQueue,
         entity_filter: EntityFilter,
     ) -> None:
         self._hass = hass
@@ -57,6 +57,7 @@ class StateIngester:
         if not self._entity_filter(entity_id):
             return
 
+        # OverflowQueue.put_nowait never raises queue.Full (D-02-b); safe from @callback.
         self._queue.put_nowait(StateRow(
             entity_id=entity_id,
             state=new_state.state,

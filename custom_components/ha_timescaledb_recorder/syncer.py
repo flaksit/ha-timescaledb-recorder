@@ -1,7 +1,6 @@
-"""MetadataSyncer: thin HA registry event relay that enqueues MetaCommand items for DbWorker."""
+"""MetadataSyncer: thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker."""
 import json
 import logging
-import queue
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -24,7 +23,7 @@ from .const import (
     SELECT_AREA_CURRENT_SQL,
     SELECT_LABEL_CURRENT_SQL,
 )
-from .worker import MetaCommand
+from .persistent_queue import PersistentQueue
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -89,20 +88,38 @@ def _extra_changed(stored, new_json: str) -> bool:
     )
 
 
+def _to_json_safe(params: tuple | list | None) -> list | None:
+    """Convert params tuple to a JSON-serializable list.
+
+    datetime → isoformat() string (meta_worker._rehydrate_params reverses this).
+    All other types (str, int, float, list[str], None) pass through unchanged.
+    """
+    if params is None:
+        return None
+    return [
+        v.isoformat() if isinstance(v, datetime) else v
+        for v in params
+    ]
+
+
 class MetadataSyncer:
-    """Thin HA registry event relay that enqueues MetaCommand items for DbWorker.
+    """Thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker.
 
     Lifecycle:
     - async_start(): snapshot all four registries into the queue, then register event listeners
-    - async_stop(): cancel all event subscriptions (no buffer to flush — queue is owned by DbWorker)
+    - async_stop(): cancel all event subscriptions (no buffer to flush — queue is owned by MetaWorker)
 
     Design boundary (D-08): registry param extraction MUST happen in @callback context (event loop).
-    DB writes and change-detection reads run in the worker thread via MetaCommand dispatch.
+    DB writes and change-detection reads run in the meta worker thread.
     """
 
-    def __init__(self, hass: HomeAssistant, queue: queue.Queue | None = None) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        meta_queue: PersistentQueue | None = None,
+    ) -> None:
         self._hass = hass
-        self._queue: queue.Queue | None = queue
+        self._meta_queue: PersistentQueue | None = meta_queue
         self._cancel_listeners: list[Callable] = []
         # Registry references — set in async_start(), used in event handlers
         self._entity_reg = None
@@ -110,17 +127,15 @@ class MetadataSyncer:
         self._area_reg = None
         self._label_reg = None
 
-    def bind_queue(self, q: queue.Queue) -> None:
-        """Wire the shared DbWorker queue after construction.
-
-        Called from async_setup_entry after DbWorker is created (which owns the queue).
-        Using a public method instead of direct _queue attribute mutation provides a
-        stable API and makes the two-phase construction intent explicit.
+    def bind_meta_queue(self, q: PersistentQueue) -> None:
+        """Wire the PersistentQueue after construction. Used by __init__.py
+        when the queue must exist before the syncer is constructed but is
+        still allowed to be assigned post-hoc for test flexibility.
         """
-        self._queue = q
+        self._meta_queue = q
 
     async def async_start(self) -> None:
-        """Iterate all four registries in the event loop and enqueue snapshot MetaCommands.
+        """Iterate all four registries in the event loop and enqueue snapshot items to PersistentQueue.
 
         D-04: snapshot items are enqueued BEFORE registering event listeners to ensure
         no registry events are missed and initial snapshot data is queued for the worker.
@@ -140,31 +155,51 @@ class MetadataSyncer:
 
         for entry in self._entity_reg.entities.values():
             params = self._extract_entity_params(entry, now)
-            self._queue.put_nowait(MetaCommand(
-                registry="entity", action="create",
-                registry_id=entry.entity_id, old_id=None, params=params,
-            ))
+            item = {
+                "registry": "entity",
+                "action": "create",
+                "registry_id": entry.entity_id,
+                "old_id": None,
+                "params": _to_json_safe(params),
+                "enqueued_at": now.isoformat(),
+            }
+            self._hass.async_create_task(self._meta_queue.put_async(item))
 
         for entry in self._device_reg.devices.values():
             params = self._extract_device_params(entry, now)
-            self._queue.put_nowait(MetaCommand(
-                registry="device", action="create",
-                registry_id=entry.id, old_id=None, params=params,
-            ))
+            item = {
+                "registry": "device",
+                "action": "create",
+                "registry_id": entry.id,
+                "old_id": None,
+                "params": _to_json_safe(params),
+                "enqueued_at": now.isoformat(),
+            }
+            self._hass.async_create_task(self._meta_queue.put_async(item))
 
         for entry in self._area_reg.async_list_areas():
             params = self._extract_area_params(entry, now)
-            self._queue.put_nowait(MetaCommand(
-                registry="area", action="create",
-                registry_id=entry.id, old_id=None, params=params,
-            ))
+            item = {
+                "registry": "area",
+                "action": "create",
+                "registry_id": entry.id,
+                "old_id": None,
+                "params": _to_json_safe(params),
+                "enqueued_at": now.isoformat(),
+            }
+            self._hass.async_create_task(self._meta_queue.put_async(item))
 
         for entry in self._label_reg.async_list_labels():
             params = self._extract_label_params(entry, now)
-            self._queue.put_nowait(MetaCommand(
-                registry="label", action="create",
-                registry_id=entry.label_id, old_id=None, params=params,
-            ))
+            item = {
+                "registry": "label",
+                "action": "create",
+                "registry_id": entry.label_id,
+                "old_id": None,
+                "params": _to_json_safe(params),
+                "enqueued_at": now.isoformat(),
+            }
+            self._hass.async_create_task(self._meta_queue.put_async(item))
 
         # Register listeners AFTER enqueuing snapshot (D-04: no missed events)
         self._cancel_listeners.append(
@@ -347,7 +382,7 @@ class MetadataSyncer:
 
     @callback
     def _handle_entity_registry_updated(self, event: Event) -> None:
-        """Extract entity registry params and enqueue MetaCommand (D-08: extract in event loop)."""
+        """Extract entity registry params and enqueue to PersistentQueue (D-08: extract in event loop)."""
         action = event.data["action"]
         entity_id = event.data["entity_id"]
         old_entity_id = event.data.get("old_entity_id")
@@ -367,13 +402,15 @@ class MetadataSyncer:
                 return
             params = self._extract_entity_params(entry, datetime.now(timezone.utc))
 
-        self._queue.put_nowait(MetaCommand(
-            registry="entity",
-            action=action,
-            registry_id=entity_id,
-            old_id=old_entity_id,
-            params=params,
-        ))
+        item = {
+            "registry": "entity",
+            "action": action,
+            "registry_id": entity_id,
+            "old_id": old_entity_id,
+            "params": _to_json_safe(params),
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._hass.async_create_task(self._meta_queue.put_async(item))
 
     # ------------------------------------------------------------------
     # Device registry event handling
@@ -381,7 +418,7 @@ class MetadataSyncer:
 
     @callback
     def _handle_device_registry_updated(self, event: Event) -> None:
-        """Extract device registry params and enqueue MetaCommand."""
+        """Extract device registry params and enqueue to PersistentQueue."""
         action = event.data["action"]
         device_id = event.data["device_id"]
 
@@ -399,13 +436,15 @@ class MetadataSyncer:
                 return
             params = self._extract_device_params(entry, datetime.now(timezone.utc))
 
-        self._queue.put_nowait(MetaCommand(
-            registry="device",
-            action=action,
-            registry_id=device_id,
-            old_id=None,
-            params=params,
-        ))
+        item = {
+            "registry": "device",
+            "action": action,
+            "registry_id": device_id,
+            "old_id": None,
+            "params": _to_json_safe(params),
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._hass.async_create_task(self._meta_queue.put_async(item))
 
     # ------------------------------------------------------------------
     # Area registry event handling
@@ -413,10 +452,10 @@ class MetadataSyncer:
 
     @callback
     def _handle_area_registry_updated(self, event: Event) -> None:
-        """Extract area registry params and enqueue MetaCommand.
+        """Extract area registry params and enqueue to PersistentQueue.
 
         Reorder events (action="reorder") are skipped — these only affect UI ordering,
-        contain no data change, and have area_id=None which would corrupt the MetaCommand.
+        contain no data change, and have area_id=None which would produce a corrupt item.
         """
         action = event.data["action"]
         if action == "reorder":
@@ -441,13 +480,15 @@ class MetadataSyncer:
                 return
             params = self._extract_area_params(entry, datetime.now(timezone.utc))
 
-        self._queue.put_nowait(MetaCommand(
-            registry="area",
-            action=action,
-            registry_id=area_id,
-            old_id=None,
-            params=params,
-        ))
+        item = {
+            "registry": "area",
+            "action": action,
+            "registry_id": area_id,
+            "old_id": None,
+            "params": _to_json_safe(params),
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._hass.async_create_task(self._meta_queue.put_async(item))
 
     # ------------------------------------------------------------------
     # Label registry event handling
@@ -455,7 +496,7 @@ class MetadataSyncer:
 
     @callback
     def _handle_label_registry_updated(self, event: Event) -> None:
-        """Extract label registry params and enqueue MetaCommand."""
+        """Extract label registry params and enqueue to PersistentQueue."""
         action = event.data["action"]
         label_id = event.data["label_id"]
 
@@ -473,13 +514,15 @@ class MetadataSyncer:
                 return
             params = self._extract_label_params(entry, datetime.now(timezone.utc))
 
-        self._queue.put_nowait(MetaCommand(
-            registry="label",
-            action=action,
-            registry_id=label_id,
-            old_id=None,
-            params=params,
-        ))
+        item = {
+            "registry": "label",
+            "action": action,
+            "registry_id": label_id,
+            "old_id": None,
+            "params": _to_json_safe(params),
+            "enqueued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._hass.async_create_task(self._meta_queue.put_async(item))
 
     # ------------------------------------------------------------------
     # Lifecycle

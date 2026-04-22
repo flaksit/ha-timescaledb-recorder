@@ -57,8 +57,8 @@ Plans:
 - [x] 02-03-PLAN.md — Create retry.py with retry_until_success decorator (D-07)
 - [x] 02-04-PLAN.md — Create overflow_queue.py with OverflowQueue drop-newest-on-full (D-02 + D-11)
 - [x] 02-05-PLAN.md — Create persistent_queue.py with file-backed FIFO (D-03)
-- [ ] 02-06-PLAN.md — Retire DbWorker/MetaCommand from worker.py; create states_worker.py with TimescaledbStateRecorderThread (D-04 + D-06 + D-15)
-- [ ] 02-07-PLAN.md — Create meta_worker.py with TimescaledbMetaRecorderThread dispatching via Phase 1 SCD2 helpers (D-05)
+- [x] 02-06-PLAN.md — Retire DbWorker/MetaCommand from worker.py; create states_worker.py with TimescaledbStateRecorderThread (D-04 + D-06 + D-15)
+- [x] 02-07-PLAN.md — Create meta_worker.py with TimescaledbMetaRecorderThread dispatching via Phase 1 SCD2 helpers (D-05)
 - [ ] 02-08-PLAN.md — Create backfill.py with backfill_orchestrator + _fetch_slice_raw (D-08)
 - [ ] 02-09-PLAN.md — Retarget ingester.py to OverflowQueue; retarget syncer.py to PersistentQueue with JSON-safe dicts (D-15-b/c)
 - [ ] 02-10-PLAN.md — Rewrite __init__.py for D-12 8-step startup + D-13 6-step shutdown + initial registry backfill + overflow watcher
@@ -84,5 +84,5 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Thread Worker Foundation | 0/8 | In progress | - |
-| 2. Durability Story | 5/13 | In progress | - |
+| 2. Durability Story | 7/13 | In progress | - |
 | 3. Hardening and Observability | 0/TBD | Not started | - |

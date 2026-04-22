@@ -33,5 +33,11 @@
         }
       }
     }
+  },
+  "issues": {
+    "buffer_dropping": {
+      "title": "TimescaleDB recorder buffer overflow",
+      "description": "The TimescaleDB recorder in-memory buffer filled up and is dropping state events. This usually means the TimescaleDB database has been unavailable for an extended period. Dropped events will be recovered automatically from Home Assistant's sqlite recorder once the database is reachable again. No user action is required; this issue will clear itself."
+    }
   }
 }

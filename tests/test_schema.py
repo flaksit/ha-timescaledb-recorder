@@ -5,41 +5,49 @@ from custom_components.ha_timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 15 SQL statements.
+    """sync_setup_schema must execute exactly 16 SQL statements.
 
-    6 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
-    remove_compression_policy, add_compression_policy, CREATE INDEX)
+    7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
+    remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
     + 4 dimension table DDL (entities, devices, areas, labels)
     + 5 dimension table indexes (entities compound, entities current-row,
       devices, areas, labels)
-    = 15 total
+    = 16 total
+
+    Phase 2 added CREATE_UNIQUE_INDEX_SQL (D-09-a) after CREATE_INDEX_SQL,
+    raising the total from 15 to 16.
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 15
+    assert cur.execute.call_count == 16
 
 
 def test_create_schema_order(mock_psycopg_conn):
-    """SQL statements must be executed in the defined order."""
+    """SQL statements must be executed in the defined order.
+
+    Phase 2 added CREATE_UNIQUE_INDEX_SQL at position 6 (after CREATE_INDEX_SQL),
+    shifting all dimension-table DDL one position forward.
+    """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
 
     calls = [call.args[0] for call in cur.execute.call_args_list]
 
-    # 6 hypertable setup statements
+    # 7 hypertable setup statements (Phase 2: unique index added after regular index)
     assert "CREATE TABLE" in calls[0]
     assert "create_hypertable" in calls[1]
     assert "timescaledb.compress" in calls[2]
     assert "remove_compression_policy" in calls[3]
     assert "add_compression_policy" in calls[4]
     assert "CREATE INDEX" in calls[5]
-    # Dimension table DDL follows
-    assert "dim_entities" in calls[6]
-    assert "dim_devices" in calls[7]
-    assert "dim_areas" in calls[8]
-    assert "dim_labels" in calls[9]
+    assert "UNIQUE INDEX" in calls[6]   # D-09-a: Phase 2 addition
+    # Dimension table DDL follows at offset 7
+    assert "dim_entities" in calls[7]
+    assert "dim_devices" in calls[8]
+    assert "dim_areas" in calls[9]
+    assert "dim_labels" in calls[10]
 
 
 def test_custom_chunk_interval(mock_psycopg_conn):
@@ -115,3 +123,13 @@ def test_dim_indexes_created(mock_psycopg_conn):
     assert "idx_dim_devices_device_time" in all_sql
     assert "idx_dim_areas_area_time" in all_sql
     assert "idx_dim_labels_label_time" in all_sql
+
+
+def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):
+    """sync_setup_schema must execute CREATE_UNIQUE_INDEX_SQL (D-09-a: enables ON CONFLICT DO NOTHING)."""
+    from custom_components.ha_timescaledb_recorder.const import CREATE_UNIQUE_INDEX_SQL
+
+    conn, cur = mock_psycopg_conn
+    sync_setup_schema(conn, chunk_interval_days=7, compress_after_hours=2)
+    executed = [call.args[0] for call in cur.execute.call_args_list]
+    assert CREATE_UNIQUE_INDEX_SQL in executed

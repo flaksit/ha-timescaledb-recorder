@@ -1,12 +1,11 @@
-"""Unit tests for MetadataSyncer (queue relay + sync change-detection helpers)."""
-import queue
+"""Unit tests for MetadataSyncer (registry relay + sync change-detection helpers)."""
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.syncer import MetadataSyncer
-from custom_components.ha_timescaledb_recorder.worker import MetaCommand
+from custom_components.ha_timescaledb_recorder.syncer import MetadataSyncer, _to_json_safe
+from custom_components.ha_timescaledb_recorder.persistent_queue import PersistentQueue
 
 
 # ---------------------------------------------------------------------------
@@ -14,38 +13,57 @@ from custom_components.ha_timescaledb_recorder.worker import MetaCommand
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def shared_queue():
-    """Return a fresh Queue for each test."""
-    return queue.Queue()
+def mock_meta_queue():
+    """Return a PersistentQueue mock with put_async as AsyncMock.
+
+    Syncer calls hass.async_create_task(q.put_async(item)); the mock captures
+    the put_async call synchronously (AsyncMock records calls before the
+    coroutine runs). Tests inspect q.put_async.call_args_list to verify the
+    dict schema rather than awaiting the coroutine.
+    """
+    q = MagicMock(spec=PersistentQueue)
+    q.put_async = AsyncMock()
+    return q
 
 
 @pytest.fixture
-def syncer(hass, shared_queue):
-    """Return a MetadataSyncer already wired to shared_queue via bind_queue()."""
-    s = MetadataSyncer(hass=hass)
-    s.bind_queue(shared_queue)
-    return s
+def syncer(hass, mock_meta_queue):
+    """Return a MetadataSyncer wired to mock_meta_queue."""
+    return MetadataSyncer(hass=hass, meta_queue=mock_meta_queue)
 
 
 # ---------------------------------------------------------------------------
-# bind_queue API
+# _to_json_safe helper
 # ---------------------------------------------------------------------------
 
-def test_bind_queue_wires_queue(hass):
-    """bind_queue() must store the queue reference on _queue."""
-    s = MetadataSyncer(hass=hass)
-    assert s._queue is None, "MetadataSyncer constructed without queue arg must have _queue=None"
-    q = queue.Queue()
-    s.bind_queue(q)
-    assert s._queue is q, "bind_queue() must store the exact Queue instance passed"
+def test_to_json_safe_converts_datetime_to_iso():
+    """datetime values in params must be converted to ISO-8601 strings."""
+    t = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
+    out = _to_json_safe(("x.y", t, None, [1, 2]))
+    assert isinstance(out[1], str)
+    assert out[1] == "2026-04-21T12:00:00+00:00"
+    assert out[0] == "x.y"
+    assert out[2] is None
+    assert out[3] == [1, 2]
+
+
+def test_to_json_safe_none_passthrough():
+    """_to_json_safe(None) must return None (remove-action path)."""
+    assert _to_json_safe(None) is None
+
+
+def test_to_json_safe_non_datetime_values_unchanged():
+    """Non-datetime types (str, int, list, None elements) must pass through unchanged."""
+    out = _to_json_safe(("hello", 42, None, ["a", "b"]))
+    assert out == ["hello", 42, None, ["a", "b"]]
 
 
 # ---------------------------------------------------------------------------
-# Entity registry callback → MetaCommand enqueue
+# Entity registry callback → dict enqueue
 # ---------------------------------------------------------------------------
 
-def test_entity_callback_enqueues_metacommand(syncer, shared_queue, mock_entity_registry):
-    """_handle_entity_registry_updated must enqueue a MetaCommand with correct fields."""
+def test_entity_callback_enqueues_dict(syncer, mock_meta_queue, mock_entity_registry):
+    """_handle_entity_registry_updated must schedule put_async with a correctly-shaped dict."""
     syncer._entity_reg = mock_entity_registry
 
     event = MagicMock()
@@ -56,19 +74,21 @@ def test_entity_callback_enqueues_metacommand(syncer, shared_queue, mock_entity_
     }
     syncer._handle_entity_registry_updated(event)
 
-    assert shared_queue.qsize() == 1
-    cmd = shared_queue.get_nowait()
-    assert isinstance(cmd, MetaCommand)
-    assert cmd.registry == "entity"
-    assert cmd.action == "update"
-    # Field name is registry_id, NOT entity_id (MetaCommand is registry-agnostic)
-    assert cmd.registry_id == "sensor.living_room_temp"
-    assert cmd.old_id is None  # Field name is old_id, NOT old_entity_id
-    assert cmd.params is not None, "Non-remove action must extract params from registry entry"
+    # Syncer calls hass.async_create_task(q.put_async(item))
+    syncer._hass.async_create_task.assert_called_once()
+    mock_meta_queue.put_async.assert_called_once()
+
+    item = mock_meta_queue.put_async.call_args.args[0]
+    assert item["registry"] == "entity"
+    assert item["action"] == "update"
+    assert item["registry_id"] == "sensor.living_room_temp"
+    assert item["old_id"] is None
+    assert item["params"] is not None, "Non-remove action must extract params"
+    assert "enqueued_at" in item
 
 
-def test_entity_remove_enqueues_params_none(syncer, shared_queue):
-    """Remove action must enqueue params=None — registry entry is already gone at remove time."""
+def test_entity_remove_enqueues_params_none(syncer, mock_meta_queue):
+    """Remove action must enqueue params=None — registry entry is already gone."""
     syncer._entity_reg = MagicMock()
 
     event = MagicMock()
@@ -79,16 +99,15 @@ def test_entity_remove_enqueues_params_none(syncer, shared_queue):
     }
     syncer._handle_entity_registry_updated(event)
 
-    assert shared_queue.qsize() == 1
-    cmd = shared_queue.get_nowait()
-    assert cmd.params is None, "Remove action must not fetch params (registry entry already gone)"
-    assert cmd.action == "remove"
-    # async_get must NOT be called on remove — registry entry is gone (D-08)
+    item = mock_meta_queue.put_async.call_args.args[0]
+    assert item["params"] is None, "Remove action must not fetch params"
+    assert item["action"] == "remove"
+    # async_get must NOT be called on remove — registry entry is gone
     syncer._entity_reg.async_get.assert_not_called()
 
 
-def test_entity_rename_sets_old_id(syncer, shared_queue, mock_entity_registry):
-    """Rename (update with old_entity_id) must set cmd.old_id to the previous entity_id."""
+def test_entity_rename_sets_old_id(syncer, mock_meta_queue, mock_entity_registry):
+    """Rename (update with old_entity_id) must populate old_id in the dict."""
     syncer._entity_reg = mock_entity_registry
 
     event = MagicMock()
@@ -99,26 +118,25 @@ def test_entity_rename_sets_old_id(syncer, shared_queue, mock_entity_registry):
     }
     syncer._handle_entity_registry_updated(event)
 
-    cmd = shared_queue.get_nowait()
-    # old_id carries the pre-rename entity_id for the SCD2 close operation
-    assert cmd.old_id == "sensor.old_name"
-    assert cmd.registry_id == "sensor.living_room_temp"
+    item = mock_meta_queue.put_async.call_args.args[0]
+    assert item["old_id"] == "sensor.old_name"
+    assert item["registry_id"] == "sensor.living_room_temp"
 
 
 # ---------------------------------------------------------------------------
 # Area registry callback — reorder skip
 # ---------------------------------------------------------------------------
 
-def test_area_reorder_skipped(syncer, shared_queue):
+def test_area_reorder_skipped(syncer, mock_meta_queue):
     """Reorder events carry no data change and must be silently dropped (Pitfall 6)."""
     event = MagicMock()
     event.data = {"action": "reorder"}
     syncer._handle_area_registry_updated(event)
-    assert shared_queue.qsize() == 0, "Reorder action must not enqueue any MetaCommand"
+    mock_meta_queue.put_async.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Change-detection helpers (sync, called from worker thread via DbWorker)
+# Change-detection helpers (sync, called from meta worker thread)
 # ---------------------------------------------------------------------------
 
 def test_entity_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
@@ -126,7 +144,6 @@ def test_entity_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
     _conn, cur = mock_psycopg_conn
     cur.fetchone.return_value = None
 
-    # 13-element params tuple: entity_id at [0], name at [2], platform at [4], etc.
     params = (
         "sensor.temp",   # [0]  entity_id
         "uuid-001",      # [1]  ha_entity_uuid
@@ -215,7 +232,6 @@ def test_device_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
     """No existing device row → always changed."""
     _conn, cur = mock_psycopg_conn
     cur.fetchone.return_value = None
-    # 8-element params: device_id at [0], name at [1], etc.
     params = (
         "device-001",   # [0] device_id
         "My Device",    # [1] name

@@ -1,12 +1,12 @@
 """Unit tests for StateIngester (thin queue relay)."""
 import inspect
-import queue
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
 
 from custom_components.ha_timescaledb_recorder.ingester import StateIngester
+from custom_components.ha_timescaledb_recorder.overflow_queue import OverflowQueue
 from custom_components.ha_timescaledb_recorder.worker import StateRow
 from homeassistant.helpers.entityfilter import convert_filter
 
@@ -50,8 +50,12 @@ def hass():
 
 @pytest.fixture
 def shared_queue():
-    """Return a fresh Queue for each test."""
-    return queue.Queue()
+    """Return a fresh OverflowQueue for each test.
+
+    OverflowQueue replaces queue.Queue in Phase 2 (D-02): put_nowait never
+    raises queue.Full — it silently drops the newest item and sets overflowed=True.
+    """
+    return OverflowQueue(maxsize=10000)
 
 
 @pytest.fixture
@@ -62,7 +66,7 @@ def entity_filter():
 
 @pytest.fixture
 def ingester(hass, shared_queue, entity_filter):
-    """Return a StateIngester wired to the shared queue."""
+    """Return a StateIngester wired to the shared OverflowQueue."""
     return StateIngester(hass=hass, queue=shared_queue, entity_filter=entity_filter)
 
 
@@ -149,3 +153,21 @@ def test_stop_is_sync(ingester):
     assert not inspect.iscoroutinefunction(ingester.stop), (
         "stop() must not be a coroutine function; callers must not await it"
     )
+
+
+def test_ingester_enqueue_never_raises_when_queue_full(hass):
+    """OverflowQueue must absorb overflow without raising — @callback safety (D-02-b)."""
+    q = OverflowQueue(maxsize=1)
+    entity_filter = lambda _eid: True
+    ing = StateIngester(hass=hass, queue=q, entity_filter=entity_filter)
+    event = MagicMock()
+    new_state = MagicMock()
+    new_state.entity_id = "sensor.a"
+    new_state.state = "on"
+    new_state.attributes = {}
+    new_state.last_updated = new_state.last_changed = None
+    event.data = {"new_state": new_state}
+    # Fill queue (size=1 means one item fits) then overflow
+    ing._handle_state_changed(event)  # enqueues 1 item; queue at capacity
+    ing._handle_state_changed(event)  # triggers overflow path; must not raise
+    assert q.overflowed is True

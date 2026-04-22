@@ -1,12 +1,12 @@
 """Integration lifecycle tests for async_setup_entry / async_unload_entry.
 
 These tests verify that:
-1. async_setup_entry returns True and stores runtime data
-2. async_unload_entry stops all components in correct order
-3. Partial-start rollback: if syncer.async_start() raises, worker is stopped cleanly
-4. bind_queue() is called rather than direct _queue attribute mutation
+1. async_setup_entry returns True and stores runtime data (HaTimescaleDBData)
+2. async_unload_entry executes D-13 shutdown sequence in the correct order
+3. D-12 setup steps fire in the documented order
+4. Partial-start rollback: if syncer.async_start() raises, workers are stopped
 """
-import queue
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,9 +16,6 @@ from custom_components.ha_timescaledb_recorder import (
     async_setup_entry,
     async_unload_entry,
 )
-from custom_components.ha_timescaledb_recorder.ingester import StateIngester
-from custom_components.ha_timescaledb_recorder.syncer import MetadataSyncer
-from custom_components.ha_timescaledb_recorder.worker import DbWorker
 
 
 # ---------------------------------------------------------------------------
@@ -26,10 +23,10 @@ from custom_components.ha_timescaledb_recorder.worker import DbWorker
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def mock_config_entry():
+def mock_entry():
     """Minimal mock config entry with DSN and default options."""
     entry = MagicMock()
-    entry.data = {"dsn": "postgresql://test/db"}
+    entry.data = {"dsn": "postgresql://local/test"}
     entry.options = {}
     entry.runtime_data = None
     entry.async_on_unload = MagicMock()
@@ -37,122 +34,281 @@ def mock_config_entry():
     return entry
 
 
+# conftest provides `hass` fixture — override here with the fields needed for
+# async_setup_entry (config.path, bus.async_listen_once, async_create_task).
 @pytest.fixture
 def hass():
-    """Return a mock hass instance with async_add_executor_job wired as AsyncMock."""
+    """Return a mock hass instance sufficient for async_setup_entry."""
     h = MagicMock()
     h.bus = MagicMock()
     h.bus.async_listen = MagicMock(return_value=MagicMock())
-    h.async_add_executor_job = AsyncMock()
+    h.bus.async_listen_once = MagicMock()
+    h.async_add_executor_job = AsyncMock(return_value=None)
+    h.async_create_task = MagicMock()
+    h.config = MagicMock()
+    h.config.path = MagicMock(return_value="/tmp/ha_tsdb_test/metadata_queue.jsonl")
     return h
 
 
 # ---------------------------------------------------------------------------
-# Happy-path: successful setup and teardown
+# D-12: setup ordering
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_setup_entry_returns_true(hass, mock_config_entry):
-    """async_setup_entry must return True and populate entry.runtime_data."""
-    with patch.object(DbWorker, "start"), \
-         patch.object(StateIngester, "async_start"), \
-         patch.object(MetadataSyncer, "async_start", new_callable=AsyncMock), \
-         patch.object(MetadataSyncer, "bind_queue"):
-        result = await async_setup_entry(hass, mock_config_entry)
+async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
+    """async_setup_entry must execute D-12 steps 2-8 in documented order.
 
-    assert result is True
-    assert mock_config_entry.runtime_data is not None
-
-
-@pytest.mark.asyncio
-async def test_unload_entry_stops_in_order(hass, mock_config_entry):
-    """async_unload_entry must stop components in the correct order: ingester → syncer → worker.
-
-    Correct order prevents new items being enqueued (ingester stopped first) while the
-    worker still drains the queue (stopped last).
+    Steps recorded via side_effect callbacks that append to a shared sequence list.
+    The expected order is: meta_worker.start (2), states_worker.start (3),
+    meta_queue.join (4), _async_initial_registry_backfill (5),
+    syncer.async_start (6), ingester.async_start (7),
+    bus.async_listen_once registration (8).
     """
-    call_order = []
+    sequence: list[str] = []
 
-    mock_worker = MagicMock()
-    mock_worker.async_stop = AsyncMock(
-        side_effect=lambda: call_order.append("worker.async_stop")
+    with patch(
+        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+    ) as MockPQ, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+    ) as MockMW, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+    ) as MockSW, patch(
+        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        new=AsyncMock(side_effect=lambda *a, **kw: sequence.append("step5")),
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.MetadataSyncer"
+    ) as MockSyncer, patch(
+        "custom_components.ha_timescaledb_recorder.StateIngester"
+    ) as MockIng, patch(
+        "custom_components.ha_timescaledb_recorder._overflow_watcher",
+        new=AsyncMock(),
+    ):
+        pq = MockPQ.return_value
+        pq.join = AsyncMock(side_effect=lambda: sequence.append("step4"))
+
+        mw = MockMW.return_value
+        mw.start = MagicMock(side_effect=lambda: sequence.append("step2"))
+
+        sw = MockSW.return_value
+        sw.start = MagicMock(side_effect=lambda: sequence.append("step3"))
+
+        syncer = MockSyncer.return_value
+        syncer.async_start = AsyncMock(side_effect=lambda: sequence.append("step6"))
+
+        ing = MockIng.return_value
+        ing.async_start = MagicMock(side_effect=lambda: sequence.append("step7"))
+
+        # Step 8 is async_listen_once registration
+        hass.bus.async_listen_once = MagicMock(
+            side_effect=lambda *a, **kw: sequence.append("step8")
+        )
+
+        await async_setup_entry(hass, mock_entry)
+
+    assert sequence == ["step2", "step3", "step4", "step5", "step6", "step7", "step8"], (
+        f"D-12 steps must fire in order 2-8. Got: {sequence}"
     )
 
-    mock_ingester = MagicMock()
-    mock_ingester.stop = MagicMock(
-        side_effect=lambda: call_order.append("ingester.stop")
-    )
 
-    mock_syncer = MagicMock()
-    mock_syncer.async_stop = AsyncMock(
-        side_effect=lambda: call_order.append("syncer.async_stop")
-    )
+async def test_setup_entry_returns_true(hass, mock_entry):
+    """async_setup_entry must return True and populate entry.runtime_data."""
+    with patch(
+        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+    ) as MockPQ, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+    ) as MockMW, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+    ) as MockSW, patch(
+        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        new=AsyncMock(),
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.MetadataSyncer"
+    ) as MockSyncer, patch(
+        "custom_components.ha_timescaledb_recorder.StateIngester"
+    ) as MockIng, patch(
+        "custom_components.ha_timescaledb_recorder._overflow_watcher",
+        new=AsyncMock(),
+    ):
+        MockPQ.return_value.join = AsyncMock()
+        MockMW.return_value.start = MagicMock()
+        MockSW.return_value.start = MagicMock()
+        MockSyncer.return_value.async_start = AsyncMock()
+        MockIng.return_value.async_start = MagicMock()
 
-    mock_config_entry.runtime_data = HaTimescaleDBData(
-        worker=mock_worker,
-        ingester=mock_ingester,
-        syncer=mock_syncer,
-    )
-
-    result = await async_unload_entry(hass, mock_config_entry)
+        result = await async_setup_entry(hass, mock_entry)
 
     assert result is True
-    assert call_order == ["ingester.stop", "syncer.async_stop", "worker.async_stop"], (
-        f"Components must stop in order: ingester → syncer → worker. Got: {call_order}"
-    )
+    assert mock_entry.runtime_data is not None
+    assert isinstance(mock_entry.runtime_data, HaTimescaleDBData)
+
+
+async def test_setup_entry_runtime_data_has_all_fields(hass, mock_entry):
+    """HaTimescaleDBData on runtime_data must have all Phase 2 fields populated."""
+    with patch(
+        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+    ) as MockPQ, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+    ) as MockMW, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+    ) as MockSW, patch(
+        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        new=AsyncMock(),
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.MetadataSyncer"
+    ) as MockSyncer, patch(
+        "custom_components.ha_timescaledb_recorder.StateIngester"
+    ) as MockIng, patch(
+        "custom_components.ha_timescaledb_recorder._overflow_watcher",
+        new=AsyncMock(),
+    ):
+        MockPQ.return_value.join = AsyncMock()
+        MockMW.return_value.start = MagicMock()
+        MockSW.return_value.start = MagicMock()
+        MockSyncer.return_value.async_start = AsyncMock()
+        MockIng.return_value.async_start = MagicMock()
+
+        await async_setup_entry(hass, mock_entry)
+
+    data = mock_entry.runtime_data
+    # All Phase 2 fields must be present
+    assert data.states_worker is not None
+    assert data.meta_worker is not None
+    assert data.ingester is not None
+    assert data.syncer is not None
+    assert data.live_queue is not None
+    assert data.meta_queue is not None
+    assert data.backfill_queue is not None
+    assert data.backfill_request is not None
+    assert data.stop_event is not None
+    assert data.loop_stop_event is not None
+
+
+# ---------------------------------------------------------------------------
+# D-13: unload sequence
+# ---------------------------------------------------------------------------
+
+async def test_async_unload_entry_runs_d13_sequence(hass, mock_entry):
+    """async_unload_entry must execute the D-13 shutdown sequence.
+
+    Verifies: stop_event.set(), loop_stop_event.set(), orchestrator cancel,
+    overflow_watcher cancel, ingester.stop(), syncer.async_stop(),
+    meta_queue.wake_consumer(), and executor joins for both workers.
+    """
+    data = MagicMock(spec=HaTimescaleDBData)
+    data.stop_event = MagicMock()
+    data.loop_stop_event = MagicMock()
+    data.ingester = MagicMock()
+    data.syncer = MagicMock()
+    data.syncer.async_stop = AsyncMock()
+    data.meta_queue = MagicMock()
+    data.states_worker = MagicMock()
+    data.states_worker.is_alive = MagicMock(return_value=False)
+    data.meta_worker = MagicMock()
+    data.meta_worker.is_alive = MagicMock(return_value=False)
+
+    # Tasks that cancel cleanly
+    async def _cancelled():
+        raise asyncio.CancelledError
+
+    orch_task = MagicMock()
+    orch_task.cancel = MagicMock()
+
+    async def _await_orch():
+        raise asyncio.CancelledError
+
+    orch_task.__await__ = lambda self: _await_orch().__await__()
+
+    data.orchestrator_task = asyncio.create_task(_cancelled())
+    data.orchestrator_task.cancel()
+    # Re-create as simple cancelled future for cleaner mock
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    fut.cancel()
+    data.orchestrator_task = fut
+
+    overflow_fut = loop.create_future()
+    overflow_fut.cancel()
+    data.overflow_watcher_task = overflow_fut
+
+    mock_entry.runtime_data = data
+    hass.async_add_executor_job = AsyncMock(return_value=None)
+
+    await async_unload_entry(hass, mock_entry)
+
+    data.stop_event.set.assert_called_once()
+    data.loop_stop_event.set.assert_called_once()
+    data.ingester.stop.assert_called_once()
+    data.syncer.async_stop.assert_awaited_once()
+    data.meta_queue.wake_consumer.assert_called_once()
+    # Both workers joined via executor job with 30s timeout
+    hass.async_add_executor_job.assert_any_call(data.states_worker.join, 30)
+    hass.async_add_executor_job.assert_any_call(data.meta_worker.join, 30)
+
+
+async def test_async_unload_entry_returns_true(hass, mock_entry):
+    """async_unload_entry must return True on success."""
+    data = MagicMock(spec=HaTimescaleDBData)
+    data.stop_event = MagicMock()
+    data.loop_stop_event = MagicMock()
+    data.orchestrator_task = None
+    data.overflow_watcher_task = None
+    data.ingester = MagicMock()
+    data.syncer = MagicMock()
+    data.syncer.async_stop = AsyncMock()
+    data.meta_queue = MagicMock()
+    data.states_worker = MagicMock()
+    data.states_worker.is_alive = MagicMock(return_value=False)
+    data.meta_worker = MagicMock()
+    data.meta_worker.is_alive = MagicMock(return_value=False)
+    mock_entry.runtime_data = data
+    hass.async_add_executor_job = AsyncMock(return_value=None)
+
+    result = await async_unload_entry(hass, mock_entry)
+
+    assert result is True
 
 
 # ---------------------------------------------------------------------------
 # Partial-start rollback
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_partial_start_rollback_on_syncer_failure(hass, mock_config_entry):
-    """If syncer.async_start() raises, worker and ingester must be stopped (no orphaned thread)."""
+async def test_partial_start_rollback_on_syncer_failure(hass, mock_entry):
+    """If syncer.async_start() raises, workers must be stopped — no orphaned threads."""
     worker_stopped = []
-    ingester_stopped = []
 
-    with patch.object(DbWorker, "start"), \
-         patch.object(DbWorker, "async_stop", new_callable=AsyncMock,
-                      side_effect=lambda: worker_stopped.append(True)), \
-         patch.object(StateIngester, "async_start"), \
-         patch.object(StateIngester, "stop",
-                      side_effect=lambda: ingester_stopped.append(True)), \
-         patch.object(MetadataSyncer, "bind_queue"), \
-         patch.object(MetadataSyncer, "async_start",
-                      new_callable=AsyncMock,
-                      side_effect=RuntimeError("syncer exploded")):
+    with patch(
+        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+    ) as MockPQ, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+    ) as MockMW, patch(
+        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+    ) as MockSW, patch(
+        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        new=AsyncMock(),
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.MetadataSyncer"
+    ) as MockSyncer, patch(
+        "custom_components.ha_timescaledb_recorder.StateIngester"
+    ) as MockIng:
+        pq = MockPQ.return_value
+        pq.join = AsyncMock()
+        pq.wake_consumer = MagicMock()
+
+        mw = MockMW.return_value
+        mw.start = MagicMock()
+
+        sw = MockSW.return_value
+        sw.start = MagicMock()
+
+        syncer = MockSyncer.return_value
+        syncer.async_start = AsyncMock(side_effect=RuntimeError("syncer exploded"))
+
+        ing = MockIng.return_value
+        ing.async_start = MagicMock()
+
         with pytest.raises(RuntimeError, match="syncer exploded"):
-            await async_setup_entry(hass, mock_config_entry)
+            await async_setup_entry(hass, mock_entry)
 
-    assert worker_stopped, "worker.async_stop() must be called on rollback — no orphaned thread"
-    assert ingester_stopped, "ingester.stop() must be called before worker on rollback"
-
-
-# ---------------------------------------------------------------------------
-# API contract: bind_queue() must be used, not direct _queue mutation
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_setup_uses_bind_queue_not_attribute_mutation(hass, mock_config_entry):
-    """async_setup_entry must call syncer.bind_queue(worker.queue), not set syncer._queue directly.
-
-    bind_queue() provides a stable API and makes the two-phase construction intent explicit.
-    Direct _queue mutation would bypass any future validation logic in bind_queue().
-    """
-    bind_queue_calls = []
-
-    def tracking_bind(self, q):
-        """Intercept bind_queue() calls to verify the argument type."""
-        bind_queue_calls.append(q)
-
-    with patch.object(DbWorker, "start"), \
-         patch.object(StateIngester, "async_start"), \
-         patch.object(MetadataSyncer, "async_start", new_callable=AsyncMock), \
-         patch.object(MetadataSyncer, "bind_queue", tracking_bind):
-        await async_setup_entry(hass, mock_config_entry)
-
-    assert len(bind_queue_calls) == 1, "bind_queue() must be called exactly once during setup"
-    assert isinstance(bind_queue_calls[0], queue.Queue), (
-        f"bind_queue() must receive a queue.Queue instance, got {type(bind_queue_calls[0])}"
-    )
+    # stop_event.set() must have been called (workers signalled to stop)
+    # Confirmed indirectly: async_add_executor_job called for joins
+    hass.async_add_executor_job.assert_any_call(mw.join, 30)
+    hass.async_add_executor_job.assert_any_call(sw.join, 30)

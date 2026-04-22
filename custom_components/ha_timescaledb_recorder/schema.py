@@ -7,6 +7,7 @@ from .const import (
     ADD_COMPRESSION_POLICY_SQL,
     REMOVE_COMPRESSION_POLICY_SQL,
     CREATE_INDEX_SQL,
+    CREATE_UNIQUE_INDEX_SQL,
     CREATE_TABLE_SQL,
     CREATE_HYPERTABLE_SQL,
     DEFAULT_CHUNK_INTERVAL_DAYS,
@@ -57,6 +58,7 @@ def sync_setup_schema(
             )
         )
         cur.execute(CREATE_INDEX_SQL)
+        cur.execute(CREATE_UNIQUE_INDEX_SQL)    # D-09-a: Phase 2 — enables ON CONFLICT DO NOTHING dedup
 
         # Dimension tables for SCD2 metadata sync (Phase 4).
         # All DDL is idempotent — safe to re-execute on every startup (D-11).

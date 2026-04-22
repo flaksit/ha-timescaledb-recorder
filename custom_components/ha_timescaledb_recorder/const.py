@@ -9,6 +9,17 @@ DEFAULT_CHUNK_INTERVAL_DAYS = 7
 # 2 hours keeps at most ~1 day of uncompressed data on disk (2-day chunk + 12h policy window).
 DEFAULT_COMPRESS_AFTER_HOURS = 2
 
+# Phase 2 ingestion tunables (D-04-e, D-06-a, D-01-a, D-01-b). These are
+# internal to the states worker loop — they are NOT user-configurable via
+# options flow. Intentionally distinct from DEFAULT_BATCH_SIZE /
+# DEFAULT_FLUSH_INTERVAL above (which are the user-facing options-flow
+# defaults from Phase 1).
+BATCH_FLUSH_SIZE: int = 200       # D-04-e: flush when buffer reaches this size
+INSERT_CHUNK_SIZE: int = 200      # D-06-a: sub-batch size per _insert_chunk call
+FLUSH_INTERVAL: float = 5.0       # D-04-e seconds — adaptive get() timeout
+LIVE_QUEUE_MAXSIZE: int = 10000   # D-01-a: OverflowQueue cap
+BACKFILL_QUEUE_MAXSIZE: int = 2   # D-01-b: backpressure cap for backfill_queue
+
 # Config keys
 CONF_DSN = "dsn"
 CONF_BATCH_SIZE = "write_batch_size_records"
@@ -60,9 +71,18 @@ CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_entity_time
     ON {TABLE_NAME} (entity_id, last_updated DESC);
 """
 
+# D-09-a: unique index — enables ON CONFLICT DO NOTHING dedup on every
+# INSERT (D-06-d). TimescaleDB hypertables allow unique indexes as long as
+# the partitioning column (last_updated) is included.
+CREATE_UNIQUE_INDEX_SQL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS idx_{TABLE_NAME}_uniq
+    ON {TABLE_NAME} (last_updated, entity_id);
+"""
+
 INSERT_SQL = f"""
 INSERT INTO {TABLE_NAME} (entity_id, state, attributes, last_updated, last_changed)
 VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (last_updated, entity_id) DO NOTHING
 """
 
 # Dimension table DDL — SCD2 temporal tracking for HA registry metadata.
@@ -262,6 +282,15 @@ INSERT INTO dim_labels
     (label_id, name, color, valid_from, valid_to, extra)
 VALUES (%s, %s, %s, %s, NULL, %s);
 """
+
+# D-08-d step 4: watermark read (orchestrator → states worker connection).
+SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
+
+# D-08-f: open entities reader — entities with rows in dim_entities whose
+# valid_to IS NULL (captures entities removed from HA during an outage).
+SELECT_OPEN_ENTITIES_SQL = (
+    "SELECT entity_id FROM dim_entities WHERE valid_to IS NULL"
+)
 
 # Change-detection SELECT constants — read the current open row for each registry type.
 # Moved from inline strings in syncer.py per project convention (all SQL in const.py).

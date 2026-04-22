@@ -59,9 +59,9 @@ Plans:
 - [x] 02-05-PLAN.md — Create persistent_queue.py with file-backed FIFO (D-03)
 - [x] 02-06-PLAN.md — Retire DbWorker/MetaCommand from worker.py; create states_worker.py with TimescaledbStateRecorderThread (D-04 + D-06 + D-15)
 - [x] 02-07-PLAN.md — Create meta_worker.py with TimescaledbMetaRecorderThread dispatching via Phase 1 SCD2 helpers (D-05)
-- [ ] 02-08-PLAN.md — Create backfill.py with backfill_orchestrator + _fetch_slice_raw (D-08)
-- [ ] 02-09-PLAN.md — Retarget ingester.py to OverflowQueue; retarget syncer.py to PersistentQueue with JSON-safe dicts (D-15-b/c)
-- [ ] 02-10-PLAN.md — Rewrite __init__.py for D-12 8-step startup + D-13 6-step shutdown + initial registry backfill + overflow watcher
+- [x] 02-08-PLAN.md — Create backfill.py with backfill_orchestrator + _fetch_slice_raw (D-08)
+- [x] 02-09-PLAN.md — Retarget ingester.py to OverflowQueue; retarget syncer.py to PersistentQueue with JSON-safe dicts (D-15-b/c)
+- [x] 02-10-PLAN.md — Rewrite __init__.py for D-12 8-step startup + D-13 6-step shutdown + initial registry backfill + overflow watcher
 - [ ] 02-11-PLAN.md — Unit tests for Wave 1 primitives (overflow_queue, persistent_queue, retry, issues)
 - [ ] 02-12-PLAN.md — Unit tests for Wave 2/3 services (states_worker, meta_worker, backfill)
 - [ ] 02-13-PLAN.md — Retarget Phase 1 tests (test_worker, test_ingester, test_syncer, test_schema, test_init); full-suite green check
@@ -84,5 +84,5 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Thread Worker Foundation | 0/8 | In progress | - |
-| 2. Durability Story | 7/13 | In progress | - |
+| 2. Durability Story | 10/13 | In progress | - |
 | 3. Hardening and Observability | 0/TBD | Not started | - |

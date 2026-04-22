@@ -62,9 +62,9 @@ Plans:
 - [x] 02-08-PLAN.md — Create backfill.py with backfill_orchestrator + _fetch_slice_raw (D-08)
 - [x] 02-09-PLAN.md — Retarget ingester.py to OverflowQueue; retarget syncer.py to PersistentQueue with JSON-safe dicts (D-15-b/c)
 - [x] 02-10-PLAN.md — Rewrite __init__.py for D-12 8-step startup + D-13 6-step shutdown + initial registry backfill + overflow watcher
-- [ ] 02-11-PLAN.md — Unit tests for Wave 1 primitives (overflow_queue, persistent_queue, retry, issues)
-- [ ] 02-12-PLAN.md — Unit tests for Wave 2/3 services (states_worker, meta_worker, backfill)
-- [ ] 02-13-PLAN.md — Retarget Phase 1 tests (test_worker, test_ingester, test_syncer, test_schema, test_init); full-suite green check
+- [x] 02-11-PLAN.md — Unit tests for Wave 1 primitives (overflow_queue, persistent_queue, retry, issues)
+- [x] 02-12-PLAN.md — Unit tests for Wave 2/3 services (states_worker, meta_worker, backfill)
+- [x] 02-13-PLAN.md — Retarget Phase 1 tests (test_worker, test_ingester, test_syncer, test_schema, test_init); full-suite green check
 
 ### Phase 3: Hardening and Observability
 **Goal**: The integration surfaces ongoing problems in the HA Repairs UI and fires one-shot notifications for critical events; data errors are isolated per-row and never drop an entire batch; code bugs produce critical logs and repair issues
@@ -84,5 +84,5 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Thread Worker Foundation | 0/8 | In progress | - |
-| 2. Durability Story | 10/13 | In progress | - |
+| 2. Durability Story | 13/13 | Complete | 2026-04-22 |
 | 3. Hardening and Observability | 0/TBD | Not started | - |

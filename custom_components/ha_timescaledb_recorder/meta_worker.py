@@ -252,7 +252,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                             cur.execute(SCD2_INSERT_ENTITY_SQL, (*params,))
 
     # ------------------------------------------------------------------
-    # Device/area/label dispatches ADDED in Task 2.
+    # Per-registry dispatch — device/area/label (D-05-c). Mechanical copies
+    # of _process_entity without the rename path (devices, areas, and labels
+    # cannot be renamed in HA — old_id is always None for these registries).
     # ------------------------------------------------------------------
 
     def _process_device(
@@ -262,7 +264,29 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         params: tuple | None,
         now: datetime,
     ) -> None:
-        raise NotImplementedError("Implemented in task 2")
+        """Execute SCD2 write for a device registry change.
+
+        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
+        "remove": close the open row.
+        "update": change-detection gate via syncer helper; close+insert if changed.
+        No rename path — devices cannot be renamed in HA.
+        """
+        conn = self.get_db_connection()
+        with conn.cursor() as cur:
+            if action == "create":
+                # params[0] = device_id; appears twice per SCD2_SNAPSHOT_DEVICE_SQL.
+                cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
+            elif action == "remove":
+                cur.execute(SCD2_CLOSE_DEVICE_SQL, (now, registry_id))
+            elif action == "update":
+                with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                    changed = self._syncer._device_row_changed(
+                        dict_cur, registry_id, params
+                    )
+                if changed:
+                    with conn.transaction():
+                        cur.execute(SCD2_CLOSE_DEVICE_SQL, (now, registry_id))
+                        cur.execute(SCD2_INSERT_DEVICE_SQL, (*params,))
 
     def _process_area(
         self,
@@ -271,7 +295,29 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         params: tuple | None,
         now: datetime,
     ) -> None:
-        raise NotImplementedError("Implemented in task 2")
+        """Execute SCD2 write for an area registry change.
+
+        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
+        "remove": close the open row.
+        "update": change-detection gate via syncer helper; close+insert if changed.
+        No rename path — areas cannot be renamed by entity_id in HA.
+        """
+        conn = self.get_db_connection()
+        with conn.cursor() as cur:
+            if action == "create":
+                # params[0] = area_id; appears twice per SCD2_SNAPSHOT_AREA_SQL.
+                cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
+            elif action == "remove":
+                cur.execute(SCD2_CLOSE_AREA_SQL, (now, registry_id))
+            elif action == "update":
+                with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                    changed = self._syncer._area_row_changed(
+                        dict_cur, registry_id, params
+                    )
+                if changed:
+                    with conn.transaction():
+                        cur.execute(SCD2_CLOSE_AREA_SQL, (now, registry_id))
+                        cur.execute(SCD2_INSERT_AREA_SQL, (*params,))
 
     def _process_label(
         self,
@@ -280,4 +326,26 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         params: tuple | None,
         now: datetime,
     ) -> None:
-        raise NotImplementedError("Implemented in task 2")
+        """Execute SCD2 write for a label registry change.
+
+        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
+        "remove": close the open row.
+        "update": change-detection gate via syncer helper; close+insert if changed.
+        No rename path — labels cannot be renamed by label_id in HA.
+        """
+        conn = self.get_db_connection()
+        with conn.cursor() as cur:
+            if action == "create":
+                # params[0] = label_id; appears twice per SCD2_SNAPSHOT_LABEL_SQL.
+                cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
+            elif action == "remove":
+                cur.execute(SCD2_CLOSE_LABEL_SQL, (now, registry_id))
+            elif action == "update":
+                with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                    changed = self._syncer._label_row_changed(
+                        dict_cur, registry_id, params
+                    )
+                if changed:
+                    with conn.transaction():
+                        cur.execute(SCD2_CLOSE_LABEL_SQL, (now, registry_id))
+                        cur.execute(SCD2_INSERT_LABEL_SQL, (*params,))

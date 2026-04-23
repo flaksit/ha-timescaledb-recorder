@@ -257,6 +257,7 @@ async def test_orchestrator_fires_backfill_gap_when_oldest_ts_after_needed_from(
     backfill_queue = queue.Queue(maxsize=4)
     live_queue = MagicMock()
     live_queue.clear_and_reset_overflow = MagicMock(return_value=0)
+    # stop_event starts clear; we set it AFTER the cycle completes (no entities → fast)
     stop_event = asyncio.Event()
     backfill_request = asyncio.Event()
     backfill_request.set()
@@ -275,22 +276,33 @@ async def test_orchestrator_fires_backfill_gap_when_oldest_ts_after_needed_from(
     ) as mock_er:
         mock_er.return_value.entities.values.return_value = []
 
-        stop_event.set()  # single cycle only
-        await backfill_orchestrator(
-            hass,
-            live_queue=live_queue,
-            backfill_queue=backfill_queue,
-            backfill_request=backfill_request,
-            read_watermark=MagicMock(return_value=wm),
-            open_entities_reader=MagicMock(return_value=set()),
-            entity_filter=lambda _eid: True,
-            stop_event=stop_event,
-            threading_stop_event=_threading_stop_event(),
+        # Stop after the first cycle: set stop_event AND backfill_request so the
+        # orchestrator can exit its backfill_request.wait() on the next iteration.
+        async def stopper():
+            await asyncio.sleep(0.05)
+            stop_event.set()
+            backfill_request.set()  # unblock backfill_request.wait() so stop check fires
+
+        asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            backfill_orchestrator(
+                hass,
+                live_queue=live_queue,
+                backfill_queue=backfill_queue,
+                backfill_request=backfill_request,
+                read_watermark=MagicMock(return_value=wm),
+                open_entities_reader=MagicMock(return_value=set()),
+                entity_filter=lambda _eid: True,
+                stop_event=stop_event,
+                threading_stop_event=_threading_stop_event(),
+            ),
+            timeout=2,
         )
 
     mock_notify.assert_called_once()
     call_kwargs = mock_notify.call_args
-    assert call_kwargs[0][1] == "recorder_retention" or call_kwargs[1].get("reason") == "recorder_retention"
+    # notify_backfill_gap(hass, reason=..., details=...) — reason is keyword-only.
+    assert call_kwargs.kwargs.get("reason") == "recorder_retention"
 
 
 @pytest.mark.asyncio
@@ -326,17 +338,26 @@ async def test_orchestrator_no_gap_notification_when_oldest_ts_before_needed_fro
     ) as mock_er:
         mock_er.return_value.entities.values.return_value = []
 
-        stop_event.set()  # single cycle only
-        await backfill_orchestrator(
-            hass,
-            live_queue=live_queue,
-            backfill_queue=backfill_queue,
-            backfill_request=backfill_request,
-            read_watermark=MagicMock(return_value=wm),
-            open_entities_reader=MagicMock(return_value=set()),
-            entity_filter=lambda _eid: True,
-            stop_event=stop_event,
-            threading_stop_event=_threading_stop_event(),
+        # Stop after the first cycle completes.
+        async def stopper():
+            await asyncio.sleep(0.05)
+            stop_event.set()
+            backfill_request.set()  # unblock backfill_request.wait()
+
+        asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            backfill_orchestrator(
+                hass,
+                live_queue=live_queue,
+                backfill_queue=backfill_queue,
+                backfill_request=backfill_request,
+                read_watermark=MagicMock(return_value=wm),
+                open_entities_reader=MagicMock(return_value=set()),
+                entity_filter=lambda _eid: True,
+                stop_event=stop_event,
+                threading_stop_event=_threading_stop_event(),
+            ),
+            timeout=2,
         )
 
     mock_notify.assert_not_called()
@@ -477,11 +498,21 @@ async def test_fetch_slice_retry_wrapping_uses_on_transient_none():
 @pytest.mark.asyncio
 async def test_fetch_slice_retries_on_transient_error():
     """D-03-c: a transient error from _fetch_slice_raw must be retried;
-    the orchestrator must not raise to caller on first failure."""
-    import psycopg
+    the orchestrator must not raise to caller on first failure.
+
+    This test uses a zero-backoff retry wrapper (via patching retry_until_success
+    in backfill) so the retry happens immediately without sleeping. The real
+    retry backoff logic is already tested in test_retry.py.
+
+    Watermark is set 2 hours in the past so from_ < t_clear (slice loop executes).
+    """
+    from custom_components.ha_timescaledb_recorder.retry import retry_until_success
+    from custom_components.ha_timescaledb_recorder.backfill import _LATE_ARRIVAL_GRACE
 
     hass = MagicMock()
-    wm = datetime(2026, 4, 23, 10, 0, 0, tzinfo=timezone.utc)
+    # wm must be in the past so that from_ = wm - _LATE_ARRIVAL_GRACE < t_clear = now()
+    from datetime import datetime, timezone, timedelta as _td
+    wm = datetime.now(timezone.utc) - _td(hours=2)
     hass.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args) if callable(fn) else None)
 
     stop_event = asyncio.Event()
@@ -501,7 +532,21 @@ async def test_fetch_slice_retries_on_transient_error():
 
     threading_stop = threading.Event()
 
+    # Use a zero-backoff retry wrapper so the test doesn't sleep.
+    # The real retry backoff is tested separately in test_retry.py.
+    def zero_backoff_retry(*, stop_event=None, on_transient=None, **kwargs):
+        def decorator(fn):
+            return retry_until_success(
+                stop_event=threading_stop,
+                on_transient=on_transient,
+                backoff_schedule=(0,),
+            )(fn)
+        return decorator
+
     with patch(
+        "custom_components.ha_timescaledb_recorder.backfill.retry_until_success",
+        zero_backoff_retry,
+    ), patch(
         "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance"
     ) as mock_get_inst, patch(
         "custom_components.ha_timescaledb_recorder.backfill._fetch_slice_raw",
@@ -525,13 +570,15 @@ async def test_fetch_slice_retries_on_transient_error():
         mock_get_inst.return_value = recorder_inst
 
         async def stopper():
-            # Stop after _fetch_slice_raw has been called at least twice.
-            for _ in range(200):
+            # Wait until the second call succeeds, then stop.
+            for _ in range(400):
                 if call_count["n"] >= 2:
                     stop_event.set()
+                    backfill_request.set()
                     return
                 await asyncio.sleep(0.005)
             stop_event.set()
+            backfill_request.set()
 
         asyncio.create_task(stopper())
 

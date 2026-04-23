@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: Robust Ingestion
-status: ready_to_execute
-stopped_at: Phase 1 planned
-last_updated: "2026-04-19T01:00:00.000Z"
-last_activity: 2026-04-19 — Phase 1 replanned with cross-AI review feedback (Gemini + Codex); 8 plans verified; ready to execute
+status: executing
+stopped_at: Phase 3 context gathered
+last_updated: "2026-04-23T08:06:21.720Z"
+last_activity: 2026-04-23 -- Phase 03 execution started
 progress:
   total_phases: 3
-  completed_phases: 0
-  total_plans: 8
-  completed_plans: 0
-  percent: 0
+  completed_phases: 2
+  total_plans: 29
+  completed_plans: 21
+  percent: 72
 ---
 
 # Project State
@@ -21,22 +21,22 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-19)
 
 **Core value:** State changes and registry metadata land in TimescaleDB reliably even when the database is temporarily unavailable — HA continues to function normally regardless.
-**Current focus:** Phase 1 — Thread Worker Foundation
+**Current focus:** Phase 03 — hardening-and-observability
 
 ## Current Position
 
-Phase: 1 of 3 (Thread Worker Foundation)
-Plan: 0 of 8 in current phase
-Status: Ready to execute
-Last activity: 2026-04-19 — Phase 1 planned; 8 plans in 5 waves
+Phase: 03 (hardening-and-observability) — EXECUTING
+Plan: 1 of 8
+Status: Executing Phase 03
+Last activity: 2026-04-23 -- Phase 03 execution started
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 0
+- Total plans completed: 21
 - Average duration: -
 - Total execution time: 0 hours
 
@@ -44,11 +44,12 @@ Progress: [░░░░░░░░░░] 0%
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 01 | 8 | - | - |
+| 02 | 13 | - | - |
 
 **Recent Trend:**
 
-- Last 5 plans: -
+- Last 5 plans: 02-09, 02-10, 02-11, 02-12, 02-13
 - Trend: -
 
 *Updated after each plan completion*
@@ -63,6 +64,7 @@ Recent decisions affecting current work:
 - Pre-roadmap: Single `queue.Queue` replaces `threading.Lock` — flush and backfill are sequential in the same worker thread, mutex is unnecessary
 - Pre-roadmap: Bare `psycopg.connect()` connection (not pool) — simpler lifecycle; reconnect handled via watchdog restart path
 - Pre-roadmap: `state_changes_during_period` requires per-entity iteration — `entity_id=None` raises `ValueError`; backfill loops per entity
+- Phase 02: TimescaleDB add-on version ≥ 2.18.1 confirmed OK for `ON CONFLICT DO NOTHING` dedup SQL (user-confirmed 2026-04-22)
 
 ### Pending Todos
 
@@ -70,7 +72,7 @@ None yet.
 
 ### Blockers/Concerns
 
-- Phase 2: Confirm TimescaleDB add-on version ≥ 2.18.1 before finalising `ON CONFLICT DO NOTHING` dedup SQL; ≤ 2.17.2 aborts entire batch on first conflict
+None — all Phase 02 blockers resolved.
 
 ## Deferred Items
 
@@ -84,5 +86,9 @@ None yet.
 ## Session Continuity
 
 Last session: --stopped-at
-Stopped at: Phase 1 context gathered
+Stopped at: Phase 3 context gathered
 Resume file: --resume-file
+
+**Completed Phase:** 02 (durability-story) — 13 plans — 2026-04-22
+
+**Planned Phase:** 03 (hardening-and-observability) — 8 plans — 2026-04-23T07:59:11.726Z

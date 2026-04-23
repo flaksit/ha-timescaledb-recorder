@@ -4,7 +4,7 @@
 
 A custom Home Assistant integration that captures HA state changes and registry metadata (entities, devices, areas, labels) into a TimescaleDB instance. State data lands in the `ha_states` hypertable; metadata is tracked via four SCD2 dimension tables with full temporal history. Deployed as a HACS custom component against a companion TimescaleDB add-on.
 
-Currently at v0.3.6 (async, asyncpg-based, event-loop resident). The v1.1 "robust ingestion" milestone refactors the write path for production-grade durability and isolation without changing the database schema or user-facing configuration surface.
+Currently at v1.1.0 (phase 01 complete). Phase 01 delivered the thread-worker foundation: psycopg3 replaces asyncpg; all DB writes run in a dedicated OS thread via `DbWorker`; the HA event loop can no longer be blocked or crashed by DB errors. Phases 02-03 deliver durability and hardening.
 
 ## Core Value
 
@@ -29,8 +29,8 @@ These capabilities exist in v0.3.6 and are the baseline.
 
 v1.1 — robust ingestion milestone.
 
-- [ ] Thread-worker isolation: StateIngester and MetadataSyncer move to a dedicated OS thread; HA event loop never blocked or crashed by DB errors
-- [ ] psycopg3 (`psycopg[binary]`) replaces asyncpg — sync driver, cleaner in threaded context
+- [x] Thread-worker isolation: StateIngester and MetadataSyncer move to a dedicated OS thread; HA event loop never blocked or crashed by DB errors — Validated in Phase 01
+- [x] psycopg3 (`psycopg[binary]`) replaces asyncpg — sync driver, cleaner in threaded context — Validated in Phase 01
 - [ ] Bounded RAM buffer: 10,000-record cap, drop-oldest with warning log + repair issue on overflow
 - [ ] HA sqlite backfill: triggered on startup and on DB-healthy transition; fills gaps via `recorder.history.state_changes_during_period`
 - [ ] Write mutex: single `threading.Lock` serializing flush and backfill; backfill releases per-chunk to allow flush interleaving

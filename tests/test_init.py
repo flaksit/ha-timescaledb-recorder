@@ -50,6 +50,7 @@ def hass():
     h.bus.async_listen_once = MagicMock()
     h.async_add_executor_job = AsyncMock(return_value=None)
     h.async_create_task = MagicMock()
+    h.async_create_background_task = MagicMock()
     h.config = MagicMock()
     h.config.path = MagicMock(return_value="/tmp/ha_tsdb_test/metadata_queue.jsonl")
     return h
@@ -501,22 +502,22 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
         recorder_instance.enabled = True
         mock_recorder.get_instance.return_value = recorder_instance
 
-        # Track what async_create_task was called with
-        created_tasks = []
+        # Track what async_create_background_task was called with
+        created_bg_tasks = []
 
-        def _capture_task(coro):
-            created_tasks.append(coro)
-            return MagicMock()  # returns a mock task
+        def _capture_bg_task(coro, *, name=None):
+            created_bg_tasks.append(coro)
+            return MagicMock()
 
-        hass.async_create_task = MagicMock(side_effect=_capture_task)
+        hass.async_create_background_task = MagicMock(side_effect=_capture_bg_task)
 
         await async_setup_entry(hass, mock_entry)
 
     # watchdog_loop must have been called
     mock_wl.assert_called_once()
-    # watchdog_loop's return value (the sentinel) must have been passed to async_create_task
-    assert watchdog_coro_sentinel in created_tasks, (
-        "watchdog_loop coroutine not passed to hass.async_create_task"
+    # watchdog_loop's return value (the sentinel) must have been passed to async_create_background_task
+    assert watchdog_coro_sentinel in created_bg_tasks, (
+        "watchdog_loop coroutine not passed to hass.async_create_background_task"
     )
 
 
@@ -615,7 +616,7 @@ def test_orchestrator_done_callback_returns_on_cancelled_task():
         cb(task)
 
     mock_notify.assert_not_called()
-    hass.async_create_task.assert_not_called()
+    hass.async_create_background_task.assert_not_called()
 
 
 def test_orchestrator_done_callback_returns_on_stop_event_set():
@@ -640,7 +641,7 @@ def test_orchestrator_done_callback_returns_on_stop_event_set():
         cb(task)
 
     mock_notify.assert_not_called()
-    hass.async_create_task.assert_not_called()
+    hass.async_create_background_task.assert_not_called()
 
 
 def test_orchestrator_done_callback_returns_on_loop_stop_event_set():
@@ -665,7 +666,7 @@ def test_orchestrator_done_callback_returns_on_loop_stop_event_set():
         cb(task)
 
     mock_notify.assert_not_called()
-    hass.async_create_task.assert_not_called()
+    hass.async_create_background_task.assert_not_called()
 
 
 def test_orchestrator_done_callback_returns_on_clean_exit():
@@ -691,7 +692,7 @@ def test_orchestrator_done_callback_returns_on_clean_exit():
         cb(task)
 
     mock_notify.assert_not_called()
-    hass.async_create_task.assert_not_called()
+    hass.async_create_background_task.assert_not_called()
 
 
 def test_orchestrator_done_callback_fires_notify_and_schedules_relaunch():
@@ -723,8 +724,8 @@ def test_orchestrator_done_callback_fires_notify_and_schedules_relaunch():
     assert call_kwargs[1]["component"] == "orchestrator" or (
         len(call_kwargs[0]) >= 2 and call_kwargs[0][1] == "orchestrator"
     )
-    # _relaunch coroutine must be scheduled
-    hass.async_create_task.assert_called_once()
+    # _relaunch coroutine must be scheduled via background task
+    hass.async_create_background_task.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -752,12 +753,12 @@ async def test_orchestrator_relaunch_sleeps_5s_before_new_task():
     new_task = MagicMock()
     new_task.add_done_callback = MagicMock()
 
-    def _capture_create(coro):
+    def _capture_create(coro, *, name=None):
         # First call from done_callback schedules _relaunch; subsequent calls create the task
         call_order.append(("create_task",))
         return new_task
 
-    hass.async_create_task = MagicMock(side_effect=_capture_create)
+    hass.async_create_background_task = MagicMock(side_effect=_capture_create)
 
     cb = _make_orchestrator_done_callback(hass, runtime, orchestrator_kwargs)
 
@@ -776,9 +777,9 @@ async def test_orchestrator_relaunch_sleeps_5s_before_new_task():
         mock_borch.return_value = object()
         cb(task)
 
-        # Retrieve the _relaunch coroutine passed to async_create_task
-        assert hass.async_create_task.called
-        relaunch_coro = hass.async_create_task.call_args[0][0]
+        # Retrieve the _relaunch coroutine passed to async_create_background_task
+        assert hass.async_create_background_task.called
+        relaunch_coro = hass.async_create_background_task.call_args[0][0]
         # Run it
         await relaunch_coro
 
@@ -821,13 +822,13 @@ async def test_orchestrator_relaunch_aborts_if_stop_event_set_during_sleep():
         # Simulate shutdown happening during the sleep
         stop_called[0] = True
 
-    def _capture(coro):
+    def _capture(coro, *, name=None):
         create_task_calls.append(coro)
         mock_task = MagicMock()
         mock_task.add_done_callback = MagicMock()
         return mock_task
 
-    hass.async_create_task = MagicMock(side_effect=_capture)
+    hass.async_create_background_task = MagicMock(side_effect=_capture)
 
     cb = _make_orchestrator_done_callback(hass, runtime, {})
 
@@ -846,8 +847,8 @@ async def test_orchestrator_relaunch_aborts_if_stop_event_set_during_sleep():
         mock_borch.return_value = object()
         cb(task)
 
-        # One create_task call so far (for _relaunch itself)
-        relaunch_coro = hass.async_create_task.call_args[0][0]
+        # One create_background_task call so far (for _relaunch itself)
+        relaunch_coro = hass.async_create_background_task.call_args[0][0]
         await relaunch_coro
 
     # After the sleep sets stop_called=True, _relaunch must NOT call async_create_task
@@ -1066,18 +1067,18 @@ async def test_recorder_disabled_spawns_wait_task_on_issue_raised(hass, mock_ent
 
         mock_recorder.get_instance.side_effect = KeyError("recorder")
 
-        # Track what async_create_task was called with
+        # Track what async_create_background_task was called with
         created_coros = []
-        def _capture(coro):
+        def _capture(coro, *, name=None):
             created_coros.append(coro)
             return MagicMock()
 
-        hass.async_create_task = MagicMock(side_effect=_capture)
+        hass.async_create_background_task = MagicMock(side_effect=_capture)
 
         await async_setup_entry(hass, mock_entry)
 
     assert wait_sentinel in created_coros, (
-        "_wait_for_recorder_and_clear coroutine not passed to hass.async_create_task"
+        "_wait_for_recorder_and_clear coroutine not passed to hass.async_create_background_task"
     )
 
 

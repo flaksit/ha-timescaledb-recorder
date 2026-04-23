@@ -290,13 +290,14 @@ def _make_orchestrator_done_callback(
             # Re-check shutdown state after sleeping — may have changed.
             if runtime.stop_event.is_set() or runtime.loop_stop_event.is_set():
                 return
-            new_task = hass.async_create_task(
+            new_task = hass.async_create_background_task(
                 backfill_orchestrator(**orchestrator_kwargs),
+                name="ha_timescaledb_recorder_backfill_orchestrator",
             )
             new_task.add_done_callback(_on_orchestrator_done)
             runtime.orchestrator_task = new_task
 
-        hass.async_create_task(_relaunch())
+        hass.async_create_background_task(_relaunch(), name="ha_timescaledb_recorder_orchestrator_relaunch")
 
     return _on_orchestrator_done
 
@@ -393,21 +394,28 @@ async def async_setup_entry(
         _recorder_check = ha_recorder.get_instance(hass)
         if not _recorder_check.enabled:
             create_recorder_disabled_issue(hass)
-            hass.async_create_task(_wait_for_recorder_and_clear(hass))
+            hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="ha_timescaledb_recorder_wait_recorder")
     except KeyError:
         create_recorder_disabled_issue(hass)
-        hass.async_create_task(_wait_for_recorder_and_clear(hass))
+        hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="ha_timescaledb_recorder_wait_recorder")
 
     # Spawn the overflow watcher now that workers are running; it fires the
     # D-10-b repair issue on first overflow flip until orchestrator clears it.
-    data.overflow_watcher_task = hass.async_create_task(
+    # async_create_background_task: tasks not tracked by HA bootstrap/shutdown
+    # stages, so long-running coroutines don't cause "Setup timed out for bootstrap"
+    # warnings or delay HA shutdown beyond the unload cancellation we do explicitly.
+    data.overflow_watcher_task = hass.async_create_background_task(
         _overflow_watcher(hass, live_queue, loop_stop_event),
+        name="ha_timescaledb_recorder_overflow_watcher",
     )
 
     # D-05-a: watchdog task supervising both worker threads. Must be spawned
     # AFTER workers exist on data (watchdog_loop reads runtime.states_worker etc.).
     # Cancelled first in async_unload_entry before orchestrator teardown.
-    data.watchdog_task = hass.async_create_task(watchdog_loop(hass, data))
+    data.watchdog_task = hass.async_create_background_task(
+        watchdog_loop(hass, data),
+        name="ha_timescaledb_recorder_watchdog",
+    )
 
     # D-12 step 8: defer orchestrator spawn until HA has fully started.
     @callback
@@ -423,7 +431,10 @@ async def async_setup_entry(
             stop_event=loop_stop_event,
             threading_stop_event=stop_event,  # Plan 05 kwarg
         )
-        task = hass.async_create_task(backfill_orchestrator(**orchestrator_kwargs))
+        task = hass.async_create_background_task(
+            backfill_orchestrator(**orchestrator_kwargs),
+            name="ha_timescaledb_recorder_backfill_orchestrator",
+        )
         task.add_done_callback(
             _make_orchestrator_done_callback(hass, data, orchestrator_kwargs),
         )

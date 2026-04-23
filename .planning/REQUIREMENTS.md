@@ -85,39 +85,39 @@
 
 ## Traceability
 
-Updated by roadmap creation (2026-04-19).
+Updated by roadmap creation (2026-04-19). All phases complete 2026-04-23.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| WORK-01 | Phase 1 | Pending |
-| WORK-02 | Phase 1 | Pending |
-| WORK-03 | Phase 1 | Pending |
-| WORK-04 | Phase 1 | Pending |
-| WORK-05 | Phase 1 | Pending |
-| BUF-01 | Phase 2 | Pending |
-| BUF-02 | Phase 2 | Pending |
-| BUF-03 | Phase 1 | Pending |
-| BACK-01 | Phase 2 | Pending |
-| BACK-02 | Phase 2 | Pending |
-| BACK-03 | Phase 2 | Pending |
-| BACK-04 | Phase 2 | Pending |
-| BACK-05 | Phase 2 | Pending |
-| BACK-06 | Phase 2 | Pending |
-| META-01 | Phase 2 | Pending |
-| META-02 | Phase 2 | Pending |
-| META-03 | Phase 2 | Pending |
+| WORK-01 | Phase 1 | Shipped |
+| WORK-02 | Phase 1 | Shipped |
+| WORK-03 | Phase 1 | Shipped |
+| WORK-04 | Phase 1 | Shipped |
+| WORK-05 | Phase 1 | Shipped |
+| BUF-01 | Phase 2 | Shipped |
+| BUF-02 | Phase 2 | Shipped |
+| BUF-03 | Phase 1 | Shipped |
+| BACK-01 | Phase 2 | Shipped |
+| BACK-02 | Phase 2 | Shipped |
+| BACK-03 | Phase 2 | Shipped |
+| BACK-04 | Phase 2 | Shipped |
+| BACK-05 | Phase 2 | Shipped |
+| BACK-06 | Phase 2 | Shipped |
+| META-01 | Phase 2 | Shipped |
+| META-02 | Phase 2 | Shipped |
+| META-03 | Phase 2 | Shipped |
 | WATCH-01 | Phase 3 | Shipped |
-| WATCH-02 | Phase 1 | Pending |
+| WATCH-02 | Phase 1 | Shipped |
 | WATCH-03 | Phase 3 | Shipped |
 | OBS-01 | Phase 3 | Shipped |
 | OBS-02 | Phase 3 | Shipped |
 | OBS-03 | Phase 3 | Shipped |
 | OBS-04 | Phase 3 | Shipped |
-| SQLERR-01 | Phase 2 | Pending |
-| SQLERR-02 | Phase 2 | Pending |
+| SQLERR-01 | Phase 2 | Shipped |
+| SQLERR-02 | Phase 2 | Shipped |
 | SQLERR-03 | Phase 3 | DROPPED (see 03-CONTEXT.md#D-01) |
 | SQLERR-04 | Phase 3 | DROPPED (see 03-CONTEXT.md#D-01) |
-| SQLERR-05 | Phase 2 | Pending |
+| SQLERR-05 | Phase 2 | Shipped |
 
 **Coverage:**
 - v1 requirements: 29 total (WORK×5, BUF×3, BACK×6, META×3, WATCH×3, OBS×4, SQLERR×5)
@@ -129,4 +129,4 @@ Note: The pre-roadmap header said "25 total" — actual count is 29 after full e
 
 ---
 *Requirements defined: 2026-04-19*
-*Last updated: 2026-04-23 — Phase 3 execution: SQLERR-03/04 marked DROPPED per D-01; WATCH/OBS entries marked Shipped*
+*Last updated: 2026-04-23 — v1.1 complete: all 27 requirements marked Shipped; SQLERR-03/04 DROPPED per D-01*

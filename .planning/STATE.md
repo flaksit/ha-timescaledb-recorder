@@ -2,77 +2,33 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: Robust Ingestion
-status: executing
-stopped_at: Phase 3 context gathered
-last_updated: "2026-04-23T08:06:21.720Z"
-last_activity: 2026-04-23 -- Phase 03 execution started
+status: complete
+stopped_at: null
+last_updated: "2026-04-23T20:30:00Z"
+last_activity: 2026-04-23 -- v1.1 milestone archived
 progress:
   total_phases: 3
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 29
-  completed_plans: 21
-  percent: 72
+  completed_plans: 29
+  percent: 100
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-19)
+See: .planning/PROJECT.md (updated 2026-04-23)
 
 **Core value:** State changes and registry metadata land in TimescaleDB reliably even when the database is temporarily unavailable — HA continues to function normally regardless.
-**Current focus:** Phase 03 — hardening-and-observability
+**Current focus:** v1.1 complete — planning next milestone
 
-## Current Position
+## Milestone v1.1 Complete
 
-Phase: 03 (hardening-and-observability) — EXECUTING
-Plan: 1 of 8
-Status: Executing Phase 03
-Last activity: 2026-04-23 -- Phase 03 execution started
+Shipped 2026-04-23. All 3 phases, 29 plans executed and verified.
 
-Progress: [██████████] 100%
-
-## Performance Metrics
-
-**Velocity:**
-
-- Total plans completed: 21
-- Average duration: -
-- Total execution time: 0 hours
-
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 01 | 8 | - | - |
-| 02 | 13 | - | - |
-
-**Recent Trend:**
-
-- Last 5 plans: 02-09, 02-10, 02-11, 02-12, 02-13
-- Trend: -
-
-*Updated after each plan completion*
-
-## Accumulated Context
-
-### Decisions
-
-Decisions are logged in PROJECT.md Key Decisions table.
-Recent decisions affecting current work:
-
-- Pre-roadmap: Single `queue.Queue` replaces `threading.Lock` — flush and backfill are sequential in the same worker thread, mutex is unnecessary
-- Pre-roadmap: Bare `psycopg.connect()` connection (not pool) — simpler lifecycle; reconnect handled via watchdog restart path
-- Pre-roadmap: `state_changes_during_period` requires per-entity iteration — `entity_id=None` raises `ValueError`; backfill loops per entity
-- Phase 02: TimescaleDB add-on version ≥ 2.18.1 confirmed OK for `ON CONFLICT DO NOTHING` dedup SQL (user-confirmed 2026-04-22)
-
-### Pending Todos
-
-None yet.
-
-### Blockers/Concerns
-
-None — all Phase 02 blockers resolved.
+Archive: `.planning/milestones/v1.1-ROADMAP.md` · `.planning/milestones/v1.1-REQUIREMENTS.md`
+Summary: `.planning/MILESTONES.md`
 
 ## Deferred Items
 
@@ -82,13 +38,4 @@ None — all Phase 02 blockers resolved.
 | v2 | SSL/TLS option (SSL-01) | Deferred | 2026-04-19 |
 | v2 | Sensor entity for health (SENSOR-01) | Deferred | 2026-04-19 |
 | v2 | Entity filter in options flow (FILTER-01) | Deferred | 2026-04-19 |
-
-## Session Continuity
-
-Last session: --stopped-at
-Stopped at: Phase 3 context gathered
-Resume file: --resume-file
-
-**Completed Phase:** 02 (durability-story) — 13 plans — 2026-04-22
-
-**Planned Phase:** 03 (hardening-and-observability) — 8 plans — 2026-04-23T07:59:11.726Z
+| tech-debt | `hasattr(ha_recorder, "async_wait_recorder")` forward-compat guard — if HA removes API, recorder_disabled issue won't auto-clear | Acknowledged | 2026-04-23 |

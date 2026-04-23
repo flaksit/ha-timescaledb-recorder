@@ -6,13 +6,13 @@ The v1.1 milestone refactors the write path from an async, event-loop-resident a
 
 ## Milestones
 
-- 🚧 **v1.1 Robust Ingestion** - Phases 1-3 (in progress)
+- ✅ **v1.1 Robust Ingestion** - Phases 1-3 (complete 2026-04-23)
 
 ## Phases
 
-- [ ] **Phase 1: Thread Worker Foundation** - Correct async/thread boundary, psycopg3 wiring, flush loop, graceful shutdown
-- [ ] **Phase 2: Durability Story** - Bounded buffer, HA sqlite backfill, metadata recovery, transient SQL error handling
-- [ ] **Phase 3: Hardening and Observability** - Watchdog restart, per-row error isolation, repair issues, persistent notifications, strings.json
+- [x] **Phase 1: Thread Worker Foundation** - Correct async/thread boundary, psycopg3 wiring, flush loop, graceful shutdown
+- [x] **Phase 2: Durability Story** - Bounded buffer, HA sqlite backfill, metadata recovery, transient SQL error handling
+- [x] **Phase 3: Hardening and Observability** - Watchdog restart, per-row error isolation, repair issues, persistent notifications, strings.json
 
 ## Phase Details
 
@@ -80,19 +80,19 @@ Plans:
 **Plans**: 8 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — Phase 3 constants + strings.json translation keys + issues.py helpers
-- [ ] 03-02-PLAN.md — notifications.py: notify_watchdog_recovery + notify_backfill_gap
-- [ ] 03-03-PLAN.md — Extend retry_until_success with on_recovery + on_sustained_fail hooks (TDD)
-- [ ] 03-04-PLAN.md — Wire Phase 3 hooks + _last_* context in states_worker and meta_worker
-- [ ] 03-05-PLAN.md — Backfill gap detection + retry-wrap read paths
-- [ ] 03-06-PLAN.md — watchdog.py: watchdog_loop + spawn factories
-- [ ] 03-07-PLAN.md — Wire watchdog + orchestrator done_callback + recorder_disabled in __init__.py
-- [ ] 03-08-PLAN.md — Update REQUIREMENTS.md and ROADMAP.md per D-01 / D-12
+- [x] 03-01-PLAN.md — Phase 3 constants + strings.json translation keys + issues.py helpers
+- [x] 03-02-PLAN.md — notifications.py: notify_watchdog_recovery + notify_backfill_gap
+- [x] 03-03-PLAN.md — Extend retry_until_success with on_recovery + on_sustained_fail hooks (TDD)
+- [x] 03-04-PLAN.md — Wire Phase 3 hooks + _last_* context in states_worker and meta_worker
+- [x] 03-05-PLAN.md — Backfill gap detection + retry-wrap read paths
+- [x] 03-06-PLAN.md — watchdog.py: watchdog_loop + spawn factories
+- [x] 03-07-PLAN.md — Wire watchdog + orchestrator done_callback + recorder_disabled in __init__.py
+- [x] 03-08-PLAN.md — Update REQUIREMENTS.md and ROADMAP.md per D-01 / D-12
 
 ## Progress
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Thread Worker Foundation | 0/8 | In progress | - |
+| 1. Thread Worker Foundation | 8/8 | Complete | 2026-04-22 |
 | 2. Durability Story | 13/13 | Complete | 2026-04-22 |
-| 3. Hardening and Observability | 0/8 | In progress | - |
+| 3. Hardening and Observability | 8/8 | Complete | 2026-04-23 |

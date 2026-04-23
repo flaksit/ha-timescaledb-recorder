@@ -71,12 +71,12 @@ Plans:
 **Depends on**: Phase 2
 **Requirements**: WATCH-01, WATCH-03, OBS-01, OBS-02, OBS-03, OBS-04, SQLERR-03, SQLERR-04
 **Success Criteria** (what must be TRUE):
-  1. The HA Repairs UI shows active repair issues for: DB unreachable >5 min, buffer dropping records, HA recorder disabled; issues clear automatically when conditions resolve
-  2. A `persistent_notification` appears when the worker thread dies and restarts, when backfill completes with a gap, and when backfill fails entirely
-  3. `DataError` and `IntegrityError` trigger a per-row fallback loop; bad rows are logged and skipped; valid rows in the same batch still succeed
-  4. `ProgrammingError` and `SyntaxError` (code bugs or schema drift) produce a critical-level log entry and a repair issue; no retry occurs
-  5. The watchdog async task detects worker thread death, restarts the thread, and fires a `persistent_notification`; unhandled exceptions in the worker are caught and routed through the same restart path
-  6. `strings.json` ships an `"issues"` section with title and description for every repair issue `translation_key`; no missing-key warnings appear in HA logs
+  1. The HA Repairs UI shows active repair issues for: DB unreachable >5 min (`db_unreachable`), buffer dropping records (`buffer_dropping`, Phase 2), HA recorder disabled (`recorder_disabled`), states worker stalled (`states_worker_stalled`), meta worker stalled (`meta_worker_stalled`); issues clear automatically when conditions resolve
+  2. A `persistent_notification` appears when the states or meta worker thread dies and restarts, when the orchestrator async task crashes and is relaunched, and when backfill encounters a recorder-retention gap
+  3. Persistent DB write failures surface via `persistent_notification` after N=5 consecutive retries and as a `worker_stalled` repair issue; the issue clears automatically on the first successful operation after recovery. No error-class branching — `DataError`, `IntegrityError`, `ProgrammingError`, and `SyntaxError` all follow this unified path (see [Phase 3 CONTEXT D-01](phases/03-hardening-and-observability/03-CONTEXT.md#D-01))
+  4. The retry decorator also wraps read paths (`read_watermark` on the worker connection, `_fetch_slice_raw` on the HA recorder pool); transient read errors retry silently with the same backoff schedule as writes
+  5. The watchdog async task detects worker thread death, restarts the thread via spawn factories, and fires a structured `persistent_notification` with the captured `_last_exception` and `_last_context`; unhandled exceptions in worker `run()` are caught by an outer try/except and routed through the watchdog restart path
+  6. `strings.json` ships an `"issues"` section with `title` and `description` for every repair issue `translation_key`; no missing-key warnings appear in HA logs
 **Plans**: 8 plans
 
 Plans:
@@ -95,4 +95,4 @@ Plans:
 |-------|----------------|--------|-----------|
 | 1. Thread Worker Foundation | 0/8 | In progress | - |
 | 2. Durability Story | 13/13 | Complete | 2026-04-22 |
-| 3. Hardening and Observability | 0/TBD | Not started | - |
+| 3. Hardening and Observability | 0/8 | In progress | - |

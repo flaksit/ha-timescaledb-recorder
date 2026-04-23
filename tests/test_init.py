@@ -67,16 +67,16 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
     meta_queue.join (4), _async_initial_registry_backfill (5),
     syncer.async_start (6), ingester.async_start (7),
     bus.async_listen_once registration (8).
+
+    Phase 3 note: workers are now constructed via spawn factories, so
+    spawn_states_worker / spawn_meta_worker are also patched here to return
+    controllable mocks whose .start() side-effects record the sequence.
     """
     sequence: list[str] = []
 
     with patch(
         "custom_components.ha_timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
-    ) as MockMW, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
-    ) as MockSW, patch(
         "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(side_effect=lambda *a, **kw: sequence.append("step5")),
     ), patch(
@@ -86,15 +86,29 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
     ) as MockIng, patch(
         "custom_components.ha_timescaledb_recorder._overflow_watcher",
         new=AsyncMock(),
-    ):
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+    ) as mock_spawn_mw, patch(
+        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+    ) as mock_spawn_sw, patch(
+        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.ha_recorder",
+    ) as mock_recorder:
         pq = MockPQ.return_value
         pq.join = AsyncMock(side_effect=lambda: sequence.append("step4"))
 
-        mw = MockMW.return_value
+        mw = MagicMock()
         mw.start = MagicMock(side_effect=lambda: sequence.append("step2"))
+        mw.read_watermark = MagicMock()
+        mw.read_open_entities = MagicMock()
+        mock_spawn_mw.return_value = mw
 
-        sw = MockSW.return_value
+        sw = MagicMock()
         sw.start = MagicMock(side_effect=lambda: sequence.append("step3"))
+        sw.read_watermark = MagicMock()
+        sw.read_open_entities = MagicMock()
+        mock_spawn_sw.return_value = sw
 
         syncer = MockSyncer.return_value
         syncer.async_start = AsyncMock(side_effect=lambda: sequence.append("step6"))
@@ -106,6 +120,10 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
         hass.bus.async_listen_once = MagicMock(
             side_effect=lambda *a, **kw: sequence.append("step8")
         )
+
+        recorder_instance = MagicMock()
+        recorder_instance.enabled = True
+        mock_recorder.get_instance.return_value = recorder_instance
 
         await async_setup_entry(hass, mock_entry)
 
@@ -119,10 +137,6 @@ async def test_setup_entry_returns_true(hass, mock_entry):
     with patch(
         "custom_components.ha_timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
-    ) as MockMW, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
-    ) as MockSW, patch(
         "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
@@ -132,12 +146,31 @@ async def test_setup_entry_returns_true(hass, mock_entry):
     ) as MockIng, patch(
         "custom_components.ha_timescaledb_recorder._overflow_watcher",
         new=AsyncMock(),
-    ):
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+    ) as mock_spawn_mw, patch(
+        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+    ) as mock_spawn_sw, patch(
+        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.ha_recorder",
+    ) as mock_recorder:
         MockPQ.return_value.join = AsyncMock()
-        MockMW.return_value.start = MagicMock()
-        MockSW.return_value.start = MagicMock()
+        mock_mw = MagicMock()
+        mock_mw.start = MagicMock()
+        mock_mw.read_watermark = MagicMock()
+        mock_mw.read_open_entities = MagicMock()
+        mock_spawn_mw.return_value = mock_mw
+        mock_sw = MagicMock()
+        mock_sw.start = MagicMock()
+        mock_sw.read_watermark = MagicMock()
+        mock_sw.read_open_entities = MagicMock()
+        mock_spawn_sw.return_value = mock_sw
         MockSyncer.return_value.async_start = AsyncMock()
         MockIng.return_value.async_start = MagicMock()
+        recorder_instance = MagicMock()
+        recorder_instance.enabled = True
+        mock_recorder.get_instance.return_value = recorder_instance
 
         result = await async_setup_entry(hass, mock_entry)
 
@@ -151,10 +184,6 @@ async def test_setup_entry_runtime_data_has_all_fields(hass, mock_entry):
     with patch(
         "custom_components.ha_timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
-    ) as MockMW, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
-    ) as MockSW, patch(
         "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
@@ -164,12 +193,31 @@ async def test_setup_entry_runtime_data_has_all_fields(hass, mock_entry):
     ) as MockIng, patch(
         "custom_components.ha_timescaledb_recorder._overflow_watcher",
         new=AsyncMock(),
-    ):
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+    ) as mock_spawn_mw, patch(
+        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+    ) as mock_spawn_sw, patch(
+        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.ha_recorder",
+    ) as mock_recorder:
         MockPQ.return_value.join = AsyncMock()
-        MockMW.return_value.start = MagicMock()
-        MockSW.return_value.start = MagicMock()
+        mock_mw = MagicMock()
+        mock_mw.start = MagicMock()
+        mock_mw.read_watermark = MagicMock()
+        mock_mw.read_open_entities = MagicMock()
+        mock_spawn_mw.return_value = mock_mw
+        mock_sw = MagicMock()
+        mock_sw.start = MagicMock()
+        mock_sw.read_watermark = MagicMock()
+        mock_sw.read_open_entities = MagicMock()
+        mock_spawn_sw.return_value = mock_sw
         MockSyncer.return_value.async_start = AsyncMock()
         MockIng.return_value.async_start = MagicMock()
+        recorder_instance = MagicMock()
+        recorder_instance.enabled = True
+        mock_recorder.get_instance.return_value = recorder_instance
 
         await async_setup_entry(hass, mock_entry)
 
@@ -194,9 +242,10 @@ async def test_setup_entry_runtime_data_has_all_fields(hass, mock_entry):
 async def test_async_unload_entry_runs_d13_sequence(hass, mock_entry):
     """async_unload_entry must execute the D-13 shutdown sequence.
 
-    Verifies: stop_event.set(), loop_stop_event.set(), orchestrator cancel,
-    overflow_watcher cancel, ingester.stop(), syncer.async_stop(),
-    meta_queue.wake_consumer(), and executor joins for both workers.
+    Verifies: stop_event.set(), loop_stop_event.set(), watchdog cancel (Phase 3),
+    orchestrator cancel, overflow_watcher cancel, ingester.stop(),
+    syncer.async_stop(), meta_queue.wake_consumer(), and executor joins for
+    both workers.
     """
     data = MagicMock(spec=HaTimescaleDBData)
     data.stop_event = MagicMock()
@@ -210,25 +259,17 @@ async def test_async_unload_entry_runs_d13_sequence(hass, mock_entry):
     data.meta_worker = MagicMock()
     data.meta_worker.is_alive = MagicMock(return_value=False)
 
-    # Tasks that cancel cleanly
-    async def _cancelled():
-        raise asyncio.CancelledError
-
-    orch_task = MagicMock()
-    orch_task.cancel = MagicMock()
-
-    async def _await_orch():
-        raise asyncio.CancelledError
-
-    orch_task.__await__ = lambda self: _await_orch().__await__()
-
-    data.orchestrator_task = asyncio.create_task(_cancelled())
-    data.orchestrator_task.cancel()
-    # Re-create as simple cancelled future for cleaner mock
     loop = asyncio.get_event_loop()
-    fut = loop.create_future()
-    fut.cancel()
-    data.orchestrator_task = fut
+
+    # Phase 3: watchdog_task must be a proper awaitable cancelled future
+    watchdog_fut = loop.create_future()
+    watchdog_fut.cancel()
+    data.watchdog_task = watchdog_fut
+
+    # Orchestrator and overflow watcher as cancelled futures
+    orch_fut = loop.create_future()
+    orch_fut.cancel()
+    data.orchestrator_task = orch_fut
 
     overflow_fut = loop.create_future()
     overflow_fut.cancel()
@@ -254,6 +295,7 @@ async def test_async_unload_entry_returns_true(hass, mock_entry):
     data = MagicMock(spec=HaTimescaleDBData)
     data.stop_event = MagicMock()
     data.loop_stop_event = MagicMock()
+    data.watchdog_task = None      # Phase 3 field — None means not spawned
     data.orchestrator_task = None
     data.overflow_watcher_task = None
     data.ingester = MagicMock()
@@ -277,32 +319,37 @@ async def test_async_unload_entry_returns_true(hass, mock_entry):
 # ---------------------------------------------------------------------------
 
 async def test_partial_start_rollback_on_syncer_failure(hass, mock_entry):
-    """If syncer.async_start() raises, workers must be stopped — no orphaned threads."""
-    worker_stopped = []
+    """If syncer.async_start() raises, workers must be stopped — no orphaned threads.
 
+    Phase 3 note: workers are now constructed via spawn factories so this test
+    patches spawn_states_worker / spawn_meta_worker to return controllable mocks.
+    The rollback path calls join on the factory-returned worker mocks.
+    """
     with patch(
         "custom_components.ha_timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
-    ) as MockMW, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
-    ) as MockSW, patch(
         "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
         "custom_components.ha_timescaledb_recorder.MetadataSyncer"
     ) as MockSyncer, patch(
         "custom_components.ha_timescaledb_recorder.StateIngester"
-    ) as MockIng:
+    ) as MockIng, patch(
+        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+    ) as mock_spawn_mw, patch(
+        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+    ) as mock_spawn_sw:
         pq = MockPQ.return_value
         pq.join = AsyncMock()
         pq.wake_consumer = MagicMock()
 
-        mw = MockMW.return_value
+        mw = MagicMock()
         mw.start = MagicMock()
+        mock_spawn_mw.return_value = mw
 
-        sw = MockSW.return_value
+        sw = MagicMock()
         sw.start = MagicMock()
+        mock_spawn_sw.return_value = sw
 
         syncer = MockSyncer.return_value
         syncer.async_start = AsyncMock(side_effect=RuntimeError("syncer exploded"))
@@ -405,6 +452,12 @@ async def test_setup_spawns_workers_via_factories(hass, mock_entry):
 
 async def test_setup_creates_watchdog_task(hass, mock_entry):
     """async_setup_entry must assign data.watchdog_task via hass.async_create_task(watchdog_loop(...))."""
+    # Use a sentinel object as the coroutine returned by watchdog_loop.
+    # watchdog_loop must be patched as a regular MagicMock (not AsyncMock) so
+    # that calling it returns the sentinel directly — AsyncMock wraps the return
+    # value in a coroutine, which would prevent identity comparison.
+    watchdog_coro_sentinel = object()
+
     with patch(
         "custom_components.ha_timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
@@ -425,7 +478,8 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
     ) as mock_spawn_sw, patch(
         "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop"
+        "custom_components.ha_timescaledb_recorder.watchdog_loop",
+        new=MagicMock(return_value=watchdog_coro_sentinel),
     ) as mock_wl, patch(
         "custom_components.ha_timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
@@ -449,8 +503,6 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
 
         # Track what async_create_task was called with
         created_tasks = []
-        watchdog_coro_sentinel = object()
-        mock_wl.return_value = watchdog_coro_sentinel
 
         def _capture_task(coro):
             created_tasks.append(coro)
@@ -462,7 +514,7 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
 
     # watchdog_loop must have been called
     mock_wl.assert_called_once()
-    # watchdog_loop's coroutine must have been passed to async_create_task
+    # watchdog_loop's return value (the sentinel) must have been passed to async_create_task
     assert watchdog_coro_sentinel in created_tasks, (
         "watchdog_loop coroutine not passed to hass.async_create_task"
     )
@@ -963,7 +1015,15 @@ async def test_recorder_disabled_check_silent_when_enabled_true(hass, mock_entry
 # ---------------------------------------------------------------------------
 
 async def test_recorder_disabled_spawns_wait_task_on_issue_raised(hass, mock_entry):
-    """When recorder_disabled issue is raised (KeyError), a background wait task must be spawned."""
+    """When recorder_disabled issue is raised (KeyError), a background wait task must be spawned.
+
+    _wait_for_recorder_and_clear is patched as a regular MagicMock (not AsyncMock) so
+    that calling it returns the sentinel directly — AsyncMock wraps return_value in a
+    new coroutine, preventing identity comparison in created_coros.
+    """
+    # Sentinel representing the coroutine that _wait_for_recorder_and_clear returns.
+    wait_sentinel = object()
+
     with patch(
         "custom_components.ha_timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
@@ -991,6 +1051,7 @@ async def test_recorder_disabled_spawns_wait_task_on_issue_raised(hass, mock_ent
         "custom_components.ha_timescaledb_recorder.create_recorder_disabled_issue",
     ), patch(
         "custom_components.ha_timescaledb_recorder._wait_for_recorder_and_clear",
+        new=MagicMock(return_value=wait_sentinel),
     ) as mock_wait_fn:
         MockPQ.return_value.join = AsyncMock()
         MockSyncer.return_value.async_start = AsyncMock()
@@ -1004,9 +1065,6 @@ async def test_recorder_disabled_spawns_wait_task_on_issue_raised(hass, mock_ent
         mock_spawn_mw.return_value.start = MagicMock()
 
         mock_recorder.get_instance.side_effect = KeyError("recorder")
-        # _wait_for_recorder_and_clear returns a coroutine sentinel
-        wait_sentinel = object()
-        mock_wait_fn.return_value = wait_sentinel
 
         # Track what async_create_task was called with
         created_coros = []
@@ -1070,17 +1128,34 @@ async def test_wait_for_recorder_and_clear_does_not_clear_when_recorder_none():
 # ---------------------------------------------------------------------------
 
 async def test_unload_cancels_and_awaits_watchdog_before_orchestrator():
-    """async_unload_entry must cancel+await watchdog_task before cancelling orchestrator_task."""
-    call_order = []
+    """async_unload_entry must cancel+await watchdog_task before cancelling orchestrator_task.
 
-    # Create proper asyncio futures to represent tasks
+    Uses real asyncio.Future objects (not MagicMock) for watchdog_task and
+    orchestrator_task so that `await task` works correctly. Order-tracking is done
+    by wrapping the futures in a small class that overrides .cancel() to record the
+    call sequence before delegating to the underlying future.
+    """
+    call_order = []
     loop = asyncio.get_event_loop()
 
-    watchdog_fut = loop.create_future()
-    watchdog_fut.cancel()
+    class _TrackedFuture:
+        """Thin awaitable wrapper that tracks .cancel() call order."""
 
-    orch_fut = loop.create_future()
-    orch_fut.cancel()
+        def __init__(self, label: str):
+            self._fut = loop.create_future()
+            self._fut.cancel()
+            self._label = label
+
+        def cancel(self):
+            call_order.append(self._label)
+            # Future is already cancelled — idempotent
+            return self._fut.cancel()
+
+        def __await__(self):
+            return self._fut.__await__()
+
+    watchdog_tracked = _TrackedFuture("watchdog_cancel")
+    orch_tracked = _TrackedFuture("orch_cancel")
 
     data = MagicMock(spec=HaTimescaleDBData)
     data.stop_event = MagicMock()
@@ -1093,24 +1168,8 @@ async def test_unload_cancels_and_awaits_watchdog_before_orchestrator():
     data.states_worker.is_alive = MagicMock(return_value=False)
     data.meta_worker = MagicMock()
     data.meta_worker.is_alive = MagicMock(return_value=False)
-
-    # Wrap cancel() in order-tracking
-    def _wd_cancel():
-        call_order.append("watchdog_cancel")
-        watchdog_fut.cancel()
-
-    def _orch_cancel():
-        call_order.append("orch_cancel")
-        orch_fut.cancel()
-
-    data.watchdog_task = MagicMock()
-    data.watchdog_task.cancel = MagicMock(side_effect=_wd_cancel)
-    data.watchdog_task.__await__ = watchdog_fut.__await__
-
-    data.orchestrator_task = MagicMock()
-    data.orchestrator_task.cancel = MagicMock(side_effect=_orch_cancel)
-    data.orchestrator_task.__await__ = orch_fut.__await__
-
+    data.watchdog_task = watchdog_tracked
+    data.orchestrator_task = orch_tracked
     data.overflow_watcher_task = None
 
     mock_entry = MagicMock()
@@ -1157,17 +1216,17 @@ async def test_unload_handles_none_watchdog_task_gracefully():
 
 
 async def test_unload_preserves_phase2_behaviour():
-    """Unload must still execute all Phase 2 shutdown steps after Phase 3 changes."""
+    """Unload must still execute all Phase 2 shutdown steps after Phase 3 changes.
+
+    Uses cancelled asyncio.Future objects for task fields so that `await task`
+    works correctly (MagicMock.__await__ assignment is unreliable for dunder protocols).
+    """
     loop = asyncio.get_event_loop()
 
-    watchdog_fut = loop.create_future()
-    watchdog_fut.cancel()
-
-    orch_fut = loop.create_future()
-    orch_fut.cancel()
-
-    overflow_fut = loop.create_future()
-    overflow_fut.cancel()
+    def _cancelled_future():
+        fut = loop.create_future()
+        fut.cancel()
+        return fut
 
     data = MagicMock(spec=HaTimescaleDBData)
     data.stop_event = MagicMock()
@@ -1181,17 +1240,10 @@ async def test_unload_preserves_phase2_behaviour():
     data.meta_worker = MagicMock()
     data.meta_worker.is_alive = MagicMock(return_value=False)
 
-    data.watchdog_task = MagicMock()
-    data.watchdog_task.cancel = MagicMock()
-    data.watchdog_task.__await__ = watchdog_fut.__await__
-
-    data.orchestrator_task = MagicMock()
-    data.orchestrator_task.cancel = MagicMock()
-    data.orchestrator_task.__await__ = orch_fut.__await__
-
-    data.overflow_watcher_task = MagicMock()
-    data.overflow_watcher_task.cancel = MagicMock()
-    data.overflow_watcher_task.__await__ = overflow_fut.__await__
+    # Use real cancelled futures so `await task` works in async_unload_entry.
+    data.watchdog_task = _cancelled_future()
+    data.orchestrator_task = _cancelled_future()
+    data.overflow_watcher_task = _cancelled_future()
 
     mock_entry = MagicMock()
     mock_entry.runtime_data = data

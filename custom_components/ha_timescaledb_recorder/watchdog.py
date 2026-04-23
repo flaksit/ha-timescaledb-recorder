@@ -27,7 +27,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, callback
 
 from .const import WATCHDOG_INTERVAL_S
 from .meta_worker import TimescaledbMetaRecorderThread
@@ -117,40 +118,54 @@ async def watchdog_loop(
 
     The poll body is wrapped in try/except Exception so a monitoring-cycle bug
     does not kill this task. (Cross-AI review MEDIUM-9.)
+
+    EVENT_HOMEASSISTANT_STOP listener: belt-and-suspenders exit so the task
+    ends during HA's STOPPING stage regardless of when async_unload_entry runs.
+    Without this, HA logs "still running after final writes shutdown stage" when
+    the restart path fires FINAL_WRITE before unload completes.
     """
-    while not runtime.loop_stop_event.is_set():
-        try:
-            # Interruptible sleep. If loop_stop_event is set during the sleep,
-            # wait_for returns normally (event set); otherwise asyncio.TimeoutError.
-            await asyncio.wait_for(
-                runtime.loop_stop_event.wait(),
-                timeout=WATCHDOG_INTERVAL_S,
-            )
-            return  # loop_stop_event set — shutdown path
-        except asyncio.TimeoutError:
-            pass  # normal cadence tick
+    @callback
+    def _on_ha_stop(_event) -> None:
+        runtime.loop_stop_event.set()
 
-        # Defensive: shutdown may have been signalled between wait and poll.
-        if runtime.stop_event.is_set() or runtime.loop_stop_event.is_set():
-            return
+    cancel_stop_listener = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_ha_stop)
 
-        # Entire poll body in try/except — a bug in one cycle must not kill
-        # the watchdog task and leave the workers unsupervised. (MEDIUM-9)
-        try:
-            if not runtime.states_worker.is_alive() and not runtime.stop_event.is_set():
-                await _watchdog_respawn(
-                    hass, runtime, component="states_worker",
-                    dead_thread=runtime.states_worker,
-                    spawn_fn=spawn_states_worker,
+    try:
+        while not runtime.loop_stop_event.is_set():
+            try:
+                # Interruptible sleep. If loop_stop_event is set during the sleep,
+                # wait_for returns normally (event set); otherwise asyncio.TimeoutError.
+                await asyncio.wait_for(
+                    runtime.loop_stop_event.wait(),
+                    timeout=WATCHDOG_INTERVAL_S,
                 )
-            if not runtime.meta_worker.is_alive() and not runtime.stop_event.is_set():
-                await _watchdog_respawn(
-                    hass, runtime, component="meta_worker",
-                    dead_thread=runtime.meta_worker,
-                    spawn_fn=spawn_meta_worker,
+                return  # loop_stop_event set — shutdown path
+            except asyncio.TimeoutError:
+                pass  # normal cadence tick
+
+            # Defensive: shutdown may have been signalled between wait and poll.
+            if runtime.stop_event.is_set() or runtime.loop_stop_event.is_set():
+                return
+
+            # Entire poll body in try/except — a bug in one cycle must not kill
+            # the watchdog task and leave the workers unsupervised. (MEDIUM-9)
+            try:
+                if not runtime.states_worker.is_alive() and not runtime.stop_event.is_set():
+                    await _watchdog_respawn(
+                        hass, runtime, component="states_worker",
+                        dead_thread=runtime.states_worker,
+                        spawn_fn=spawn_states_worker,
+                    )
+                if not runtime.meta_worker.is_alive() and not runtime.stop_event.is_set():
+                    await _watchdog_respawn(
+                        hass, runtime, component="meta_worker",
+                        dead_thread=runtime.meta_worker,
+                        spawn_fn=spawn_meta_worker,
+                    )
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Watchdog poll cycle raised unexpected exception — loop continues",
+                    exc_info=True,
                 )
-        except Exception:  # noqa: BLE001
-            _LOGGER.warning(
-                "Watchdog poll cycle raised unexpected exception — loop continues",
-                exc_info=True,
-            )
+    finally:
+        cancel_stop_listener()

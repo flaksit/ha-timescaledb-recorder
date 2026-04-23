@@ -51,8 +51,8 @@
 
 - [ ] **SQLERR-01**: PostgresConnectionError / OSError → transient; keep rows, retry on next flush
 - [ ] **SQLERR-02**: DeadlockDetected / LockNotAvailable / SerializationError → transient; retry
-- [ ] **SQLERR-03**: DataError / IntegrityError → isolate offending row via single-row fallback loop; log + skip bad row; continue batch
-- [ ] **SQLERR-04**: ProgrammingError / SyntaxError → critical log + repair issue; do not retry (code bug or schema drift)
+- ~~**SQLERR-03**~~: ~~DataError / IntegrityError → isolate offending row via single-row fallback loop; log + skip bad row; continue batch~~ **DROPPED** — see [Phase 3 CONTEXT D-01](phases/03-hardening-and-observability/03-CONTEXT.md#D-01). Persistent bad-row failures stall the worker and surface via the `worker_stalled` repair issue + Phase 2 stall notification.
+- ~~**SQLERR-04**~~: ~~ProgrammingError / SyntaxError → critical log + repair issue; do not retry (code bug or schema drift)~~ **DROPPED** — see [Phase 3 CONTEXT D-01](phases/03-hardening-and-observability/03-CONTEXT.md#D-01). Persistent code-bug / schema-drift failures follow the same unified path as other errors: retry → stall notification after N=5 → `worker_stalled` repair issue.
 - [ ] **SQLERR-05**: TimescaleDB add-on version verified ≥ 2.18.1 before enabling ON CONFLICT DO NOTHING dedup (≤ 2.17.2 bug aborts entire batch on first conflict)
 
 ## v2 Requirements
@@ -106,26 +106,27 @@ Updated by roadmap creation (2026-04-19).
 | META-01 | Phase 2 | Pending |
 | META-02 | Phase 2 | Pending |
 | META-03 | Phase 2 | Pending |
-| WATCH-01 | Phase 3 | Pending |
+| WATCH-01 | Phase 3 | Shipped |
 | WATCH-02 | Phase 1 | Pending |
-| WATCH-03 | Phase 3 | Pending |
-| OBS-01 | Phase 3 | Pending |
-| OBS-02 | Phase 3 | Pending |
-| OBS-03 | Phase 3 | Pending |
-| OBS-04 | Phase 3 | Pending |
+| WATCH-03 | Phase 3 | Shipped |
+| OBS-01 | Phase 3 | Shipped |
+| OBS-02 | Phase 3 | Shipped |
+| OBS-03 | Phase 3 | Shipped |
+| OBS-04 | Phase 3 | Shipped |
 | SQLERR-01 | Phase 2 | Pending |
 | SQLERR-02 | Phase 2 | Pending |
-| SQLERR-03 | Phase 3 | Pending |
-| SQLERR-04 | Phase 3 | Pending |
+| SQLERR-03 | Phase 3 | DROPPED (see 03-CONTEXT.md#D-01) |
+| SQLERR-04 | Phase 3 | DROPPED (see 03-CONTEXT.md#D-01) |
 | SQLERR-05 | Phase 2 | Pending |
 
 **Coverage:**
 - v1 requirements: 29 total (WORK×5, BUF×3, BACK×6, META×3, WATCH×3, OBS×4, SQLERR×5)
 - Mapped to phases: 29
 - Unmapped: 0 ✓
+- Dropped (scope reduction during phase planning): 2 (SQLERR-03, SQLERR-04 — see [Phase 3 CONTEXT D-01](phases/03-hardening-and-observability/03-CONTEXT.md#D-01))
 
 Note: The pre-roadmap header said "25 total" — actual count is 29 after full enumeration.
 
 ---
 *Requirements defined: 2026-04-19*
-*Last updated: 2026-04-19 — traceability confirmed during roadmap creation*
+*Last updated: 2026-04-23 — Phase 3 execution: SQLERR-03/04 marked DROPPED per D-01; WATCH/OBS entries marked Shipped*

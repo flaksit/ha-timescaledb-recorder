@@ -7,7 +7,6 @@ import pytest
 from custom_components.ha_timescaledb_recorder import const
 from custom_components.ha_timescaledb_recorder.retry import (
     _BACKOFF_SCHEDULE,
-    _STALL_NOTIFY_THRESHOLD,
     retry_until_success,
 )
 
@@ -158,7 +157,9 @@ def test_broad_exception_catch_d07c():
 
 def test_default_backoff_constants():
     assert _BACKOFF_SCHEDULE == (1, 5, 10, 30, 60)
-    assert _STALL_NOTIFY_THRESHOLD == 5
+    # _STALL_NOTIFY_THRESHOLD was removed in Phase 3 Plan 03 — the threshold
+    # is now STALL_THRESHOLD in const.py, imported directly by retry.py.
+    assert const.STALL_THRESHOLD == 5
 
 
 # ---------------------------------------------------------------------------

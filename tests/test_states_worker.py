@@ -230,13 +230,20 @@ def test_sustained_fail_hook_creates_db_unreachable_issue():
 
 def test_retry_decorator_wired_with_all_phase3_hooks():
     """D-03: retry_until_success must receive on_recovery and on_sustained_fail
-    keyword args bound to the instance hook methods."""
-    captured = {}
+    keyword args for the _insert_chunk wrapper (first call in __init__).
+    The read_watermark wrapper (second call) uses on_transient only — no hooks.
+
+    __init__ calls retry_until_success twice: once for _insert_chunk, once for
+    read_watermark. Capture both calls and assert the first has full hook set.
+    """
+    all_calls = []
 
     def fake_retry(*, stop_event, on_transient=None, notify_stall=None,
                    on_recovery=None, on_sustained_fail=None, **kwargs):
-        captured["on_recovery"] = on_recovery
-        captured["on_sustained_fail"] = on_sustained_fail
+        all_calls.append({
+            "on_recovery": on_recovery,
+            "on_sustained_fail": on_sustained_fail,
+        })
         def decorator(fn):
             return fn
         return decorator
@@ -247,12 +254,16 @@ def test_retry_decorator_wired_with_all_phase3_hooks():
     ):
         t = _make_thread()
 
-    # Bound hook methods must be passed.
-    assert captured.get("on_recovery") is not None
-    assert captured.get("on_sustained_fail") is not None
+    # __init__ must call retry_until_success at least twice (insert + watermark).
+    assert len(all_calls) >= 2, f"Expected >=2 calls to retry_until_success, got {len(all_calls)}"
+
+    # First call wraps _insert_chunk_raw: must have full Phase 3 hook set.
+    insert_call = all_calls[0]
+    assert insert_call.get("on_recovery") is not None
+    assert insert_call.get("on_sustained_fail") is not None
     # They should be bound to the thread instance (same underlying function).
-    assert captured["on_recovery"].__func__ is t._recovery_hook.__func__
-    assert captured["on_sustained_fail"].__func__ is t._sustained_fail_hook.__func__
+    assert insert_call["on_recovery"].__func__ is t._recovery_hook.__func__
+    assert insert_call["on_sustained_fail"].__func__ is t._sustained_fail_hook.__func__
 
 
 def test_run_outer_except_captures_last_exception_and_context():
@@ -418,8 +429,13 @@ def test_read_watermark_retry_wiring_captures_on_transient(mock_psycopg_conn):
     ):
         t = _make_thread()
 
-    # on_transient must be reset_db_connection (the instance method).
-    assert captured.get("on_transient") is t.reset_db_connection
+    # on_transient must be the bound reset_db_connection of this specific instance.
+    # Bound methods are equal (==) but not identical (is) since Python recreates
+    # bound method wrappers on each attribute access. Use __func__ comparison instead.
+    on_transient = captured.get("on_transient")
+    assert on_transient is not None, "on_transient was not passed to retry_until_success"
+    assert on_transient.__func__ is TimescaledbStateRecorderThread.reset_db_connection
+    assert on_transient.__self__ is t
     # No stall/recovery hooks — watermark failures are surfaced via orchestrator.
     assert captured.get("on_recovery") is None
     assert captured.get("on_sustained_fail") is None

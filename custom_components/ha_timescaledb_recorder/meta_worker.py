@@ -43,6 +43,12 @@ from .const import (
     SCD2_SNAPSHOT_ENTITY_SQL,
     SCD2_SNAPSHOT_LABEL_SQL,
 )
+from .issues import (
+    clear_db_unreachable_issue,
+    clear_meta_worker_stalled_issue,
+    create_db_unreachable_issue,
+    create_meta_worker_stalled_issue,
+)
 from .retry import retry_until_success
 
 if TYPE_CHECKING:
@@ -84,12 +90,29 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         self._stop_event = stop_event
         self._conn: psycopg.Connection | None = None
 
+        # D-06-b: watchdog-readable post-mortem context. Safe defaults in __init__
+        # so watchdog can read these even if run() never executes. (MEDIUM-8)
+        # meta_worker has no mode state machine, so mode is always None.
+        self._last_exception: Exception | None = None
+        self._last_context: dict = {
+            "at": None,
+            "mode": None,       # meta_worker has no mode state machine
+            "retry_attempt": None,
+            "last_op": "unknown",
+        }
+        # Updated before each major operation so watchdog context is meaningful.
+        self._last_op: str = "unknown"
+        self._last_retry_attempt: int | None = None
+
         # retry_until_success is applied to the bound method at __init__ time so
         # on_transient / notify_stall can reference self. D-07 wiring.
+        # Phase 3: extended with on_recovery and on_sustained_fail (D-03, D-11).
         self._write_item = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-            notify_stall=self._notify_stall,
+            notify_stall=self._stall_hook,
+            on_recovery=self._recovery_hook,
+            on_sustained_fail=self._sustained_fail_hook,
         )(self._write_item_raw)
 
     # ------------------------------------------------------------------
@@ -115,18 +138,26 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 pass
         self._conn = None
 
-    def _notify_stall(self, attempts: int) -> None:
-        """Fire a persistent_notification when the retry loop has stalled.
+    # ------------------------------------------------------------------
+    # Phase 3 hook methods (D-02, D-03, D-11)
+    # ------------------------------------------------------------------
 
-        Uses hass.add_job (fire-and-forget) because this is called from the
-        worker thread — direct async calls are not safe here (D-07-f, WATCH-02).
+    def _stall_hook(self, attempts: int) -> None:
+        """Retry-decorator stall hook.
+
+        D-02 / D-07-f: on STALL_THRESHOLD consecutive failures, fire BOTH:
+          - persistent_notification (kept from Phase 2 for continuity)
+          - meta_worker_stalled repair issue (Phase 3 add)
+        Both bridged via hass.add_job (thread-safe).
         """
         _LOGGER.warning(
-            "meta worker stalled after %d attempts — firing persistent_notification",
+            "meta worker stalled after %d attempts — notifying + raising repair issue",
             attempts,
         )
+        # Import lazily to avoid module-load-time HA import cost.
         from homeassistant.components import persistent_notification
 
+        # Keep the Phase 2 notification (unchanged body).
         self._hass.add_job(
             persistent_notification.async_create,
             self._hass,
@@ -135,19 +166,88 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             "TimescaleDB Recorder",
             "ha_timescaledb_recorder_meta_stalled",
         )
+        # New Phase 3 repair issue — auto-clears on recovery.
+        self._hass.add_job(create_meta_worker_stalled_issue, self._hass)
+
+    def _recovery_hook(self) -> None:
+        """Retry-decorator recovery hook.
+
+        D-02-c / D-03-a: fires exactly once on first success after a stall.
+        Clears BOTH repair issues that may have been raised during the streak:
+          - meta_worker_stalled (always raised on stall — D-02)
+          - db_unreachable (raised if streak also exceeded 300s — D-11)
+        Cleared unconditionally — ir.async_delete_issue is a no-op if the
+        issue was not present.
+        """
+        _LOGGER.info("meta worker recovered after stall — clearing repair issues")
+        self._hass.add_job(clear_meta_worker_stalled_issue, self._hass)
+        self._hass.add_job(clear_db_unreachable_issue, self._hass)
+
+    def _sustained_fail_hook(self) -> None:
+        """Retry-decorator sustained-fail hook.
+
+        D-11: fires once when cumulative fail duration crosses
+        DB_UNREACHABLE_THRESHOLD_SECONDS (300s default). Raises the
+        db_unreachable repair issue; cleared by _recovery_hook on next success.
+        """
+        _LOGGER.warning(
+            "meta worker: DB unreachable for > threshold — raising repair issue",
+        )
+        self._hass.add_job(create_db_unreachable_issue, self._hass)
 
     # ------------------------------------------------------------------
     # Main loop (D-05-b, D-05-d)
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Drain PersistentQueue until shutdown; close connection on exit."""
+        """Thread entry point.
+
+        Outer try/except catches unhandled bugs (D-06-a). The inner loop
+        handles expected exceptions (stop_event sentinel via break).
+        Only exceptions outside the retry scope escape to the outer handler.
+
+        The finally block closes the DB connection regardless of success or
+        failure. Crucially, failure capture (_last_exception assignment) happens
+        in the except block BEFORE finally runs, so a teardown error cannot
+        overwrite the original fault. (Cross-AI review 2026-04-23, MEDIUM-8.)
+        """
+        try:
+            self._run_main_loop()
+        except Exception as err:  # noqa: BLE001 — last-resort guard (D-06-a)
+            _LOGGER.error(
+                "%s died with unhandled exception", self.name, exc_info=True,
+            )
+            # Capture BEFORE finally — teardown errors must not overwrite this.
+            self._last_exception = err
+            self._last_context = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "mode": None,  # meta_worker has no mode machine
+                "retry_attempt": self._last_retry_attempt,
+                "last_op": self._last_op,
+            }
+        finally:
+            # Connection teardown — runs regardless of success or failure.
+            # Errors here are caught and logged, NOT re-raised (D-06 principle).
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "%s: error closing connection during teardown", self.name
+                    )
+
+    def _run_main_loop(self) -> None:
+        """Inner main loop extracted from run() so the outer try/except/finally
+        in run() can wrap it cleanly (MEDIUM-8 pattern)."""
         while not self._stop_event.is_set():
             item = self._meta_queue.get()  # blocks on Condition; None on wake
             if item is None or self._stop_event.is_set():
                 # D-05-d: wake_consumer() from async_unload_entry unblocks get()
                 # returning None. Also re-check stop_event for the sentinel-None case.
                 break
+            # Update last_op before the retried operation so watchdog context
+            # captures the activity even after thread exit (D-06-b).
+            self._last_op = "write_item"
             # retry-wrapped; returns None if interrupted by shutdown (D-07-e).
             result = self._write_item(item)
             if self._stop_event.is_set() and result is None:
@@ -155,12 +255,8 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 # Item stays on disk for replay on next startup (D-03-h).
                 break
             self._meta_queue.task_done()
-        # Clean up connection regardless of how we exited the loop.
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
+        # Connection is NOT closed here — the finally block in run() handles
+        # teardown unconditionally (MEDIUM-8: single teardown path).
 
     # ------------------------------------------------------------------
     # Dispatch (D-05-c)

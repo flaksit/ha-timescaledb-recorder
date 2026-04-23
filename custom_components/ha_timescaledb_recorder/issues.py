@@ -3,7 +3,7 @@ Phase 3 extends this module with additional translation_keys (D-10-e).
 """
 import logging
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 
 from .const import DOMAIN
@@ -22,6 +22,7 @@ _DB_UNREACHABLE_ID = "db_unreachable"
 _RECORDER_DISABLED_ID = "recorder_disabled"
 
 
+@callback
 def create_buffer_dropping_issue(hass: HomeAssistant) -> None:
     """Register the buffer_dropping repair issue. Idempotent (HA dedupes by id).
 
@@ -38,6 +39,7 @@ def create_buffer_dropping_issue(hass: HomeAssistant) -> None:
     )
 
 
+@callback
 def clear_buffer_dropping_issue(hass: HomeAssistant) -> None:
     """Delete the buffer_dropping repair issue. Idempotent — no-op if absent.
 
@@ -55,6 +57,7 @@ def clear_buffer_dropping_issue(hass: HomeAssistant) -> None:
 # ---------------------------------------------------------------------------
 
 
+@callback
 def create_states_worker_stalled_issue(hass: HomeAssistant) -> None:
     """Register the states_worker_stalled repair issue (D-02).
 
@@ -71,6 +74,7 @@ def create_states_worker_stalled_issue(hass: HomeAssistant) -> None:
     )
 
 
+@callback
 def clear_states_worker_stalled_issue(hass: HomeAssistant) -> None:
     """Delete the states_worker_stalled repair issue (D-02-c).
 
@@ -79,6 +83,7 @@ def clear_states_worker_stalled_issue(hass: HomeAssistant) -> None:
     ir.async_delete_issue(hass, DOMAIN, _STATES_WORKER_STALLED_ID)
 
 
+@callback
 def create_meta_worker_stalled_issue(hass: HomeAssistant) -> None:
     """Register the meta_worker_stalled repair issue (D-02).
 
@@ -95,6 +100,7 @@ def create_meta_worker_stalled_issue(hass: HomeAssistant) -> None:
     )
 
 
+@callback
 def clear_meta_worker_stalled_issue(hass: HomeAssistant) -> None:
     """Delete the meta_worker_stalled repair issue (D-02-c).
 
@@ -103,6 +109,7 @@ def clear_meta_worker_stalled_issue(hass: HomeAssistant) -> None:
     ir.async_delete_issue(hass, DOMAIN, _META_WORKER_STALLED_ID)
 
 
+@callback
 def create_db_unreachable_issue(hass: HomeAssistant) -> None:
     """Register the db_unreachable repair issue (D-11).
 
@@ -119,6 +126,7 @@ def create_db_unreachable_issue(hass: HomeAssistant) -> None:
     )
 
 
+@callback
 def clear_db_unreachable_issue(hass: HomeAssistant) -> None:
     """Delete the db_unreachable repair issue (D-11).
 
@@ -127,6 +135,7 @@ def clear_db_unreachable_issue(hass: HomeAssistant) -> None:
     ir.async_delete_issue(hass, DOMAIN, _DB_UNREACHABLE_ID)
 
 
+@callback
 def create_recorder_disabled_issue(hass: HomeAssistant) -> None:
     """Register the recorder_disabled repair issue (D-11).
 
@@ -144,6 +153,7 @@ def create_recorder_disabled_issue(hass: HomeAssistant) -> None:
     )
 
 
+@callback
 def clear_recorder_disabled_issue(hass: HomeAssistant) -> None:
     """Delete the recorder_disabled repair issue (D-11).
 

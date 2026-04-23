@@ -15,11 +15,12 @@ flush at or below FLUSH_INTERVAL cadence regardless of event pressure.
 """
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 
 import psycopg
@@ -52,6 +53,14 @@ if TYPE_CHECKING:
     from .overflow_queue import OverflowQueue
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _json_default(obj: object) -> str:
+    # HA attributes may contain datetime/date objects not handled by stdlib json.
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
 
 # State-machine modes (D-04-b). String-valued for log readability.
 MODE_INIT = "init"
@@ -365,7 +374,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         per D-06-d (requires D-09-a unique index).
         """
         params = [
-            (r.entity_id, r.state, Jsonb(r.attributes), r.last_updated, r.last_changed)
+            (r.entity_id, r.state, Jsonb(r.attributes, dumps=lambda v: json.dumps(v, default=_json_default)), r.last_updated, r.last_changed)
             for r in chunk
         ]
         conn = self.get_db_connection()

@@ -19,7 +19,7 @@ import logging
 import queue
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import psycopg
@@ -35,6 +35,12 @@ from .const import (
     INSERT_SQL,
     SELECT_OPEN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
+)
+from .issues import (
+    clear_db_unreachable_issue,
+    clear_states_worker_stalled_issue,
+    create_db_unreachable_issue,
+    create_states_worker_stalled_issue,
 )
 from .retry import retry_until_success
 from .schema import sync_setup_schema
@@ -83,12 +89,32 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._compress_after_hours = compress_after_hours
         self._conn: psycopg.Connection | None = None
 
-        # D-07: wrap _insert_chunk_raw at __init__ so retry hooks bind to `self`.
-        # Wrapping at class-body time would fix `self` too early.
+        # D-06-b: watchdog-readable post-mortem context. Initialized to safe defaults
+        # so watchdog can always read these attributes even if run() never executes.
+        # Populated by outer try/except in run() when an unhandled exception escapes
+        # the main loop.
+        self._last_exception: Exception | None = None
+        self._last_context: dict = {
+            "at": None,
+            "mode": "init",
+            "retry_attempt": None,
+            "last_op": "unknown",
+        }
+        # Updated at stable checkpoints (mode transitions, pre-op) so the watchdog
+        # notification carries meaningful last_op even after thread exit.
+        self._last_op: str = "unknown"
+        self._last_mode: str = "init"
+        self._last_retry_attempt: int | None = None
+
+        # D-03 / D-07 wiring: retry_until_success with full Phase 3 hook set.
+        # Wrapping at class-body time would fix `self` too early; __init__ ensures
+        # all hooks bind to this specific instance.
         self._insert_chunk = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-            notify_stall=self._notify_stall,
+            notify_stall=self._stall_hook,
+            on_recovery=self._recovery_hook,
+            on_sustained_fail=self._sustained_fail_hook,
         )(self._insert_chunk_raw)
 
     # ------------------------------------------------------------------
@@ -111,18 +137,27 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 pass
         self._conn = None
 
-    def _notify_stall(self, attempts: int) -> None:
-        """Retry-decorator hook. Fires a persistent_notification via the event
-        loop (hass.add_job is the thread-safe bridge per worker.py comment).
+    # ------------------------------------------------------------------
+    # Phase 3 hook methods (D-02, D-03, D-11)
+    # ------------------------------------------------------------------
+
+    def _stall_hook(self, attempts: int) -> None:
+        """Retry-decorator stall hook.
+
+        D-02 / D-07-f: on STALL_THRESHOLD consecutive failures, fire BOTH:
+          - persistent_notification (kept from Phase 2 for continuity)
+          - states_worker_stalled repair issue (Phase 3 add)
+        Both bridged via hass.add_job (thread-safe).
         """
         _LOGGER.warning(
-            "states worker stalled after %d attempts — firing persistent_notification",
+            "states worker stalled after %d attempts — notifying + raising repair issue",
             attempts,
         )
         # Import lazily to avoid module-load-time HA import cost and keep
         # notifications orthogonal from the class's test surface.
         from homeassistant.components import persistent_notification
 
+        # Keep the Phase 2 notification (unchanged body).
         self._hass.add_job(
             persistent_notification.async_create,
             self._hass,
@@ -131,18 +166,90 @@ class TimescaledbStateRecorderThread(threading.Thread):
             "TimescaleDB Recorder",
             "ha_timescaledb_recorder_states_stalled",
         )
+        # New Phase 3 repair issue — auto-clears on recovery.
+        self._hass.add_job(create_states_worker_stalled_issue, self._hass)
+
+    def _recovery_hook(self) -> None:
+        """Retry-decorator recovery hook.
+
+        D-02-c / D-03-a: fires exactly once on first success after a stall.
+        Clears BOTH repair issues that may have been raised during the streak:
+          - states_worker_stalled (always raised on stall — D-02)
+          - db_unreachable (raised if streak also exceeded 300s — D-11)
+        Cleared unconditionally — ir.async_delete_issue is a no-op if the
+        issue was not present.
+        """
+        _LOGGER.info(
+            "states worker recovered after stall — clearing repair issues",
+        )
+        self._hass.add_job(clear_states_worker_stalled_issue, self._hass)
+        self._hass.add_job(clear_db_unreachable_issue, self._hass)
+
+    def _sustained_fail_hook(self) -> None:
+        """Retry-decorator sustained-fail hook.
+
+        D-11: fires once when cumulative fail duration crosses
+        DB_UNREACHABLE_THRESHOLD_SECONDS (300s default). Raises the
+        db_unreachable repair issue; cleared by _recovery_hook on next success.
+        """
+        _LOGGER.warning(
+            "states worker: DB unreachable for > threshold — raising repair issue",
+        )
+        self._hass.add_job(create_db_unreachable_issue, self._hass)
 
     # ------------------------------------------------------------------
     # Main loop (D-04)
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Thread entry point."""
+        """Thread entry point.
+
+        Outer try/except catches unhandled bugs (D-06-a). The inner loop
+        handles expected exceptions (queue.Empty, stop_event via continue).
+        Only exceptions outside the retry scope escape to the outer handler.
+
+        The finally block closes the DB connection regardless of success or
+        failure. Crucially, failure capture (_last_exception assignment) happens
+        in the except block BEFORE finally runs, so a teardown error cannot
+        overwrite the original fault. (Cross-AI review 2026-04-23, MEDIUM-8.)
+        """
+        try:
+            self._run_main_loop()
+        except Exception as err:  # noqa: BLE001 — last-resort guard (D-06-a)
+            _LOGGER.error(
+                "%s died with unhandled exception", self.name, exc_info=True,
+            )
+            # Capture context HERE (in except) before finally runs.
+            # If finally also raises, _last_exception already holds the
+            # original fault — it is not overwritten.
+            self._last_exception = err
+            self._last_context = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "mode": self._last_mode,
+                "retry_attempt": self._last_retry_attempt,
+                "last_op": self._last_op,
+            }
+        finally:
+            # Connection teardown — runs regardless of success or failure.
+            # Errors here are caught and logged, NOT re-raised (D-06 principle).
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "%s: error closing connection during teardown", self.name
+                    )
+        # Return naturally — watchdog polls is_alive() on next tick.
+
+    def _run_main_loop(self) -> None:
+        """Inner main loop extracted from run() so the outer try/except/finally
+        in run() can wrap it cleanly (MEDIUM-8 pattern)."""
         # Ensure schema (idempotent; D-15-d carries Phase 1 behaviour). Retry
         # via decorator would be overkill here — startup race with DB outage
         # is handled by the main loop (continues without schema; next flush
         # cycle retries writes, which will fail until DDL succeeds on
         # reconnect). Log-and-continue preserves WATCH-02 non-blocking shape.
+        self._last_op = "schema_setup"
         try:
             conn = self.get_db_connection()
             sync_setup_schema(
@@ -158,6 +265,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
             self.reset_db_connection()
 
         mode = MODE_INIT
+        self._last_mode = mode
         buffer: list[StateRow] = []
         last_flush = time.monotonic()
 
@@ -165,11 +273,13 @@ class TimescaledbStateRecorderThread(threading.Thread):
             # D-04-c: init/overflow → request backfill, switch to MODE_BACKFILL.
             if mode == MODE_INIT or (mode == MODE_LIVE and self._live_queue.overflowed):
                 if buffer:
+                    self._last_op = "flush_pre_backfill"
                     self._flush(buffer)
                     buffer.clear()
                 # asyncio.Event.set is NOT thread-safe — cross the boundary.
                 self._hass.loop.call_soon_threadsafe(self._backfill_request.set)
                 mode = MODE_BACKFILL
+                self._last_mode = mode
                 last_flush = time.monotonic()
                 continue
 
@@ -180,14 +290,17 @@ class TimescaledbStateRecorderThread(threading.Thread):
                     continue  # D-04-f: timeout allows stop_event check
                 if item is BACKFILL_DONE:
                     if buffer:
+                        self._last_op = "flush_backfill_done"
                         self._flush(buffer)
                         buffer.clear()
                     mode = MODE_LIVE
+                    self._last_mode = mode
                     last_flush = time.monotonic()
                     continue
                 # item is dict[entity_id, list[HA State]] (D-04-d)
                 rows = self._slice_to_rows(item)
                 buffer.extend(rows)
+                self._last_op = "flush_backfill_chunk"
                 self._flush(buffer)
                 buffer.clear()
                 continue
@@ -199,6 +312,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 item = self._live_queue.get(timeout=remaining)
             except queue.Empty:
                 if buffer:
+                    self._last_op = "flush_live_timeout"
                     self._flush(buffer)
                     buffer.clear()
                 last_flush = time.monotonic()
@@ -209,21 +323,20 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 len(buffer) >= BATCH_FLUSH_SIZE
                 or time.monotonic() - last_flush >= FLUSH_INTERVAL
             ):
+                self._last_op = "flush_live_threshold"
                 self._flush(buffer)
                 buffer.clear()
                 last_flush = time.monotonic()
 
-        # Shutdown: one final flush (best-effort), then close connection.
+        # Shutdown: one final flush (best-effort).
+        # Connection is NOT closed here — the finally block in run() handles
+        # teardown unconditionally (MEDIUM-8: single teardown path).
         if buffer and self._conn is not None:
             try:
+                self._last_op = "flush_shutdown"
                 self._flush(buffer)
             except Exception:  # noqa: BLE001
                 _LOGGER.warning("Final flush failed at shutdown; %d rows lost", len(buffer))
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     # ------------------------------------------------------------------
     # Flush / chunk (D-06)

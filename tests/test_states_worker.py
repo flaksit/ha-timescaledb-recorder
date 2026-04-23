@@ -182,9 +182,9 @@ def test_stall_hook_fires_persistent_notification_and_repair_issue():
     hass = MagicMock()
     t = _make_thread(hass=hass)
 
-    with patch(
-        "custom_components.ha_timescaledb_recorder.states_worker.persistent_notification"
-    ) as mock_pn:
+    # _stall_hook imports persistent_notification lazily inside the method body;
+    # patch at the homeassistant.components level so the lazy import resolves to the mock.
+    with patch("homeassistant.components.persistent_notification") as mock_pn:
         t._stall_hook(5)
 
     # Two add_job calls: one for persistent_notification.async_create, one for

@@ -334,3 +334,93 @@ def test_last_op_updated_before_retried_operations():
     # exists and has the right type.
     assert isinstance(t._last_op, str)
     assert isinstance(t._last_retry_attempt, (int, type(None)))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 Plan 05: retry-wrapped read_watermark (D-03-c)
+# ---------------------------------------------------------------------------
+
+
+def test_read_watermark_is_retry_wrapped():
+    """D-03-c: after __init__, read_watermark must be the retry-wrapped instance
+    attribute (not identical to _read_watermark_raw)."""
+    t = _make_thread()
+    # read_watermark must exist
+    assert hasattr(t, "read_watermark")
+    # raw variant must be renamed
+    assert hasattr(t, "_read_watermark_raw")
+    # wrapped version must differ from the raw method
+    assert t.read_watermark is not t._read_watermark_raw
+
+
+def test_read_watermark_retries_on_transient_error(mock_psycopg_conn):
+    """D-03-c: a single OperationalError from the raw read must be retried;
+    the final successful return value must be propagated to the caller."""
+    import psycopg
+    from datetime import datetime, timezone
+
+    conn, cur = mock_psycopg_conn
+    expected_dt = datetime(2026, 4, 23, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Fail once, succeed on second call.
+    call_count = {"n": 0}
+
+    def raw_side_effect():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise psycopg.OperationalError("transient error")
+        return expected_dt
+
+    # Use a fast backoff so the test does not sleep.
+    stop_event = threading.Event()
+    t = _make_thread(stop_event=stop_event)
+    t._conn = conn
+
+    reset_mock = MagicMock()
+    t.reset_db_connection = reset_mock
+
+    # Patch the raw method and rebuild the retry wrapper with a zero backoff.
+    t._read_watermark_raw = raw_side_effect
+    from custom_components.ha_timescaledb_recorder.retry import retry_until_success
+    t.read_watermark = retry_until_success(
+        stop_event=stop_event,
+        on_transient=t.reset_db_connection,
+        backoff_schedule=(0,),
+    )(t._read_watermark_raw)
+
+    result = t.read_watermark()
+    assert result == expected_dt
+    # reset_db_connection must have been called at least once (on_transient hook).
+    reset_mock.assert_called()
+
+
+def test_read_watermark_retry_wiring_captures_on_transient(mock_psycopg_conn):
+    """D-03-c: retry_until_success must be called with on_transient=reset_db_connection
+    and without on_recovery / on_sustained_fail / notify_stall (D-03-c note: stall on
+    watermark read manifests as stalled backfill — covered by orchestrator done_callback,
+    not by repair-issue hooks on this wrapper)."""
+    captured = {}
+
+    def fake_retry(*, stop_event, on_transient=None, on_recovery=None,
+                   on_sustained_fail=None, notify_stall=None, **kwargs):
+        captured["on_transient"] = on_transient
+        captured["on_recovery"] = on_recovery
+        captured["on_sustained_fail"] = on_sustained_fail
+        captured["notify_stall"] = notify_stall
+
+        def decorator(fn):
+            return fn
+        return decorator
+
+    with patch(
+        "custom_components.ha_timescaledb_recorder.states_worker.retry_until_success",
+        fake_retry,
+    ):
+        t = _make_thread()
+
+    # on_transient must be reset_db_connection (the instance method).
+    assert captured.get("on_transient") is t.reset_db_connection
+    # No stall/recovery hooks — watermark failures are surfaced via orchestrator.
+    assert captured.get("on_recovery") is None
+    assert captured.get("on_sustained_fail") is None
+    assert captured.get("notify_stall") is None

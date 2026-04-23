@@ -18,7 +18,7 @@ Assumptions:
 - runtime.loop_stop_event is an asyncio.Event used as interruptible sleep.
 - runtime.stop_event is the threading.Event shared with workers.
 - runtime has fields dsn, live_queue, backfill_queue, backfill_request,
-  meta_queue, syncer, chunk_interval_days, compress_after_hours — added
+  meta_queue, registry_listener, chunk_interval_days, compress_after_hours — added
   to HaTimescaleDBData by Plan 07. See PATTERNS.md __init__.py section.
 """
 from __future__ import annotations
@@ -67,12 +67,12 @@ def spawn_meta_worker(
     hass: HomeAssistant,
     runtime: "HaTimescaleDBData",
 ) -> TimescaledbMetaRecorderThread:
-    """Construct a new meta_worker with shared meta_queue + syncer + stop_event."""
+    """Construct a new meta_worker with shared meta_queue + registry_listener + stop_event."""
     return TimescaledbMetaRecorderThread(
         hass=hass,
         dsn=runtime.dsn,
         meta_queue=runtime.meta_queue,
-        syncer=runtime.syncer,
+        registry_listener=runtime.registry_listener,
         stop_event=runtime.stop_event,
     )
 

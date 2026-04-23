@@ -51,7 +51,7 @@ from .const import (
     DOMAIN,
     LIVE_QUEUE_MAXSIZE,
 )
-from .ingester import StateIngester
+from .state_listener import StateListener
 from .issues import (
     clear_recorder_disabled_issue,
     create_buffer_dropping_issue,
@@ -62,7 +62,7 @@ from .notifications import notify_watchdog_recovery
 from .overflow_queue import OverflowQueue
 from .persistent_queue import PersistentQueue
 from .states_worker import TimescaledbStateRecorderThread
-from .syncer import MetadataSyncer, _to_json_safe
+from .registry_listener import RegistryListener, _to_json_safe
 from .watchdog import spawn_meta_worker, spawn_states_worker, watchdog_loop
 
 _LOGGER = logging.getLogger(__name__)
@@ -80,8 +80,8 @@ class HaTimescaleDBData:
 
     states_worker: TimescaledbStateRecorderThread | None
     meta_worker: TimescaledbMetaRecorderThread | None
-    ingester: StateIngester | None
-    syncer: MetadataSyncer
+    state_listener: StateListener | None
+    registry_listener: RegistryListener
     live_queue: OverflowQueue
     meta_queue: PersistentQueue
     backfill_queue: queue.Queue
@@ -136,16 +136,16 @@ async def _async_initial_registry_backfill(
     entity_reg = er.async_get(hass)
     device_reg = dr.async_get(hass)
 
-    # Construct a throwaway MetadataSyncer bound to meta_queue so we can reuse
+    # Construct a throwaway RegistryListener bound to meta_queue so we can reuse
     # its _extract_*_params helpers without duplicating the extraction logic.
-    # At this point syncer.async_start() has NOT been called, so _entity_reg etc.
-    # are None — but the extract helpers receive the registry entry directly as
-    # an argument, so they do not read self._entity_reg.
+    # async_start() has NOT been called on this instance, so _entity_reg etc. are
+    # None — but the extract helpers receive the registry entry directly as an
+    # argument and do not read self._entity_reg.
     now = datetime.now(timezone.utc)
-    syncer_helper = MetadataSyncer(hass=hass, meta_queue=meta_queue)
+    listener_helper = RegistryListener(hass=hass, meta_queue=meta_queue)
 
     for entry in area_reg.async_list_areas():
-        params = syncer_helper._extract_area_params(entry, now)
+        params = listener_helper._extract_area_params(entry, now)
         await meta_queue.put_async({
             "registry": "area",
             "action": "create",
@@ -156,7 +156,7 @@ async def _async_initial_registry_backfill(
         })
 
     for entry in label_reg.async_list_labels():
-        params = syncer_helper._extract_label_params(entry, now)
+        params = listener_helper._extract_label_params(entry, now)
         await meta_queue.put_async({
             "registry": "label",
             "action": "create",
@@ -167,7 +167,7 @@ async def _async_initial_registry_backfill(
         })
 
     for entry in entity_reg.entities.values():
-        params = syncer_helper._extract_entity_params(entry, now)
+        params = listener_helper._extract_entity_params(entry, now)
         await meta_queue.put_async({
             "registry": "entity",
             "action": "create",
@@ -178,7 +178,7 @@ async def _async_initial_registry_backfill(
         })
 
     for entry in device_reg.devices.values():
-        params = syncer_helper._extract_device_params(entry, now)
+        params = listener_helper._extract_device_params(entry, now)
         await meta_queue.put_async({
             "registry": "device",
             "action": "create",
@@ -302,10 +302,34 @@ def _make_orchestrator_done_callback(
     return _on_orchestrator_done
 
 
+async def _async_meta_init(
+    hass: HomeAssistant,
+    meta_queue: PersistentQueue,
+    registry_listener: RegistryListener,
+) -> None:
+    """Drain persisted queue, run registry backfill, then enable registry_listener.
+
+    Runs as a background task so async_setup_entry returns fast and does not
+    delay homeassistant_started. Three steps in strict order:
+    1. Drain the file-backed queue from the previous session (meta_worker processes
+       old items first — FIFO ordering preserved).
+    2. Snapshot current HA registries into meta_queue via SCD2_SNAPSHOT (idempotent,
+       WHERE NOT EXISTS guard). No recorder dependency — reads er/ar/dr/lr directly.
+    3. Enable registry_listener: flip DISCARD → LIVE so incoming registry events
+       now flow to meta_queue normally.
+
+    HA cancels background tasks on shutdown automatically, so no stop_event check
+    is needed — CancelledError interrupts any awaited step cleanly.
+    """
+    await meta_queue.join()
+    await _async_initial_registry_backfill(hass, meta_queue)
+    registry_listener.enable()
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: HaTimescaleDBConfigEntry,
 ) -> bool:
-    """Set up the TimescaleDB integration from a config entry (D-12 8 steps)."""
+    """Set up the TimescaleDB integration from a config entry."""
     dsn = entry.data[CONF_DSN]
     options = entry.options
     chunk_interval_days = options.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS)
@@ -322,18 +346,18 @@ async def async_setup_entry(
     live_queue = OverflowQueue(maxsize=LIVE_QUEUE_MAXSIZE)
     backfill_queue: queue.Queue = queue.Queue(maxsize=BACKFILL_QUEUE_MAXSIZE)
 
-    # Syncer is constructed before workers because meta_worker needs a reference
-    # to reuse SCD2 change-detection helpers.
-    syncer = MetadataSyncer(hass=hass, meta_queue=meta_queue)
+    # RegistryListener constructed before workers — meta_worker holds a reference
+    # for SCD2 change-detection helpers. StateListener needs live_queue.
+    registry_listener = RegistryListener(hass=hass, meta_queue=meta_queue)
+    state_listener = StateListener(hass=hass, queue=live_queue, entity_filter=entity_filter)
 
-    # Build the data object first (workers=None) so spawn factories can receive
-    # it as their runtime argument — factories read dsn, queue fields, etc.
-    # This enables a single code path for initial spawn and watchdog respawn (D-05-c).
+    # Build data first so spawn factories can read dsn, queue fields, etc.
+    # Enables a single code path for initial spawn and watchdog respawn (D-05-c).
     data = HaTimescaleDBData(
-        states_worker=None,     # filled by spawn_states_worker below
-        meta_worker=None,       # filled by spawn_meta_worker below
-        ingester=None,          # filled after startup steps 6-7
-        syncer=syncer,
+        states_worker=None,         # filled by spawn_states_worker below
+        meta_worker=None,           # filled by spawn_meta_worker below
+        state_listener=state_listener,
+        registry_listener=registry_listener,
         live_queue=live_queue,
         meta_queue=meta_queue,
         backfill_queue=backfill_queue,
@@ -357,34 +381,34 @@ async def async_setup_entry(
     data.states_worker = spawn_states_worker(hass, data)
     data.states_worker.start()
 
-    # D-12 step 4: drain file before subscribing to new events.
-    await meta_queue.join()
-    # D-12 step 5: initial registry backfill — covers pre-install and
-    # missed-subscription windows.
-    await _async_initial_registry_backfill(hass, meta_queue)
-
-    ingester = StateIngester(hass=hass, queue=live_queue, entity_filter=entity_filter)
-    data.ingester = ingester
-
     started: list[str] = []
     try:
-        # D-12 step 6: subscribe to registry events (4 listeners).
-        await syncer.async_start()
-        started.append("syncer")
-        # D-12 step 7: subscribe to state_changed events.
-        ingester.async_start()
-        started.append("ingester")
+        # D-12 step 4: subscribe registry_listener in DISCARD mode — events dropped
+        # until _async_meta_init calls enable() after drain + backfill complete.
+        await registry_listener.async_start()
+        started.append("registry_listener")
+        # D-12 step 5: subscribe state_listener — live_queue buffers all events
+        # from this point; no states are lost regardless of init timing.
+        state_listener.async_start()
+        started.append("state_listener")
     except Exception:
         _LOGGER.exception("Setup failed after starting %s; rolling back", started)
-        if "ingester" in started:
-            ingester.stop()
-        if "syncer" in started:
-            await syncer.async_stop()
+        if "state_listener" in started:
+            state_listener.stop()
+        if "registry_listener" in started:
+            await registry_listener.async_stop()
         stop_event.set()
         meta_queue.wake_consumer()
         await hass.async_add_executor_job(data.meta_worker.join, 30)
         await hass.async_add_executor_job(data.states_worker.join, 30)
         raise
+
+    # D-12 steps 6+7: drain persisted queue + registry backfill + enable listeners.
+    # Background task does not block homeassistant_started (HA: "Will not block startup").
+    hass.async_create_background_task(
+        _async_meta_init(hass, meta_queue, registry_listener),
+        name="ha_timescaledb_recorder_meta_init",
+    )
 
     # D-11: recorder_disabled detection — one-shot check at setup. Backfill
     # requires HA's sqlite recorder; if it's not loaded or disabled, raise a
@@ -509,9 +533,9 @@ async def async_unload_entry(
     # Step 3: stop event-loop-side producers so no new events enqueue during
     # the thread join. Guard against None in case setup failed before these
     # were assigned.
-    if data.ingester is not None:
-        data.ingester.stop()
-    await data.syncer.async_stop()
+    if data.state_listener is not None:
+        data.state_listener.stop()
+    await data.registry_listener.async_stop()
 
     # D-13-b step 3: wake meta worker from its Condition wait.
     data.meta_queue.wake_consumer()

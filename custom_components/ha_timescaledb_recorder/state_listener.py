@@ -1,4 +1,4 @@
-"""StateIngester: thin event relay that enqueues state changes to the worker queue."""
+"""StateListener: thin event relay that enqueues state changes to the worker queue."""
 import logging
 
 from homeassistant.core import HomeAssistant, Event, callback
@@ -10,8 +10,8 @@ from .worker import StateRow
 _LOGGER = logging.getLogger(__name__)
 
 
-class StateIngester:
-    """Relay HA state_changed events to the DbWorker queue.
+class StateListener:
+    """Relay HA state_changed events to the states-worker queue.
 
     Lifecycle:
     - async_start(): register STATE_CHANGED listener
@@ -73,7 +73,7 @@ class StateIngester:
         Named stop() rather than the async_ prefix convention to prevent callers from
         incorrectly awaiting it — there is no coroutine here, just a callback cancel.
 
-        No final flush needed — DbWorker handles the remaining buffer when it
+        No final flush needed — the states worker handles the remaining buffer when it
         processes the _STOP sentinel enqueued by async_unload_entry.
         """
         if self._cancel_listener is not None:

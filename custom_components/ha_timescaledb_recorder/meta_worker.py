@@ -53,7 +53,7 @@ from .retry import retry_until_success
 
 if TYPE_CHECKING:
     from .persistent_queue import PersistentQueue
-    from .syncer import MetadataSyncer
+    from .registry_listener import RegistryListener
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,14 +79,14 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         hass: HomeAssistant,
         dsn: str,
         meta_queue: "PersistentQueue",
-        syncer: "MetadataSyncer",
+        registry_listener: "RegistryListener",
         stop_event: threading.Event,
     ) -> None:
         super().__init__(daemon=True, name="ha_timescaledb_meta_worker")
         self._hass = hass
         self._dsn = dsn
         self._meta_queue = meta_queue
-        self._syncer = syncer
+        self._registry_listener = registry_listener
         self._stop_event = stop_event
         self._conn: psycopg.Connection | None = None
 
@@ -339,7 +339,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 else:
                     # Field-change path — change-detection gate via syncer helper.
                     with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._syncer._entity_row_changed(
+                        changed = self._registry_listener._entity_row_changed(
                             dict_cur, registry_id, params
                         )
                     if changed:
@@ -376,7 +376,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 cur.execute(SCD2_CLOSE_DEVICE_SQL, (now, registry_id))
             elif action == "update":
                 with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                    changed = self._syncer._device_row_changed(
+                    changed = self._registry_listener._device_row_changed(
                         dict_cur, registry_id, params
                     )
                 if changed:
@@ -407,7 +407,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 cur.execute(SCD2_CLOSE_AREA_SQL, (now, registry_id))
             elif action == "update":
                 with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                    changed = self._syncer._area_row_changed(
+                    changed = self._registry_listener._area_row_changed(
                         dict_cur, registry_id, params
                     )
                 if changed:
@@ -438,7 +438,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 cur.execute(SCD2_CLOSE_LABEL_SQL, (now, registry_id))
             elif action == "update":
                 with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                    changed = self._syncer._label_row_changed(
+                    changed = self._registry_listener._label_row_changed(
                         dict_cur, registry_id, params
                     )
                 if changed:

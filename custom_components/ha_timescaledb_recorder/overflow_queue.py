@@ -17,7 +17,7 @@ class OverflowQueue(queue.Queue):
     """FIFO queue whose put_nowait drops the newest item on full instead of raising.
 
     Consumers:
-    - StateIngester (event-loop @callback): calls put_nowait on every state
+    - StateListener (event-loop @callback): calls put_nowait on every state
       change event; never blocks, never raises.
     - TimescaledbStateRecorderThread (worker thread): reads .overflowed to
       decide whether to enter MODE_BACKFILL (D-04-c).

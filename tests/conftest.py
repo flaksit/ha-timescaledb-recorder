@@ -76,7 +76,7 @@ def _make_registry_entry(**attrs):
 def mock_entity_registry():
     """Return a mock HA entity registry with two example RegistryEntry objects.
 
-    Attributes match the fields extracted by MetadataSyncer (Pattern 4 in RESEARCH.md):
+    Attributes match the fields extracted by RegistryListener (Pattern 4 in RESEARCH.md):
     entity_id, id (ha_entity_uuid), name, original_name, domain, platform,
     device_id, area_id, labels (set), device_class, unit_of_measurement, disabled_by.
     """

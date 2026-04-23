@@ -1,4 +1,4 @@
-"""MetadataSyncer: thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker."""
+"""RegistryListener: thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker."""
 import json
 import logging
 from datetime import datetime, timezone
@@ -102,15 +102,26 @@ def _to_json_safe(params: tuple | list | None) -> list | None:
     ]
 
 
-class MetadataSyncer:
+class RegistryListener:
     """Thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker.
 
     Lifecycle:
-    - async_start(): snapshot all four registries into the queue, then register event listeners
-    - async_stop(): cancel all event subscriptions (no buffer to flush — queue is owned by MetaWorker)
+    - async_start(): register event listeners in DISCARD mode — events are dropped
+      until enable() is called. This allows subscription before the registry backfill
+      completes without risking out-of-order SCD2 writes.
+    - enable(): flip from DISCARD to LIVE — called by _async_meta_init after the
+      persistent queue drain and initial registry backfill complete.
+    - async_stop(): cancel all event subscriptions.
 
-    Design boundary (D-08): registry param extraction MUST happen in @callback context (event loop).
-    DB writes and change-detection reads run in the meta worker thread.
+    Design boundary (D-08): registry param extraction MUST happen in @callback context
+    (event loop). DB writes and change-detection reads run in the meta worker thread.
+
+    DISCARD mode rationale: the initial registry backfill (_async_initial_registry_backfill)
+    snapshots the current registry state via SCD2_SNAPSHOT (WHERE NOT EXISTS, idempotent).
+    Any registry change event that fires during the drain+backfill window would be
+    processed before the snapshot row exists, causing the SCD2 close/insert to target
+    a non-existent row. DISCARD mode eliminates this ordering hazard. The backfill
+    captures the registry state at snapshot time; changes after enable() flow normally.
     """
 
     def __init__(
@@ -126,82 +137,35 @@ class MetadataSyncer:
         self._device_reg = None
         self._area_reg = None
         self._label_reg = None
+        # DISCARD mode: events are dropped until enable() is called. Prevents
+        # out-of-order SCD2 writes during the initial drain+backfill window.
+        self._enabled: bool = False
 
     def bind_meta_queue(self, q: PersistentQueue) -> None:
         """Wire the PersistentQueue after construction. Used by __init__.py
-        when the queue must exist before the syncer is constructed but is
+        when the queue must exist before the listener is constructed but is
         still allowed to be assigned post-hoc for test flexibility.
         """
         self._meta_queue = q
 
+    def enable(self) -> None:
+        """Flip from DISCARD to LIVE mode. Called by _async_meta_init after
+        persistent queue drain and initial registry backfill complete.
+        """
+        self._enabled = True
+
     async def async_start(self) -> None:
-        """Iterate all four registries in the event loop and enqueue snapshot items to PersistentQueue.
+        """Cache registry references and register event listeners in DISCARD mode.
 
-        D-04: snapshot items are enqueued BEFORE registering event listeners to ensure
-        no registry events are missed and initial snapshot data is queued for the worker.
-
-        Accepted race window (D-04 design decision): there is a small window between the
-        snapshot iteration and listener registration where a registry change event could
-        be missed. This is an accepted risk per D-04 — the snapshot + listener ordering
-        minimises the window but does not eliminate it entirely. Phase 1 accepts this;
-        Phase 3 (backfill) can close any gaps via periodic reconciliation if needed.
+        Listeners are registered immediately so subscription starts as early as
+        possible, but events are silently dropped until enable() is called.
+        This matches the startup flow described in RegistryListener class docstring.
         """
         self._entity_reg = er.async_get(self._hass)
         self._device_reg = dr.async_get(self._hass)
         self._area_reg = ar.async_get(self._hass)
         self._label_reg = lr.async_get(self._hass)
 
-        now = datetime.now(timezone.utc)
-
-        for entry in self._entity_reg.entities.values():
-            params = self._extract_entity_params(entry, now)
-            item = {
-                "registry": "entity",
-                "action": "create",
-                "registry_id": entry.entity_id,
-                "old_id": None,
-                "params": _to_json_safe(params),
-                "enqueued_at": now.isoformat(),
-            }
-            self._hass.async_create_task(self._meta_queue.put_async(item))
-
-        for entry in self._device_reg.devices.values():
-            params = self._extract_device_params(entry, now)
-            item = {
-                "registry": "device",
-                "action": "create",
-                "registry_id": entry.id,
-                "old_id": None,
-                "params": _to_json_safe(params),
-                "enqueued_at": now.isoformat(),
-            }
-            self._hass.async_create_task(self._meta_queue.put_async(item))
-
-        for entry in self._area_reg.async_list_areas():
-            params = self._extract_area_params(entry, now)
-            item = {
-                "registry": "area",
-                "action": "create",
-                "registry_id": entry.id,
-                "old_id": None,
-                "params": _to_json_safe(params),
-                "enqueued_at": now.isoformat(),
-            }
-            self._hass.async_create_task(self._meta_queue.put_async(item))
-
-        for entry in self._label_reg.async_list_labels():
-            params = self._extract_label_params(entry, now)
-            item = {
-                "registry": "label",
-                "action": "create",
-                "registry_id": entry.label_id,
-                "old_id": None,
-                "params": _to_json_safe(params),
-                "enqueued_at": now.isoformat(),
-            }
-            self._hass.async_create_task(self._meta_queue.put_async(item))
-
-        # Register listeners AFTER enqueuing snapshot (D-04: no missed events)
         self._cancel_listeners.append(
             self._hass.bus.async_listen(
                 EVENT_ENTITY_REGISTRY_UPDATED, self._handle_entity_registry_updated
@@ -293,7 +257,7 @@ class MetadataSyncer:
         return (entry.label_id, entry.name, entry.color, valid_from, extra)
 
     # ------------------------------------------------------------------
-    # Change detection helpers (sync, called from worker thread via DbWorker)
+    # Change detection helpers (sync, called from meta worker thread)
     # ------------------------------------------------------------------
 
     def _entity_row_changed(
@@ -301,7 +265,7 @@ class MetadataSyncer:
     ) -> bool:
         """Return True if the current open entity row differs from new_params.
 
-        Receives a dict_row cursor from DbWorker — row["name"] access is valid.
+        Receives a dict_row cursor from meta worker — row["name"] access is valid.
         new_params indices: 0=entity_id, 1=ha_entity_uuid, 2=name, 3=domain,
         4=platform, 5=device_id, 6=area_id, 7=labels, 8=device_class,
         9=unit_of_measurement, 10=disabled_by, 11=valid_from, 12=extra
@@ -383,6 +347,8 @@ class MetadataSyncer:
     @callback
     def _handle_entity_registry_updated(self, event: Event) -> None:
         """Extract entity registry params and enqueue to PersistentQueue (D-08: extract in event loop)."""
+        if not self._enabled:
+            return
         action = event.data["action"]
         entity_id = event.data["entity_id"]
         old_entity_id = event.data.get("old_entity_id")
@@ -419,6 +385,8 @@ class MetadataSyncer:
     @callback
     def _handle_device_registry_updated(self, event: Event) -> None:
         """Extract device registry params and enqueue to PersistentQueue."""
+        if not self._enabled:
+            return
         action = event.data["action"]
         device_id = event.data["device_id"]
 
@@ -457,6 +425,8 @@ class MetadataSyncer:
         Reorder events (action="reorder") are skipped — these only affect UI ordering,
         contain no data change, and have area_id=None which would produce a corrupt item.
         """
+        if not self._enabled:
+            return
         action = event.data["action"]
         if action == "reorder":
             return
@@ -497,6 +467,8 @@ class MetadataSyncer:
     @callback
     def _handle_label_registry_updated(self, event: Event) -> None:
         """Extract label registry params and enqueue to PersistentQueue."""
+        if not self._enabled:
+            return
         action = event.data["action"]
         label_id = event.data["label_id"]
 
@@ -531,8 +503,8 @@ class MetadataSyncer:
     async def async_stop(self) -> None:
         """Cancel all registry event subscriptions.
 
-        Unlike StateIngester, MetadataSyncer has no write buffer — events are
-        processed immediately, so no final flush is needed on shutdown.
+        No write buffer to flush — events are processed immediately by the meta worker,
+        so no final flush is needed on shutdown.
         """
         for cancel in self._cancel_listeners:
             cancel()

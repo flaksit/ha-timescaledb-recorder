@@ -23,14 +23,14 @@ from custom_components.ha_timescaledb_recorder.meta_worker import (
 )
 
 
-def _make_worker(meta_queue=None, syncer=None):
+def _make_worker(meta_queue=None, registry_listener=None):
     hass = MagicMock()
     meta_queue = meta_queue or MagicMock()
-    syncer = syncer or MagicMock()
+    registry_listener = registry_listener or MagicMock()
     stop_event = threading.Event()
     return TimescaledbMetaRecorderThread(
         hass=hass, dsn="postgresql://",
-        meta_queue=meta_queue, syncer=syncer, stop_event=stop_event,
+        meta_queue=meta_queue, registry_listener=registry_listener, stop_event=stop_event,
     )
 
 

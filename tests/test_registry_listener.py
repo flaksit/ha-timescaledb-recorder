@@ -1,10 +1,10 @@
-"""Unit tests for MetadataSyncer (registry relay + sync change-detection helpers)."""
+"""Unit tests for RegistryListener (registry relay + SCD2 change-detection helpers)."""
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.syncer import MetadataSyncer, _to_json_safe
+from custom_components.ha_timescaledb_recorder.registry_listener import RegistryListener, _to_json_safe
 from custom_components.ha_timescaledb_recorder.persistent_queue import PersistentQueue
 
 
@@ -14,22 +14,24 @@ from custom_components.ha_timescaledb_recorder.persistent_queue import Persisten
 
 @pytest.fixture
 def mock_meta_queue():
-    """Return a PersistentQueue mock with put_async as AsyncMock.
-
-    Syncer calls hass.async_create_task(q.put_async(item)); the mock captures
-    the put_async call synchronously (AsyncMock records calls before the
-    coroutine runs). Tests inspect q.put_async.call_args_list to verify the
-    dict schema rather than awaiting the coroutine.
-    """
+    """Return a PersistentQueue mock with put_async as AsyncMock."""
     q = MagicMock(spec=PersistentQueue)
     q.put_async = AsyncMock()
     return q
 
 
 @pytest.fixture
-def syncer(hass, mock_meta_queue):
-    """Return a MetadataSyncer wired to mock_meta_queue."""
-    return MetadataSyncer(hass=hass, meta_queue=mock_meta_queue)
+def listener(hass, mock_meta_queue):
+    """Return a RegistryListener wired to mock_meta_queue."""
+    return RegistryListener(hass=hass, meta_queue=mock_meta_queue)
+
+
+@pytest.fixture
+def enabled_listener(hass, mock_meta_queue):
+    """Return a RegistryListener with DISCARD mode disabled (live mode)."""
+    rl = RegistryListener(hass=hass, meta_queue=mock_meta_queue)
+    rl.enable()
+    return rl
 
 
 # ---------------------------------------------------------------------------
@@ -59,12 +61,59 @@ def test_to_json_safe_non_datetime_values_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Entity registry callback → dict enqueue
+# DISCARD mode
 # ---------------------------------------------------------------------------
 
-def test_entity_callback_enqueues_dict(syncer, mock_meta_queue, mock_entity_registry):
-    """_handle_entity_registry_updated must schedule put_async with a correctly-shaped dict."""
-    syncer._entity_reg = mock_entity_registry
+def test_starts_in_discard_mode(listener):
+    """RegistryListener must start with _enabled=False (DISCARD mode)."""
+    assert listener._enabled is False
+
+
+def test_enable_flips_to_live_mode(listener):
+    """enable() must set _enabled=True."""
+    listener.enable()
+    assert listener._enabled is True
+
+
+def test_entity_callback_discarded_before_enable(listener, mock_meta_queue):
+    """Events must be silently dropped when _enabled=False."""
+    listener._entity_reg = MagicMock()
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.temp", "old_entity_id": None}
+    listener._handle_entity_registry_updated(event)
+    mock_meta_queue.put_async.assert_not_called()
+
+
+def test_device_callback_discarded_before_enable(listener, mock_meta_queue):
+    """Device events must be silently dropped when _enabled=False."""
+    listener._device_reg = MagicMock()
+    event = MagicMock()
+    event.data = {"action": "update", "device_id": "dev-001"}
+    listener._handle_device_registry_updated(event)
+    mock_meta_queue.put_async.assert_not_called()
+
+
+def test_area_callback_discarded_before_enable(listener, mock_meta_queue):
+    """Area events must be silently dropped when _enabled=False."""
+    listener._area_reg = MagicMock()
+    event = MagicMock()
+    event.data = {"action": "update", "area_id": "area-001"}
+    listener._handle_area_registry_updated(event)
+    mock_meta_queue.put_async.assert_not_called()
+
+
+def test_label_callback_discarded_before_enable(listener, mock_meta_queue):
+    """Label events must be silently dropped when _enabled=False."""
+    listener._label_reg = MagicMock()
+    event = MagicMock()
+    event.data = {"action": "update", "label_id": "label-001"}
+    listener._handle_label_registry_updated(event)
+    mock_meta_queue.put_async.assert_not_called()
+
+
+def test_entity_callback_enqueues_after_enable(enabled_listener, mock_meta_queue, mock_entity_registry):
+    """Events must be enqueued normally after enable() is called."""
+    enabled_listener._entity_reg = mock_entity_registry
 
     event = MagicMock()
     event.data = {
@@ -72,10 +121,31 @@ def test_entity_callback_enqueues_dict(syncer, mock_meta_queue, mock_entity_regi
         "entity_id": "sensor.living_room_temp",
         "old_entity_id": None,
     }
-    syncer._handle_entity_registry_updated(event)
+    enabled_listener._handle_entity_registry_updated(event)
 
-    # Syncer calls hass.async_create_task(q.put_async(item))
-    syncer._hass.async_create_task.assert_called_once()
+    mock_meta_queue.put_async.assert_called_once()
+    item = mock_meta_queue.put_async.call_args.args[0]
+    assert item["registry"] == "entity"
+    assert item["action"] == "update"
+
+
+# ---------------------------------------------------------------------------
+# Entity registry callback → dict enqueue (live mode)
+# ---------------------------------------------------------------------------
+
+def test_entity_callback_enqueues_dict(enabled_listener, mock_meta_queue, mock_entity_registry):
+    """_handle_entity_registry_updated must schedule put_async with a correctly-shaped dict."""
+    enabled_listener._entity_reg = mock_entity_registry
+
+    event = MagicMock()
+    event.data = {
+        "action": "update",
+        "entity_id": "sensor.living_room_temp",
+        "old_entity_id": None,
+    }
+    enabled_listener._handle_entity_registry_updated(event)
+
+    enabled_listener._hass.async_create_task.assert_called_once()
     mock_meta_queue.put_async.assert_called_once()
 
     item = mock_meta_queue.put_async.call_args.args[0]
@@ -87,9 +157,9 @@ def test_entity_callback_enqueues_dict(syncer, mock_meta_queue, mock_entity_regi
     assert "enqueued_at" in item
 
 
-def test_entity_remove_enqueues_params_none(syncer, mock_meta_queue):
+def test_entity_remove_enqueues_params_none(enabled_listener, mock_meta_queue):
     """Remove action must enqueue params=None — registry entry is already gone."""
-    syncer._entity_reg = MagicMock()
+    enabled_listener._entity_reg = MagicMock()
 
     event = MagicMock()
     event.data = {
@@ -97,18 +167,17 @@ def test_entity_remove_enqueues_params_none(syncer, mock_meta_queue):
         "entity_id": "sensor.temp",
         "old_entity_id": None,
     }
-    syncer._handle_entity_registry_updated(event)
+    enabled_listener._handle_entity_registry_updated(event)
 
     item = mock_meta_queue.put_async.call_args.args[0]
     assert item["params"] is None, "Remove action must not fetch params"
     assert item["action"] == "remove"
-    # async_get must NOT be called on remove — registry entry is gone
-    syncer._entity_reg.async_get.assert_not_called()
+    enabled_listener._entity_reg.async_get.assert_not_called()
 
 
-def test_entity_rename_sets_old_id(syncer, mock_meta_queue, mock_entity_registry):
+def test_entity_rename_sets_old_id(enabled_listener, mock_meta_queue, mock_entity_registry):
     """Rename (update with old_entity_id) must populate old_id in the dict."""
-    syncer._entity_reg = mock_entity_registry
+    enabled_listener._entity_reg = mock_entity_registry
 
     event = MagicMock()
     event.data = {
@@ -116,7 +185,7 @@ def test_entity_rename_sets_old_id(syncer, mock_meta_queue, mock_entity_registry
         "entity_id": "sensor.living_room_temp",
         "old_entity_id": "sensor.old_name",
     }
-    syncer._handle_entity_registry_updated(event)
+    enabled_listener._handle_entity_registry_updated(event)
 
     item = mock_meta_queue.put_async.call_args.args[0]
     assert item["old_id"] == "sensor.old_name"
@@ -127,11 +196,11 @@ def test_entity_rename_sets_old_id(syncer, mock_meta_queue, mock_entity_registry
 # Area registry callback — reorder skip
 # ---------------------------------------------------------------------------
 
-def test_area_reorder_skipped(syncer, mock_meta_queue):
+def test_area_reorder_skipped(enabled_listener, mock_meta_queue):
     """Reorder events carry no data change and must be silently dropped (Pitfall 6)."""
     event = MagicMock()
     event.data = {"action": "reorder"}
-    syncer._handle_area_registry_updated(event)
+    enabled_listener._handle_area_registry_updated(event)
     mock_meta_queue.put_async.assert_not_called()
 
 
@@ -139,7 +208,7 @@ def test_area_reorder_skipped(syncer, mock_meta_queue):
 # Change-detection helpers (sync, called from meta worker thread)
 # ---------------------------------------------------------------------------
 
-def test_entity_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
+def test_entity_row_changed_returns_true_when_no_row(listener, mock_psycopg_conn):
     """No existing row → always changed (first write for this entity_id)."""
     _conn, cur = mock_psycopg_conn
     cur.fetchone.return_value = None
@@ -159,10 +228,10 @@ def test_entity_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
         datetime.now(timezone.utc),  # [11] valid_from
         "{}",            # [12] extra
     )
-    assert syncer._entity_row_changed(cur, "sensor.temp", params) is True
+    assert listener._entity_row_changed(cur, "sensor.temp", params) is True
 
 
-def test_entity_row_changed_returns_false_when_unchanged(syncer, mock_psycopg_conn):
+def test_entity_row_changed_returns_false_when_unchanged(listener, mock_psycopg_conn):
     """Identical row data → no change; helper must return False to suppress spurious SCD2 writes."""
     _conn, cur = mock_psycopg_conn
     cur.fetchone.return_value = {
@@ -192,10 +261,10 @@ def test_entity_row_changed_returns_false_when_unchanged(syncer, mock_psycopg_co
         datetime.now(timezone.utc),  # [11] valid_from
         "{}",            # [12] extra (matches row)
     )
-    assert syncer._entity_row_changed(cur, "sensor.temp", params) is False
+    assert listener._entity_row_changed(cur, "sensor.temp", params) is False
 
 
-def test_entity_row_changed_returns_true_when_name_differs(syncer, mock_psycopg_conn):
+def test_entity_row_changed_returns_true_when_name_differs(listener, mock_psycopg_conn):
     """Changed name must trigger a new SCD2 row."""
     _conn, cur = mock_psycopg_conn
     cur.fetchone.return_value = {
@@ -225,10 +294,10 @@ def test_entity_row_changed_returns_true_when_name_differs(syncer, mock_psycopg_
         datetime.now(timezone.utc),  # [11]
         "{}",            # [12]
     )
-    assert syncer._entity_row_changed(cur, "sensor.temp", params) is True
+    assert listener._entity_row_changed(cur, "sensor.temp", params) is True
 
 
-def test_device_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
+def test_device_row_changed_returns_true_when_no_row(listener, mock_psycopg_conn):
     """No existing device row → always changed."""
     _conn, cur = mock_psycopg_conn
     cur.fetchone.return_value = None
@@ -242,4 +311,4 @@ def test_device_row_changed_returns_true_when_no_row(syncer, mock_psycopg_conn):
         datetime.now(timezone.utc),  # [6] valid_from
         "{}",           # [7] extra
     )
-    assert syncer._device_row_changed(cur, "device-001", params) is True
+    assert listener._device_row_changed(cur, "device-001", params) is True

@@ -57,7 +57,7 @@ class _MockRuntime:
     backfill_queue: object = None
     backfill_request: object = None
     meta_queue: object = None
-    syncer: object = None
+    registry_listener: object = None
     chunk_interval_days: int = 7
     compress_after_hours: int = 2
 
@@ -632,7 +632,7 @@ def test_spawn_meta_worker_uses_runtime_fields():
     hass = MagicMock()
 
     meta_q = MagicMock()
-    syncer = MagicMock()
+    registry_listener = MagicMock()
     stop_ev = threading.Event()
 
     runtime = _MockRuntime(
@@ -641,7 +641,7 @@ def test_spawn_meta_worker_uses_runtime_fields():
         stop_event=stop_ev,
         dsn="postgresql://testhost/testdb",
         meta_queue=meta_q,
-        syncer=syncer,
+        registry_listener=registry_listener,
     )
 
     with patch(
@@ -656,7 +656,7 @@ def test_spawn_meta_worker_uses_runtime_fields():
         hass=hass,
         dsn="postgresql://testhost/testdb",
         meta_queue=meta_q,
-        syncer=syncer,
+        registry_listener=registry_listener,
         stop_event=stop_ev,
     )
     assert result is mock_instance

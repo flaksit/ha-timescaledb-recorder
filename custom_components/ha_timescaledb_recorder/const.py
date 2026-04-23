@@ -20,6 +20,20 @@ FLUSH_INTERVAL: float = 5.0       # D-04-e seconds — adaptive get() timeout
 LIVE_QUEUE_MAXSIZE: int = 10000   # D-01-a: OverflowQueue cap
 BACKFILL_QUEUE_MAXSIZE: int = 2   # D-01-b: backpressure cap for backfill_queue
 
+# Phase 3 observability tunables (D-03-d, D-05-c, D-11).
+# STALL_THRESHOLD — after this many consecutive retry failures, the
+#   notify_stall hook fires once and the worker_stalled repair issue is raised.
+#   Matches Phase 2's previous retry._STALL_NOTIFY_THRESHOLD (which Plan 03
+#   will remove in favour of importing from here).
+# WATCHDOG_INTERVAL_S — polling cadence for watchdog_loop (seconds).
+#   10s balances detection latency against event-loop overhead.
+# DB_UNREACHABLE_THRESHOLD_SECONDS — cumulative fail duration at which the
+#   db_unreachable repair issue is raised via retry decorator's
+#   on_sustained_fail hook (D-11).
+STALL_THRESHOLD: int = 5
+WATCHDOG_INTERVAL_S: float = 10.0
+DB_UNREACHABLE_THRESHOLD_SECONDS: float = 300.0
+
 # Config keys
 CONF_DSN = "dsn"
 CONF_BATCH_SIZE = "write_batch_size_records"

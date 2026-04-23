@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -19,6 +20,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
 from .issues import clear_buffer_dropping_issue
+from .notifications import notify_backfill_gap
+from .retry import retry_until_success
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +69,7 @@ async def backfill_orchestrator(
     open_entities_reader: Callable[[], set],          # sync; runs in executor
     entity_filter: Callable[[str], bool],
     stop_event: asyncio.Event,
+    threading_stop_event: threading.Event,           # NEW — used by retry wrap for _fetch_slice_raw
 ) -> None:
     """Long-running event-loop task driving HA sqlite backfill on demand.
 
@@ -78,6 +82,18 @@ async def backfill_orchestrator(
             returns → orchestrator exits cleanly.
     """
     recorder_instance = recorder.get_instance(hass)
+
+    # D-03-c: wrap _fetch_slice_raw with retry. No on_transient callback because
+    # the recorder pool owns the session; we have no connection to reset. The
+    # retry decorator's stop_event check makes the loop interruptible on
+    # async_unload_entry (threading_stop_event is shared with workers).
+    # Runs inside recorder_instance.async_add_executor_job (thread pool) —
+    # never on the event loop directly (Plan 03 HIGH-3 constraint satisfied).
+    fetch_slice = retry_until_success(
+        stop_event=threading_stop_event,
+        on_transient=None,
+    )(_fetch_slice_raw)
+
     while not stop_event.is_set():
         await backfill_request.wait()
         backfill_request.clear()
@@ -106,6 +122,35 @@ async def backfill_orchestrator(
             continue
 
         from_ = wm - _LATE_ARRIVAL_GRACE          # D-08-d step 6
+
+        # D-08: recorder-retention gap detection. Compare needed_from against the
+        # oldest timestamp cached by HA's StatesManager.
+        #
+        # IMPORTANT: oldest_ts may be None when the recorder has not yet loaded its
+        # oldest-data cache (e.g. first boot, recorder warming up). None does NOT
+        # mean "no data / confirmed gap" — skip detection entirely when None.
+        # Only a concrete float is comparable against from_. (Cross-AI review HIGH-2.)
+        oldest_ts_float = recorder_instance.states_manager.oldest_ts
+        if oldest_ts_float is None:
+            _LOGGER.debug(
+                "oldest_ts not yet available from recorder — skipping gap detection this cycle"
+            )
+        else:
+            oldest_recorder_ts = datetime.fromtimestamp(oldest_ts_float, tz=timezone.utc)
+            if oldest_recorder_ts > from_:
+                gap_end = oldest_recorder_ts
+                duration_minutes = int((gap_end - from_).total_seconds() // 60)
+                notify_backfill_gap(
+                    hass,
+                    reason="recorder_retention",
+                    details={
+                        "window_start": from_.isoformat(),
+                        "window_end": gap_end.isoformat(),
+                        "duration_minutes": duration_minutes,
+                    },
+                )
+                from_ = oldest_recorder_ts
+
         cutoff = t_clear
 
         # D-08-f: entity set = live registry (filtered) ∪ open rows in dim_entities.
@@ -140,7 +185,7 @@ async def backfill_orchestrator(
                 except asyncio.TimeoutError:
                     pass  # normal: delay elapsed, proceed to fetch
             raw = await recorder_instance.async_add_executor_job(
-                _fetch_slice_raw, hass, entities, slice_start, slice_end,
+                fetch_slice, hass, entities, slice_start, slice_end,
             )
             # Blocking put = natural backpressure at maxsize=2 (D-08-g).
             await hass.async_add_executor_job(backfill_queue.put, raw)

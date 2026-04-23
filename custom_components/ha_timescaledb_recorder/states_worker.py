@@ -117,6 +117,17 @@ class TimescaledbStateRecorderThread(threading.Thread):
             on_sustained_fail=self._sustained_fail_hook,
         )(self._insert_chunk_raw)
 
+        # D-03-c: watermark read uses same retry shape as writes (owns a connection,
+        # so on_transient resets it). No stall/recovery hooks — a persistently
+        # failing watermark read will block backfill; orchestrator done_callback
+        # eventually surfaces the failure as a watchdog-recovery notification.
+        # Runs in async_add_executor_job or states_worker OS thread — never on the
+        # event loop directly (satisfies Plan 03 HIGH-3 constraint).
+        self.read_watermark = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+        )(self._read_watermark_raw)
+
     # ------------------------------------------------------------------
     # Connection management (D-07-g)
     # ------------------------------------------------------------------
@@ -373,15 +384,18 @@ class TimescaledbStateRecorderThread(threading.Thread):
     # Orchestrator-facing reads (D-08-d, D-08-f)
     # ------------------------------------------------------------------
 
-    def read_watermark(self) -> datetime | None:
-        """Return MAX(last_updated) from ha_states or None if empty.
+    def _read_watermark_raw(self) -> datetime | None:
+        """Raw watermark read — wrapped by retry_until_success in __init__ (D-03-c).
 
         Called from the event loop via hass.async_add_executor_job while the
-        orchestrator is triggering a backfill — this runs in the default
-        executor, not in the worker thread. A side-effecting read through the
-        worker's connection is acceptable because the worker's loop waits on
-        queue.get() with a 5s timeout and psycopg3 connections allow reads
-        from a different thread sequentially (no concurrent cursor use).
+        orchestrator is triggering a backfill. Reads through the worker's
+        psycopg3 connection; on_transient=reset_db_connection ensures a dead
+        connection is replaced before the next retry.
+
+        NOTE: This runs inside async_add_executor_job (thread pool) when called
+        by the orchestrator, and directly in the states_worker OS thread when
+        called internally. Both contexts are off the event loop — satisfying the
+        retry decorator's synchronous-blocking constraint. (Plan 03 HIGH-3.)
         """
         conn = self.get_db_connection()
         with conn.cursor() as cur:

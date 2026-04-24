@@ -38,6 +38,7 @@ Algorithm (per bucket)
 import argparse
 import json
 import math
+import re
 import sqlite3
 import sys
 import time
@@ -321,7 +322,8 @@ def main() -> None:
     sqlite_path = str(Path(args.sqlite or _DEFAULT_SQLITE).expanduser().resolve())
     pg_dsn = args.pg_dsn or _detect_pg_dsn()
     print(f"SQLite: {sqlite_path}")
-    print(f"PG DSN: {pg_dsn[:pg_dsn.index('@') + 1]}… (credentials hidden)" if "@" in pg_dsn else f"PG DSN: {pg_dsn}")
+    safe_dsn = re.sub(r"(://[^:@]+:)[^@]+(@)", r"\1***\2", pg_dsn) if "@" in pg_dsn else pg_dsn
+    print(f"PG DSN: {safe_dsn}")
 
     entities_filter: set[str] | None = (
         {e.strip() for e in args.entities.split(",") if e.strip()}
@@ -386,7 +388,7 @@ def main() -> None:
                     if args.dry_run and total_gaps == 0:
                         print("\n[DRY RUN] First 5 rows that would be inserted:")
                         for row in missing[:5]:
-                            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]!r}")
+                            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]}")
 
                     total_inserted += insert_batches(pg_conn, missing, args.batch_size, args.dry_run)
                     total_gaps += len(missing)
@@ -398,7 +400,7 @@ def main() -> None:
             if now - last_print >= 10.0:
                 print(
                     f"  [{bucket_idx}/{n_buckets}] "
-                    f"scanned={total_scanned:,} gaps={total_gaps:,} inserted={total_inserted:,}",
+                    f"scanned={total_scanned} gaps={total_gaps} inserted={total_inserted}",
                     flush=True,
                 )
                 last_print = now
@@ -407,8 +409,8 @@ def main() -> None:
 
     dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
     print(
-        f"Buckets skipped (in sync): {buckets_skipped:,} / {n_buckets:,}\n"
-        f"Scanned: {total_scanned:,} | Gaps: {total_gaps:,} | Inserted: {total_inserted:,}{dry_suffix}"
+        f"Buckets skipped (already in sync): {buckets_skipped} / {n_buckets}\n"
+        f"Scanned: {total_scanned} | Gaps: {total_gaps} | Inserted: {total_inserted}{dry_suffix}"
     )
 
 

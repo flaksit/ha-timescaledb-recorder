@@ -14,7 +14,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 ## Prerequisites
 
 - Home Assistant 2024.1 or later
-- A running PostgreSQL + TimescaleDB instance (the [TimescaleDB HA app](https://github.com/flaksit/hass-timescaledb) is the intended companion)
+- A running PostgreSQL + TimescaleDB instance > 2.18 (the [TimescaleDB HA app](https://github.com/flaksit/hass-timescaledb) is the intended companion)
 - The DSN user must have `CREATE TABLE` privileges — use the `homeassistant` role created by the app, **not** `homeassistant_rw` which is read/write only and lacks DDL rights
 
 ## Installation

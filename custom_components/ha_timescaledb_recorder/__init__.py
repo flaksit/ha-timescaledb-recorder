@@ -27,11 +27,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
+import voluptuous as vol
+
 from homeassistant.components import recorder as ha_recorder
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import label_registry as lr
@@ -66,6 +69,41 @@ from .registry_listener import RegistryListener, _to_json_safe
 from .watchdog import spawn_meta_worker, spawn_states_worker, watchdog_loop
 
 _LOGGER = logging.getLogger(__name__)
+
+# Voluptuous schema for one include/exclude block inside the YAML config.
+# Each key is optional — missing keys default to an empty list so
+# convert_include_exclude_filter always receives well-formed dicts.
+_FILTER_SCHEMA_INNER = vol.Schema({
+    vol.Optional("domains", default=[]): vol.All(list, [cv.string]),
+    vol.Optional("entities", default=[]): vol.All(list, [cv.string]),
+    vol.Optional("entity_globs", default=[]): vol.All(list, [cv.string]),
+})
+
+# CONFIG_SCHEMA is required for HA to call async_setup before async_setup_entry.
+# ALLOW_EXTRA lets other integrations' top-level keys pass through validation —
+# HA validates the full configuration.yaml against every component's schema.
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Schema({
+            vol.Optional("include"): _FILTER_SCHEMA_INNER,
+            vol.Optional("exclude"): _FILTER_SCHEMA_INNER,
+        }),
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Store YAML filter config in hass.data before config entries are set up.
+
+    HA guarantees async_setup runs before any async_setup_entry call for this
+    domain, so the filter dict is always present in hass.data by the time
+    _get_entity_filter reads it during entry setup.
+    """
+    domain_config = config.get(DOMAIN, {})
+    hass.data.setdefault(DOMAIN, {})["filter"] = domain_config
+    return True
+
 
 # Sleep interval for the overflow watcher task. Small enough to notice the
 # flag flip quickly, large enough to be effectively free. The watcher only
@@ -103,9 +141,15 @@ class HaTimescaleDBData:
 HaTimescaleDBConfigEntry = ConfigEntry[HaTimescaleDBData]
 
 
-def _get_entity_filter(entry):
-    """Build entity filter from config entry data (unchanged from Phase 1)."""
-    raw_filter = entry.data.get("filter", {})
+def _get_entity_filter(hass: HomeAssistant, entry):
+    """Build entity filter from YAML config stored in hass.data.
+
+    entry.data never carries a filter key (config-flow entries only store the
+    DSN), so the old entry.data path was permanently pass-all. The YAML filter
+    is now the authoritative source, stored by async_setup before this runs.
+    Falls back to pass-all when no YAML filter is configured.
+    """
+    raw_filter = hass.data.get(DOMAIN, {}).get("filter", {})
     if raw_filter:
         return convert_include_exclude_filter(raw_filter)
     return convert_filter({
@@ -334,7 +378,7 @@ async def async_setup_entry(
     options = entry.options
     chunk_interval_days = options.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS)
     compress_after_hours = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_HOURS)
-    entity_filter = _get_entity_filter(entry)
+    entity_filter = _get_entity_filter(hass, entry)
 
     # D-12 step 1: open PersistentQueue
     meta_queue = PersistentQueue(hass.config.path(DOMAIN, "metadata_queue.jsonl"))

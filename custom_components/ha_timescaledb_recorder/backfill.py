@@ -40,23 +40,29 @@ def _fetch_slice_raw(
     t_start: datetime,
     t_end: datetime,
 ) -> dict:
-    """Iterate per entity_id and return dict[entity_id -> list[HA State]].
+    """Return dict[entity_id -> list[HA State]] for all state rows in [t_start, t_end).
 
     D-08-e: runs in the HA recorder executor pool. include_start_time_state=False
     avoids re-ingesting boundary rows on every slice (research SUMMARY).
-    Passing a None entity_id raises ValueError — must iterate per entity_id.
+
+    Uses get_significant_states(significant_changes_only=False) instead of
+    state_changes_during_period because the latter has an additional SQL filter:
+        (last_changed_ts == last_updated_ts) OR last_changed_ts IS NULL
+    This filter excludes HA restart states where the entity value is unchanged —
+    last_changed_ts stays at the original change time while last_updated_ts
+    advances to the restart time. get_significant_states with
+    significant_changes_only=False returns all rows by last_updated_ts only,
+    so those startup-restored states are included. This also batches all
+    entity_ids in a single query instead of one query per entity.
     """
-    out: dict[str, list] = {}
-    for eid in entities:
-        states = recorder_history.state_changes_during_period(
-            hass,
-            t_start,
-            t_end,
-            entity_id=eid,
-            include_start_time_state=False,
-        )
-        out[eid] = states.get(eid, [])
-    return out
+    return recorder_history.get_significant_states(
+        hass,
+        t_start,
+        t_end,
+        entity_ids=list(entities),
+        significant_changes_only=False,
+        include_start_time_state=False,
+    )
 
 
 async def backfill_orchestrator(

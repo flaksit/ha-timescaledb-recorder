@@ -20,29 +20,40 @@ def _threading_stop_event():
     return threading.Event()
 
 
-def test_fetch_slice_raw_iterates_per_entity_never_passes_none():
+def test_fetch_slice_raw_uses_significant_states_batch():
+    """_fetch_slice_raw must use get_significant_states(significant_changes_only=False).
+
+    state_changes_during_period filters out restart-restored states (where
+    last_changed_ts != last_updated_ts). get_significant_states with
+    significant_changes_only=False captures all state rows by last_updated_ts,
+    including those from entities whose value didn't change across a restart.
+    """
     hass = MagicMock()
     entities = {"sensor.a", "sensor.b"}
     t_start = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
     t_end = t_start + timedelta(minutes=5)
+    expected = {"sensor.a": [MagicMock()], "sensor.b": [MagicMock()]}
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.state_changes_during_period"
-    ) as mock_sc:
-        mock_sc.side_effect = lambda hass, s, e, *, entity_id, include_start_time_state: (
-            {entity_id: [MagicMock(entity_id=entity_id)]}
-        )
+        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.get_significant_states",
+        return_value=expected,
+    ) as mock_gs:
         out = _fetch_slice_raw(hass, entities, t_start, t_end)
-    # Called once per entity; entity_id=None NEVER passed
-    for call in mock_sc.call_args_list:
-        assert call.kwargs["entity_id"] is not None
-        assert call.kwargs["include_start_time_state"] is False
-    assert set(out.keys()) == entities
-    assert len(mock_sc.call_args_list) == 2
+    # Called once with all entity_ids in a single batch query
+    mock_gs.assert_called_once()
+    _, kwargs = mock_gs.call_args[0], mock_gs.call_args[1]
+    assert kwargs.get("significant_changes_only") is False
+    assert kwargs.get("include_start_time_state") is False
+    assert set(kwargs.get("entity_ids", [])) == entities
+    assert out == expected
 
 
 def test_fetch_slice_raw_empty_entities_returns_empty():
     hass = MagicMock()
-    out = _fetch_slice_raw(hass, set(), datetime.now(), datetime.now())
+    with patch(
+        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.get_significant_states",
+        return_value={},
+    ):
+        out = _fetch_slice_raw(hass, set(), datetime.now(), datetime.now())
     assert out == {}
 
 

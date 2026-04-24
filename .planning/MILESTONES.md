@@ -18,4 +18,6 @@
 
 **Requirements:** 27/29 Shipped · 2 Dropped (SQLERR-03/04 unified into retry+stall path per D-01)
 
-**Archive:** `.planning/milestones/v1.1-ROADMAP.md` · `.planning/milestones/v1.1-REQUIREMENTS.md`
+**Final git tag:** `v1.1.5` (semver releases: v1.1.0 → v1.1.5)
+
+**Archive:** `.planning/milestones/v1.1-ROADMAP.md` · `.planning/milestones/v1.1-REQUIREMENTS.md` · `.planning/milestones/v1.1-phases/`

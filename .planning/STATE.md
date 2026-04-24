@@ -1,17 +1,14 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.1
-milestone_name: Robust Ingestion
-status: complete
-stopped_at: null
-last_updated: "2026-04-23T20:30:00Z"
-last_activity: 2026-04-23 -- v1.1 milestone archived
+milestone_name: milestone
+status: unknown
+last_updated: "2026-04-24T10:22:00Z"
 progress:
-  total_phases: 3
-  completed_phases: 3
-  total_plans: 29
-  completed_plans: 29
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
 ---
 
 # Project State
@@ -29,6 +26,12 @@ Shipped 2026-04-23. All 3 phases, 29 plans executed and verified.
 
 Archive: `.planning/milestones/v1.1-ROADMAP.md` · `.planning/milestones/v1.1-REQUIREMENTS.md`
 Summary: `.planning/MILESTONES.md`
+
+## Quick Tasks
+
+| Task | Description | Status | Completed |
+|------|-------------|--------|-----------|
+| 260424-dv3 | YAML entity filtering wired end-to-end (CONFIG_SCHEMA, async_setup, hass.data) | Done | 2026-04-24 |
 
 ## Deferred Items
 

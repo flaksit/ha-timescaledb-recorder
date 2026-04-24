@@ -38,9 +38,9 @@ Algorithm (per bucket)
 import argparse
 import json
 import math
+import re
 import sqlite3
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -321,7 +321,8 @@ def main() -> None:
     sqlite_path = str(Path(args.sqlite or _DEFAULT_SQLITE).expanduser().resolve())
     pg_dsn = args.pg_dsn or _detect_pg_dsn()
     print(f"SQLite: {sqlite_path}")
-    print(f"PG DSN: {pg_dsn[:pg_dsn.index('@') + 1]}… (credentials hidden)" if "@" in pg_dsn else f"PG DSN: {pg_dsn}")
+    safe_dsn = re.sub(r"(://[^:@]+:)[^@]+(@)", r"\1***\2", pg_dsn) if "@" in pg_dsn else pg_dsn
+    print(f"PG DSN: {safe_dsn}")
 
     entities_filter: set[str] | None = (
         {e.strip() for e in args.entities.split(",") if e.strip()}
@@ -347,7 +348,6 @@ def main() -> None:
     with psycopg.connect(pg_dsn, autocommit=True) as pg_conn:
         total_scanned = total_gaps = total_inserted = 0
         buckets_skipped = bucket_idx = 0
-        last_print = time.monotonic()
 
         ts = start_ts
         while ts < end_ts:
@@ -359,6 +359,7 @@ def main() -> None:
             sq_count = sqlite_bucket_count(sqlite_path, ts, bucket_end)
             if sq_count == 0:
                 buckets_skipped += 1
+                print(".", end="", flush=True)
                 ts = bucket_end
                 continue
 
@@ -372,11 +373,13 @@ def main() -> None:
                 # Same count → assume in sync (count collision for timestamped
                 # state events is astronomically unlikely).
                 buckets_skipped += 1
+                print(".", end="", flush=True)
                 ts = bucket_end
                 continue
 
             # ── Counts differ → full fingerprint comparison ───────────────────
             sqlite_rows = fetch_sqlite_bucket(sqlite_path, ts, bucket_end, entities_filter)
+            char = "."
             if sqlite_rows:
                 entity_ids = list({r["entity_id"] for r in sqlite_rows})
                 fingerprints = fetch_pg_fingerprints(pg_conn, start_dt, end_dt, entity_ids)
@@ -386,29 +389,22 @@ def main() -> None:
                     if args.dry_run and total_gaps == 0:
                         print("\n[DRY RUN] First 5 rows that would be inserted:")
                         for row in missing[:5]:
-                            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]!r}")
+                            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]}")
 
                     total_inserted += insert_batches(pg_conn, missing, args.batch_size, args.dry_run)
                     total_gaps += len(missing)
+                    char = "+"
 
                 total_scanned += len(sqlite_rows)
 
-            # ── Progress (every 10 s) ─────────────────────────────────────────
-            now = time.monotonic()
-            if now - last_print >= 10.0:
-                print(
-                    f"  [{bucket_idx}/{n_buckets}] "
-                    f"scanned={total_scanned:,} gaps={total_gaps:,} inserted={total_inserted:,}",
-                    flush=True,
-                )
-                last_print = now
-
+            print(char, end="", flush=True)
             ts = bucket_end
 
+    print()
     dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
     print(
-        f"Buckets skipped (in sync): {buckets_skipped:,} / {n_buckets:,}\n"
-        f"Scanned: {total_scanned:,} | Gaps: {total_gaps:,} | Inserted: {total_inserted:,}{dry_suffix}"
+        f"Buckets skipped (already in sync): {buckets_skipped} / {n_buckets}\n"
+        f"Scanned: {total_scanned} | Gaps: {total_gaps} | Inserted: {total_inserted}{dry_suffix}"
     )
 
 

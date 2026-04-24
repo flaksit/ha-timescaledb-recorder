@@ -406,21 +406,21 @@ def main() -> None:
             print(char, end="", flush=True)
             ts = bucket_end
 
-    print()
-    if dry_run_sample:
-        print("[DRY RUN] First 5 rows that would be inserted:")
-        for row in dry_run_sample:
-            print(f"  {row[3].isoformat()}  {row[0]}  {row[1]}")
-    dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
-    print(
-        f"Buckets skipped (already in sync): {buckets_skipped} / {n_buckets}\n"
-        f"Scanned: {total_scanned} | Gaps: {total_gaps} | Inserted: {total_inserted}{dry_suffix}"
-    )
+        print()
+        if dry_run_sample:
+            print("[DRY RUN] First 5 rows that would be inserted:")
+            for row in dry_run_sample:
+                print(f"  {row[3].isoformat()}  {row[0]}  {row[1]}")
+        dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
+        print(
+            f"Buckets skipped (already in sync): {buckets_skipped} / {n_buckets}\n"
+            f"Scanned: {total_scanned} | Gaps: {total_gaps} | Inserted: {total_inserted}{dry_suffix}"
+        )
 
-    if total_inserted > 0 and not args.dry_run:
-        print("Running ANALYZE ha_states …", end="", flush=True)
-        pg_conn.execute("ANALYZE ha_states")
-        print(" done.")
+        if total_inserted > 0 and not args.dry_run:
+            print("Running ANALYZE ha_states …", end="", flush=True)
+            pg_conn.execute("ANALYZE ha_states")
+            print(" done.")
 
 
 try:

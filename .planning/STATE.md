@@ -44,4 +44,4 @@ Summary: `.planning/MILESTONES.md`
 
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
-| 260424-l5k | Fix backfill entity set for non-registry entities (sun.sun, zone.home, conversation.*) | 2026-04-24 | 1b59297 | [260424-l5k-fix-backfill-to-include-non-entity-regis](./quick/260424-l5k-fix-backfill-to-include-non-entity-regis/) |
+| 260424-l5k | Fix backfill entity set for non-registry entities (sun.sun, zone.home, conversation.*) | 2026-04-24 | 566f8e6 | [260424-l5k-fix-backfill-to-include-non-entity-regis](./quick/260424-l5k-fix-backfill-to-include-non-entity-regis/) |

@@ -180,6 +180,8 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated entity_ids to backfill. Default: all.")
     p.add_argument("--dry-run", action="store_true",
                    help="Show what would be inserted without writing to TimescaleDB.")
+    p.add_argument("--verbose", action="store_true",
+                   help="Print every missing row as it is found. Suppresses the post-run first-5 sample.")
     return p.parse_args()
 
 
@@ -288,7 +290,8 @@ def insert_batches(
         batch = rows[i : i + batch_size]
         if not dry_run:
             with conn.transaction():
-                conn.executemany(INSERT_SQL, batch)
+                with conn.cursor() as cur:
+                    cur.executemany(INSERT_SQL, batch)
         inserted += len(batch)
     return inserted
 
@@ -387,12 +390,16 @@ def main() -> None:
                 missing = build_missing_rows(sqlite_rows, fingerprints)
 
                 if missing:
-                    if args.dry_run and len(dry_run_sample) < 5:
+                    if args.dry_run and not args.verbose and len(dry_run_sample) < 5:
                         dry_run_sample.extend(missing[:5 - len(dry_run_sample)])
 
                     total_inserted += insert_batches(pg_conn, missing, args.batch_size, args.dry_run)
                     total_gaps += len(missing)
-                    char = "+"
+                    char = "" if args.verbose else "+"
+                    if args.verbose:
+                        print()
+                        for row in missing:
+                            print(f"  {row[3].isoformat()}  {row[0]}  {row[1]}")
 
                 total_scanned += len(sqlite_rows)
 
@@ -403,12 +410,17 @@ def main() -> None:
     if dry_run_sample:
         print("[DRY RUN] First 5 rows that would be inserted:")
         for row in dry_run_sample:
-            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]}")
+            print(f"  {row[3].isoformat()}  {row[0]}  {row[1]}")
     dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
     print(
         f"Buckets skipped (already in sync): {buckets_skipped} / {n_buckets}\n"
         f"Scanned: {total_scanned} | Gaps: {total_gaps} | Inserted: {total_inserted}{dry_suffix}"
     )
+
+    if total_inserted > 0 and not args.dry_run:
+        print("Running ANALYZE ha_states …", end="", flush=True)
+        pg_conn.execute("ANALYZE ha_states")
+        print(" done.")
 
 
 try:

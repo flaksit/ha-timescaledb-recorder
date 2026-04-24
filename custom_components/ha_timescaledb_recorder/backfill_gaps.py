@@ -348,6 +348,7 @@ def main() -> None:
     with psycopg.connect(pg_dsn, autocommit=True) as pg_conn:
         total_scanned = total_gaps = total_inserted = 0
         buckets_skipped = bucket_idx = 0
+        dry_run_sample: list[tuple[Any, ...]] = []
 
         ts = start_ts
         while ts < end_ts:
@@ -386,10 +387,8 @@ def main() -> None:
                 missing = build_missing_rows(sqlite_rows, fingerprints)
 
                 if missing:
-                    if args.dry_run and total_gaps == 0:
-                        print("\n[DRY RUN] First 5 rows that would be inserted:")
-                        for row in missing[:5]:
-                            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]}")
+                    if args.dry_run and len(dry_run_sample) < 5:
+                        dry_run_sample.extend(missing[:5 - len(dry_run_sample)])
 
                     total_inserted += insert_batches(pg_conn, missing, args.batch_size, args.dry_run)
                     total_gaps += len(missing)
@@ -401,6 +400,10 @@ def main() -> None:
             ts = bucket_end
 
     print()
+    if dry_run_sample:
+        print("[DRY RUN] First 5 rows that would be inserted:")
+        for row in dry_run_sample:
+            print(f"  {row[0]} @ {row[3].isoformat()} state={row[1]}")
     dry_suffix = " (dry-run — no rows written)" if args.dry_run else ""
     print(
         f"Buckets skipped (already in sync): {buckets_skipped} / {n_buckets}\n"

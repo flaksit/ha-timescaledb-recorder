@@ -444,6 +444,31 @@ async def async_setup_entry(
     # D-12 step 8: defer orchestrator spawn until HA has fully started.
     @callback
     def _on_ha_started(_event):
+        # Snapshot all current HA states into backfill_queue before the orchestrator
+        # runs. This catches startup states that fired before state_listener was
+        # active (zone.home, sun.sun, person.*, conversation.* etc. are initialized
+        # by core components that load before custom config entries). Reading from
+        # hass.states avoids the SQLite commit-lag race that affects get_significant_states
+        # at startup; it also covers non-entity-registry entities excluded from the
+        # orchestrator's entity set. ON CONFLICT DO NOTHING on INSERT makes this
+        # idempotent — any states already in ha_states are silently skipped.
+        # The worker is guaranteed to be in MODE_BACKFILL here (it entered that mode
+        # immediately on startup before HOMEASSISTANT_STARTED), so backfill_queue
+        # items will be processed before the transition to MODE_LIVE.
+        snapshot: dict[str, list] = {
+            state.entity_id: [state]
+            for state in hass.states.async_all()
+            if entity_filter(state.entity_id)
+        }
+        if snapshot:
+            try:
+                backfill_queue.put_nowait(snapshot)
+            except queue.Full:
+                _LOGGER.warning(
+                    "backfill_queue full at startup — startup snapshot dropped; "
+                    "run backfill_gaps.py manually to fill any resulting gaps"
+                )
+
         orchestrator_kwargs = dict(
             hass=hass,
             live_queue=live_queue,

@@ -25,7 +25,7 @@ Planning artifacts live in `.planning/`. Read before executing any phase:
 
 Read `.planning/research/SUMMARY.md` before planning any phase. Key constraints:
 
-- `state_changes_during_period` requires a single `entity_id` — `entity_id=None` raises `ValueError`. Backfill must iterate per entity.
+- Backfill uses `get_significant_states(significant_changes_only=False, include_start_time_state=False)` — accepts a list of entity_ids and returns ALL state rows by `last_updated_ts`. Do NOT use `state_changes_during_period`: it filters out restart-restored states where `last_changed_ts != last_updated_ts` (value unchanged across restart), causing persistent gaps for `sun.sun`, `person.*`, `zone.home`, `conversation.*` etc.
 - `hass.async_*` methods are **not thread-safe** from worker thread — use `hass.add_job` (fire-and-forget) or `run_coroutine_threadsafe` (keyword APIs).
 - `run_coroutine_threadsafe(...).result()` deadlocks on HA shutdown — use sentinel + `async_add_executor_job(thread.join)`.
 - psycopg3: single `psycopg.connect()` owned by worker thread; wrap dicts in `Jsonb()` for JSONB columns.

@@ -300,10 +300,15 @@ VALUES (%s, %s, %s, %s, NULL, %s);
 # D-08-d step 4: watermark read (orchestrator → states worker connection).
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
 
-# D-08-f: open entities reader — entities with rows in dim_entities whose
-# valid_to IS NULL (captures entities removed from HA during an outage).
-SELECT_OPEN_ENTITIES_SQL = (
-    "SELECT entity_id FROM dim_entities WHERE valid_to IS NULL"
+# D-08-f: all-known entities reader — dim_entities (all rows, incl. removed)
+# unioned with all entity_ids ever written to ha_states.
+# GROUP BY on the ha_states branch forces the planner to use the
+# idx_ha_states_entity_time index before the UNION deduplication step.
+# Plain UNION without pre-grouping causes a full hypertable scan (~27 s).
+SELECT_ALL_KNOWN_ENTITIES_SQL = (
+    "SELECT entity_id FROM dim_entities"
+    " UNION"
+    f" SELECT DISTINCT entity_id FROM {TABLE_NAME}"
 )
 
 # Change-detection SELECT constants — read the current open row for each registry type.

@@ -20,29 +20,40 @@ def _threading_stop_event():
     return threading.Event()
 
 
-def test_fetch_slice_raw_iterates_per_entity_never_passes_none():
+def test_fetch_slice_raw_uses_significant_states_batch():
+    """_fetch_slice_raw must use get_significant_states(significant_changes_only=False).
+
+    state_changes_during_period filters out restart-restored states (where
+    last_changed_ts != last_updated_ts). get_significant_states with
+    significant_changes_only=False captures all state rows by last_updated_ts,
+    including those from entities whose value didn't change across a restart.
+    """
     hass = MagicMock()
     entities = {"sensor.a", "sensor.b"}
     t_start = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
     t_end = t_start + timedelta(minutes=5)
+    expected = {"sensor.a": [MagicMock()], "sensor.b": [MagicMock()]}
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.state_changes_during_period"
-    ) as mock_sc:
-        mock_sc.side_effect = lambda hass, s, e, *, entity_id, include_start_time_state: (
-            {entity_id: [MagicMock(entity_id=entity_id)]}
-        )
+        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.get_significant_states",
+        return_value=expected,
+    ) as mock_gs:
         out = _fetch_slice_raw(hass, entities, t_start, t_end)
-    # Called once per entity; entity_id=None NEVER passed
-    for call in mock_sc.call_args_list:
-        assert call.kwargs["entity_id"] is not None
-        assert call.kwargs["include_start_time_state"] is False
-    assert set(out.keys()) == entities
-    assert len(mock_sc.call_args_list) == 2
+    # Called once with all entity_ids in a single batch query
+    mock_gs.assert_called_once()
+    _, kwargs = mock_gs.call_args[0], mock_gs.call_args[1]
+    assert kwargs.get("significant_changes_only") is False
+    assert kwargs.get("include_start_time_state") is False
+    assert set(kwargs.get("entity_ids", [])) == entities
+    assert out == expected
 
 
 def test_fetch_slice_raw_empty_entities_returns_empty():
     hass = MagicMock()
-    out = _fetch_slice_raw(hass, set(), datetime.now(), datetime.now())
+    with patch(
+        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.get_significant_states",
+        return_value={},
+    ):
+        out = _fetch_slice_raw(hass, set(), datetime.now(), datetime.now())
     assert out == {}
 
 
@@ -62,7 +73,7 @@ async def test_orchestrator_exits_on_stop_event_set_before_trigger():
             backfill_queue=MagicMock(),
             backfill_request=backfill_request,
             read_watermark=MagicMock(return_value=None),
-            open_entities_reader=MagicMock(return_value=set()),
+            all_entities_reader=MagicMock(return_value=set()),
             entity_filter=lambda _eid: True,
             stop_event=stop_event,
             threading_stop_event=_threading_stop_event(),
@@ -100,7 +111,7 @@ async def test_orchestrator_empty_hypertable_pushes_done_and_loops():
             backfill_queue=backfill_queue,
             backfill_request=backfill_request,
             read_watermark=MagicMock(return_value=None),
-            open_entities_reader=MagicMock(return_value=set()),
+            all_entities_reader=MagicMock(return_value=set()),
             entity_filter=lambda _eid: True,
             stop_event=stop_event,
             threading_stop_event=_threading_stop_event(),
@@ -142,7 +153,7 @@ async def test_orchestrator_clears_buffer_dropping_on_recovery():
                 backfill_queue=backfill_queue,
                 backfill_request=backfill_request,
                 read_watermark=MagicMock(return_value=None),
-                open_entities_reader=MagicMock(return_value=set()),
+                all_entities_reader=MagicMock(return_value=set()),
                 entity_filter=lambda _eid: True,
                 stop_event=stop_event,
                 threading_stop_event=_threading_stop_event(),
@@ -201,11 +212,7 @@ async def test_orchestrator_skips_gap_detection_when_oldest_ts_none(caplog):
         "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
     ) as mock_notify, patch(
         "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
-    ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.er.async_get"
-    ) as mock_er:
-        mock_er.return_value.entities.values.return_value = []
-
+    ):
         async def stopper():
             # Let one full cycle complete then stop.
             await asyncio.sleep(0.05)
@@ -222,7 +229,7 @@ async def test_orchestrator_skips_gap_detection_when_oldest_ts_none(caplog):
                         backfill_queue=backfill_queue,
                         backfill_request=backfill_request,
                         read_watermark=MagicMock(return_value=wm),
-                        open_entities_reader=MagicMock(return_value=set()),
+                        all_entities_reader=MagicMock(return_value=set()),
                         entity_filter=lambda _eid: True,
                         stop_event=stop_event,
                         threading_stop_event=_threading_stop_event(),
@@ -271,11 +278,7 @@ async def test_orchestrator_fires_backfill_gap_when_oldest_ts_after_needed_from(
         "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
     ) as mock_notify, patch(
         "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
-    ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.er.async_get"
-    ) as mock_er:
-        mock_er.return_value.entities.values.return_value = []
-
+    ):
         # Stop after the first cycle: set stop_event AND backfill_request so the
         # orchestrator can exit its backfill_request.wait() on the next iteration.
         async def stopper():
@@ -291,7 +294,7 @@ async def test_orchestrator_fires_backfill_gap_when_oldest_ts_after_needed_from(
                 backfill_queue=backfill_queue,
                 backfill_request=backfill_request,
                 read_watermark=MagicMock(return_value=wm),
-                open_entities_reader=MagicMock(return_value=set()),
+                all_entities_reader=MagicMock(return_value=set()),
                 entity_filter=lambda _eid: True,
                 stop_event=stop_event,
                 threading_stop_event=_threading_stop_event(),
@@ -333,11 +336,7 @@ async def test_orchestrator_no_gap_notification_when_oldest_ts_before_needed_fro
         "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
     ) as mock_notify, patch(
         "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
-    ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.er.async_get"
-    ) as mock_er:
-        mock_er.return_value.entities.values.return_value = []
-
+    ):
         # Stop after the first cycle completes.
         async def stopper():
             await asyncio.sleep(0.05)
@@ -352,7 +351,7 @@ async def test_orchestrator_no_gap_notification_when_oldest_ts_before_needed_fro
                 backfill_queue=backfill_queue,
                 backfill_request=backfill_request,
                 read_watermark=MagicMock(return_value=wm),
-                open_entities_reader=MagicMock(return_value=set()),
+                all_entities_reader=MagicMock(return_value=set()),
                 entity_filter=lambda _eid: True,
                 stop_event=stop_event,
                 threading_stop_event=_threading_stop_event(),
@@ -406,14 +405,7 @@ async def test_orchestrator_adjusts_from_to_oldest_ts_after_gap():
         "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
     ), patch(
         "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
-    ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.er.async_get"
-    ) as mock_er:
-        # Provide one entity so the slice loop executes at least one iteration.
-        entry = MagicMock()
-        entry.entity_id = "sensor.test"
-        mock_er.return_value.entities.values.return_value = [entry]
-
+    ):
         stop_event.set()  # single cycle only — stop_event checked in slice loop
         with patch(
             "custom_components.ha_timescaledb_recorder.backfill._SLICE_WINDOW",
@@ -425,7 +417,7 @@ async def test_orchestrator_adjusts_from_to_oldest_ts_after_gap():
                 backfill_queue=backfill_queue,
                 backfill_request=backfill_request,
                 read_watermark=MagicMock(return_value=wm),
-                open_entities_reader=MagicMock(return_value=set()),
+                all_entities_reader=MagicMock(return_value={"sensor.test"}),
                 entity_filter=lambda _eid: True,
                 stop_event=stop_event,
                 threading_stop_event=_threading_stop_event(),
@@ -482,7 +474,7 @@ async def test_fetch_slice_retry_wrapping_uses_on_transient_none():
             backfill_queue=queue.Queue(maxsize=4),
             backfill_request=backfill_request,
             read_watermark=MagicMock(return_value=wm),
-            open_entities_reader=MagicMock(return_value=set()),
+            all_entities_reader=MagicMock(return_value=set()),
             entity_filter=lambda _eid: True,
             stop_event=stop_event,
             threading_stop_event=_threading_stop_event(),
@@ -554,14 +546,8 @@ async def test_fetch_slice_retries_on_transient_error():
     ), patch(
         "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.er.async_get"
-    ) as mock_er, patch(
         "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
     ):
-        entry = MagicMock()
-        entry.entity_id = "sensor.test"
-        mock_er.return_value.entities.values.return_value = [entry]
-
         recorder_inst = MagicMock()
         recorder_inst.states_manager.oldest_ts = None
         recorder_inst.async_add_executor_job = AsyncMock(
@@ -596,7 +582,7 @@ async def test_fetch_slice_retries_on_transient_error():
                     backfill_queue=backfill_queue,
                     backfill_request=backfill_request,
                     read_watermark=MagicMock(return_value=wm),
-                    open_entities_reader=MagicMock(return_value=set()),
+                    all_entities_reader=MagicMock(return_value={"sensor.test"}),
                     entity_filter=lambda _eid: True,
                     stop_event=stop_event,
                     threading_stop_event=threading_stop,
@@ -640,8 +626,106 @@ async def test_orchestrator_does_not_swallow_unhandled_exceptions():
                 backfill_queue=queue.Queue(maxsize=4),
                 backfill_request=backfill_request,
                 read_watermark=MagicMock(return_value=None),
-                open_entities_reader=MagicMock(return_value=set()),
+                all_entities_reader=MagicMock(return_value=set()),
                 entity_filter=lambda _eid: True,
                 stop_event=stop_event,
                 threading_stop_event=_threading_stop_event(),
             )
+
+
+# ---------------------------------------------------------------------------
+# Issue #8: non-entity-registry entities included in backfill entity set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_includes_non_registry_entities():
+    """Entities in hass.states but absent from entity_reg (no unique_id, e.g. sun.sun,
+    zone.home, conversation.*) must appear in the backfill entity set.
+
+    entity_reg.entities only contains entities that have a unique_id.  Entities
+    without one never appear there, so they were silently excluded from backfill
+    before the fix.  hass.states.async_all() is the authoritative source for all
+    live entities regardless of registry status.
+    """
+    hass = MagicMock()
+    # wm in the recent past so from_ < cutoff (slice loop executes once).
+    wm = datetime.now(timezone.utc) - timedelta(minutes=5)
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+
+    # State machine has sun.sun (no unique_id → not in entity_reg).
+    sun_state = MagicMock()
+    sun_state.entity_id = "sun.sun"
+    hass.states.async_all.return_value = [sun_state]
+
+    captured_entities: list[set[str]] = []
+    stop_event = asyncio.Event()
+
+    def capture_fetch(h, entities, t_start, t_end):
+        captured_entities.append(set(entities))
+        return {}
+
+    backfill_queue = queue.Queue(maxsize=8)
+    live_queue = MagicMock()
+    live_queue.clear_and_reset_overflow = MagicMock(return_value=0)
+    backfill_request = asyncio.Event()
+    backfill_request.set()
+
+    recorder_inst = _make_recorder_instance(oldest_ts=None)
+    # Run fetch_slice synchronously so the captured entities are visible immediately.
+    recorder_inst.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+
+    async def stopper():
+        # Wait until the orchestrator completes its first full cycle (slice + DONE),
+        # then signal shutdown.
+        for _ in range(500):
+            if captured_entities:
+                stop_event.set()
+                backfill_request.set()
+                return
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        backfill_request.set()
+
+    with patch(
+        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance",
+        return_value=recorder_inst,
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill._fetch_slice_raw",
+        capture_fetch,
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill._SLICE_WINDOW",
+        timedelta(hours=1),
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill._RECORDER_COMMIT_LAG",
+        timedelta(seconds=0),
+    ):
+        asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            backfill_orchestrator(
+                hass,
+                live_queue=live_queue,
+                backfill_queue=backfill_queue,
+                backfill_request=backfill_request,
+                read_watermark=MagicMock(return_value=wm),
+                # sensor.test via DB (registry entity); sun.sun via hass.states
+                all_entities_reader=MagicMock(return_value={"sensor.test"}),
+                entity_filter=lambda _eid: True,
+                stop_event=stop_event,
+                threading_stop_event=_threading_stop_event(),
+            ),
+            timeout=10,
+        )
+
+    assert captured_entities, "No slice fetches — entity set construction skipped"
+    entities = captured_entities[0]
+    assert "sun.sun" in entities, (
+        "sun.sun absent from backfill entity set — hass.states not unioned into entity set"
+    )
+    assert "sensor.test" in entities, (
+        "sensor.test absent from backfill entity set — all_entities_reader result lost"
+    )

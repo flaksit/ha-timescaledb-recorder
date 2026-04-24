@@ -266,3 +266,33 @@ This integration runs alongside the built-in recorder — it does not replace it
 
 - Avoid querying a chunk that is currently being compressed. TimescaleDB holds a lock during compression; the background job runs periodically and briefly.
 - Increase `batch_size` to reduce flush frequency under high event volume
+
+## Backfilling historical gaps
+
+If you installed the integration after HA had already been running for a while, or after a TimescaleDB outage, use the included backfill script to fill the gaps from HA's SQLite recorder.
+
+From the HA host terminal (SSH addon):
+
+```bash
+docker exec homeassistant python3 \
+    /config/custom_components/ha_timescaledb_recorder/backfill_gaps.py
+```
+
+No arguments needed. The script auto-detects the SQLite database path and reads the TimescaleDB DSN from the integration config. `psycopg[binary]` is already present in the HA container once the integration is installed.
+
+Optional arguments:
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--sqlite PATH` | `/config/home-assistant_v2.db` | SQLite recorder database path |
+| `--pg-dsn DSN` | read from integration config | PostgreSQL connection string |
+| `--start ISO8601` | earliest SQLite row | Start of backfill window (inclusive) |
+| `--end ISO8601` | latest SQLite row | End of backfill window (inclusive, precision-snapped) |
+| `--bucket-minutes M` | `60` | Time bucket width; larger = fewer PG queries, more memory |
+| `--batch-size N` | `500` | Rows per INSERT batch |
+| `--entities ENTITY_IDS` | all | Comma-separated entity_ids to backfill |
+| `--dry-run` | off | Show what would be inserted without writing |
+
+The script is safe to run while HA is active — SQLite is opened read-only and re-running is idempotent. Each bucket does a cheap `COUNT(*)` comparison first; buckets already in sync are skipped with no row fetches.
+
+**`--end` precision snapping:** `--end 2026-04-10` includes the full day; `--end 2026-04-10T14:30` includes the full minute, and so on.

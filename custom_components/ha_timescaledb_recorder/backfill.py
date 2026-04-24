@@ -159,15 +159,23 @@ async def backfill_orchestrator(
 
         cutoff = t_clear
 
-        # D-08-f: entity set = live registry (filtered) ∪ open rows in dim_entities.
+        # D-08-f: entity set = live registry (filtered) ∪ state machine (filtered)
+        # ∪ open rows in dim_entities.
+        # hass.states covers entities without unique_id (sun.sun, zone.home,
+        # conversation.*) that never appear in entity_reg.
         entity_reg = er.async_get(hass)
         live_entities: set[str] = {
             e.entity_id
             for e in entity_reg.entities.values()
             if entity_filter(e.entity_id)
         }
+        state_machine_entities: set[str] = {
+            state.entity_id
+            for state in hass.states.async_all()
+            if entity_filter(state.entity_id)
+        }
         open_entities = await hass.async_add_executor_job(open_entities_reader)
-        entities = live_entities | open_entities
+        entities = live_entities | state_machine_entities | open_entities
         if not entities:
             _LOGGER.info("backfill: no entities to query, skipping")
             await hass.async_add_executor_job(backfill_queue.put, BACKFILL_DONE)

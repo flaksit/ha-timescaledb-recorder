@@ -656,3 +656,107 @@ async def test_orchestrator_does_not_swallow_unhandled_exceptions():
                 stop_event=stop_event,
                 threading_stop_event=_threading_stop_event(),
             )
+
+
+# ---------------------------------------------------------------------------
+# Issue #8: non-entity-registry entities included in backfill entity set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_includes_non_registry_entities():
+    """Entities in hass.states but absent from entity_reg (no unique_id, e.g. sun.sun,
+    zone.home, conversation.*) must appear in the backfill entity set.
+
+    entity_reg.entities only contains entities that have a unique_id.  Entities
+    without one never appear there, so they were silently excluded from backfill
+    before the fix.  hass.states.async_all() is the authoritative source for all
+    live entities regardless of registry status.
+    """
+    hass = MagicMock()
+    # wm in the recent past so from_ < cutoff (slice loop executes once).
+    wm = datetime.now(timezone.utc) - timedelta(minutes=5)
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+
+    # State machine has sun.sun (no unique_id → not in entity_reg).
+    sun_state = MagicMock()
+    sun_state.entity_id = "sun.sun"
+    hass.states.async_all.return_value = [sun_state]
+
+    captured_entities: list[set[str]] = []
+    stop_event = asyncio.Event()
+
+    def capture_fetch(h, entities, t_start, t_end):
+        captured_entities.append(set(entities))
+        return {}
+
+    backfill_queue = queue.Queue(maxsize=8)
+    live_queue = MagicMock()
+    live_queue.clear_and_reset_overflow = MagicMock(return_value=0)
+    backfill_request = asyncio.Event()
+    backfill_request.set()
+
+    recorder_inst = _make_recorder_instance(oldest_ts=None)
+    # Run fetch_slice synchronously so the captured entities are visible immediately.
+    recorder_inst.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+
+    async def stopper():
+        # Wait until the orchestrator completes its first full cycle (slice + DONE),
+        # then signal shutdown.
+        for _ in range(500):
+            if captured_entities:
+                stop_event.set()
+                backfill_request.set()
+                return
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        backfill_request.set()
+
+    with patch(
+        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance",
+        return_value=recorder_inst,
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill.er.async_get"
+    ) as mock_er, patch(
+        "custom_components.ha_timescaledb_recorder.backfill._fetch_slice_raw",
+        capture_fetch,
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill._SLICE_WINDOW",
+        timedelta(hours=1),
+    ), patch(
+        "custom_components.ha_timescaledb_recorder.backfill._RECORDER_COMMIT_LAG",
+        timedelta(seconds=0),
+    ):
+        # entity_reg has sensor.test only (has unique_id).
+        registry_entry = MagicMock()
+        registry_entry.entity_id = "sensor.test"
+        mock_er.return_value.entities.values.return_value = [registry_entry]
+
+        asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            backfill_orchestrator(
+                hass,
+                live_queue=live_queue,
+                backfill_queue=backfill_queue,
+                backfill_request=backfill_request,
+                read_watermark=MagicMock(return_value=wm),
+                open_entities_reader=MagicMock(return_value=set()),
+                entity_filter=lambda _eid: True,
+                stop_event=stop_event,
+                threading_stop_event=_threading_stop_event(),
+            ),
+            timeout=10,
+        )
+
+    assert captured_entities, "No slice fetches — entity set construction skipped"
+    entities = captured_entities[0]
+    assert "sun.sun" in entities, (
+        "sun.sun absent from backfill entity set — hass.states not unioned into entity set"
+    )
+    assert "sensor.test" in entities, (
+        "sensor.test absent from backfill entity set — entity_reg entities lost"
+    )

@@ -449,9 +449,8 @@ async def async_setup_entry(
         # active (zone.home, sun.sun, person.*, conversation.* etc. are initialized
         # by core components that load before custom config entries). Reading from
         # hass.states avoids the SQLite commit-lag race that affects get_significant_states
-        # at startup; it also covers non-entity-registry entities excluded from the
-        # orchestrator's entity set. ON CONFLICT DO NOTHING on INSERT makes this
-        # idempotent — any states already in ha_states are silently skipped.
+        # at startup. ON CONFLICT DO NOTHING on INSERT makes this idempotent — any
+        # states already in ha_states are silently skipped.
         # The worker is guaranteed to be in MODE_BACKFILL here (it entered that mode
         # immediately on startup before HOMEASSISTANT_STARTED), so backfill_queue
         # items will be processed before the transition to MODE_LIVE.
@@ -475,7 +474,7 @@ async def async_setup_entry(
             backfill_queue=backfill_queue,
             backfill_request=backfill_request,
             read_watermark=data.states_worker.read_watermark,
-            open_entities_reader=data.states_worker.read_open_entities,
+            all_entities_reader=data.states_worker.read_all_known_entities,
             entity_filter=entity_filter,
             stop_event=loop_stop_event,
             threading_stop_event=stop_event,  # Plan 05 kwarg

@@ -34,7 +34,7 @@ from .const import (
     FLUSH_INTERVAL,
     INSERT_CHUNK_SIZE,
     INSERT_SQL,
-    SELECT_OPEN_ENTITIES_SQL,
+    SELECT_ALL_KNOWN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
 )
 from .issues import (
@@ -412,9 +412,15 @@ class TimescaledbStateRecorderThread(threading.Thread):
             row = cur.fetchone()
         return row[0] if row and row[0] is not None else None
 
-    def read_open_entities(self) -> set[str]:
-        """Return entity_ids with open rows (valid_to IS NULL) in dim_entities."""
+    def read_all_known_entities(self) -> set[str]:
+        """Return every entity_id ever seen: dim_entities ∪ ha_states.
+
+        No valid_to filter on dim_entities: removed entities still need
+        backfilling for the period before removal.
+        ha_states uses GROUP BY (not DISTINCT) to force index-based grouping
+        before the UNION deduplication step — plain UNION causes a full scan.
+        """
         conn = self.get_db_connection()
         with conn.cursor() as cur:
-            cur.execute(SELECT_OPEN_ENTITIES_SQL)
+            cur.execute(SELECT_ALL_KNOWN_ENTITIES_SQL)
             return {row[0] for row in cur.fetchall()}

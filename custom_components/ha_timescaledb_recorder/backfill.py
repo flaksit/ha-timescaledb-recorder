@@ -17,7 +17,6 @@ from typing import Callable
 from homeassistant.components import recorder
 from homeassistant.components.recorder import history as recorder_history
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
 
 from .issues import clear_buffer_dropping_issue
 from .notifications import notify_backfill_gap
@@ -72,7 +71,7 @@ async def backfill_orchestrator(
     backfill_queue: queue.Queue,
     backfill_request: asyncio.Event,
     read_watermark: Callable[[], "datetime | None"],  # sync; runs in executor
-    open_entities_reader: Callable[[], set],          # sync; runs in executor
+    all_entities_reader: Callable[[], set],            # sync; runs in executor
     entity_filter: Callable[[str], bool],
     stop_event: asyncio.Event,
     threading_stop_event: threading.Event,           # NEW — used by retry wrap for _fetch_slice_raw
@@ -89,16 +88,13 @@ async def backfill_orchestrator(
     """
     recorder_instance = recorder.get_instance(hass)
 
-    # D-03-c: wrap _fetch_slice_raw with retry. No on_transient callback because
-    # the recorder pool owns the session; we have no connection to reset. The
-    # retry decorator's stop_event check makes the loop interruptible on
-    # async_unload_entry (threading_stop_event is shared with workers).
+    # D-03-c: no on_transient callback — recorder pool owns the session, no
+    # connection to reset. stop_event makes the loop interruptible on unload.
     # Runs inside recorder_instance.async_add_executor_job (thread pool) —
     # never on the event loop directly (Plan 03 HIGH-3 constraint satisfied).
-    fetch_slice = retry_until_success(
-        stop_event=threading_stop_event,
-        on_transient=None,
-    )(_fetch_slice_raw)
+    @retry_until_success(stop_event=threading_stop_event, on_transient=None)
+    def fetch_slice(hass, entities, t_start, t_end):
+        return _fetch_slice_raw(hass, entities, t_start, t_end)
 
     while not stop_event.is_set():
         await backfill_request.wait()
@@ -159,23 +155,21 @@ async def backfill_orchestrator(
 
         cutoff = t_clear
 
-        # D-08-f: entity set = live registry (filtered) ∪ state machine (filtered)
-        # ∪ open rows in dim_entities.
-        # hass.states covers entities without unique_id (sun.sun, zone.home,
-        # conversation.*) that never appear in entity_reg.
-        entity_reg = er.async_get(hass)
-        live_entities: set[str] = {
-            e.entity_id
-            for e in entity_reg.entities.values()
-            if entity_filter(e.entity_id)
-        }
+        # D-08-f: entity set = DB-known entities ∪ currently-live state-machine entities.
+        # all_entities_reader returns DISTINCT entity_id from dim_entities ∪ ha_states:
+        #   - dim_entities: all registry entities ever seen, including removed ones whose
+        #     valid_to is set (their historical ha_states records still need backfilling).
+        #   - ha_states: non-registry entities (sun.sun, zone.home, conversation.*)
+        #     written by previous cycles.
+        # hass.states supplements for non-registry entities not yet in ha_states (first
+        # run only — after the first successful cycle they appear in ha_states).
+        all_db_entities = await hass.async_add_executor_job(all_entities_reader)
         state_machine_entities: set[str] = {
             state.entity_id
             for state in hass.states.async_all()
             if entity_filter(state.entity_id)
         }
-        open_entities = await hass.async_add_executor_job(open_entities_reader)
-        entities = live_entities | state_machine_entities | open_entities
+        entities = all_db_entities | state_machine_entities
         if not entities:
             _LOGGER.info("backfill: no entities to query, skipping")
             await hass.async_add_executor_job(backfill_queue.put, BACKFILL_DONE)

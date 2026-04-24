@@ -42,6 +42,7 @@ from homeassistant.helpers.entityfilter import (
     convert_filter,
     convert_include_exclude_filter,
 )
+from homeassistant.helpers.reload import async_integration_yaml_config
 
 from .backfill import backfill_orchestrator
 from .const import (
@@ -102,6 +103,16 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """
     domain_config = config.get(DOMAIN, {})
     hass.data.setdefault(DOMAIN, {})["filter"] = domain_config
+
+    async def _async_reload_filter(call) -> None:
+        # Re-parse configuration.yaml and reload all config entries so the new
+        # filter takes effect without a full HA restart.
+        fresh = await async_integration_yaml_config(hass, DOMAIN)
+        hass.data.setdefault(DOMAIN, {})["filter"] = (fresh or {}).get(DOMAIN, {})
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            await hass.config_entries.async_reload(entry.entry_id)
+
+    hass.services.async_register(DOMAIN, "reload", _async_reload_filter)
     return True
 
 

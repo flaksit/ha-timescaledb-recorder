@@ -92,7 +92,11 @@ Filter behaviour:
 - When only `exclude` is specified, matching entities are dropped (deny-list)
 - When both are specified, HA recorder precedence rules apply: include first, then exclude wins
 
-> **Note:** Filter configuration requires a **Home Assistant restart** to take effect — changes are not picked up by a config entry reload, because `async_setup` (which reads the YAML filter) only runs at startup.
+After editing `configuration.yaml`, call the reload service to apply the new filter without restarting HA:
+
+**Developer Tools → Services → `ha_timescaledb_recorder.reload`** (no parameters needed)
+
+This re-parses `configuration.yaml` and reloads the integration's config entry. A full HA restart also works but is not required.
 
 ## Schema
 

@@ -14,7 +14,8 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 ## Prerequisites
 
 - Home Assistant 2024.1 or later
-- A running PostgreSQL + TimescaleDB instance > 2.18 (the [TimescaleDB HA app](https://github.com/flaksit/hass-timescaledb) is the intended companion)
+- The built-in HA recorder integration must be enabled — this integration relies on the recorder's SQLite database for historical backfill and entity registry access
+- A running PostgreSQL + TimescaleDB instance > 2.18 (the [TimescaleDB HA app](https://github.com/flaksic/hass-timescaledb) is the intended companion)
 - The DSN user must have `CREATE TABLE` privileges — use the `homeassistant` role created by the app, **not** `homeassistant_rw` which is read/write only and lacks DDL rights
 
 ## Installation
@@ -59,7 +60,7 @@ Options take effect immediately — the integration reloads automatically when y
 
 ### Entity Filtering
 
-Entity filtering is configured in `configuration.yaml` using the same include/exclude syntax as the recorder integration. Add the filter under the integration domain:
+Entity filtering is configured via `configuration.yaml` and mirrors [HA recorder semantics](https://www.home-assistant.io/integrations/recorder/#configure-filter). Omitting the filter block ingests all entities.
 
 ```yaml
 ha_timescaledb_recorder:
@@ -67,17 +68,35 @@ ha_timescaledb_recorder:
     domains:
       - sensor
       - binary_sensor
-      - switch
-  exclude:
     entities:
-      - sensor.some_noisy_sensor
+      - switch.living_room_light
     entity_globs:
       - sensor.weather_*
+  exclude:
+    domains:
+      - media_player
+    entities:
+      - sensor.debug_probe
+    entity_globs:
+      - sensor.*_internal
 ```
 
-When no filter is configured, all entities are ingested.
+Filter behaviour:
 
-Include/exclude precedence follows the same rules as the HA recorder. See the [HA recorder filter documentation](https://www.home-assistant.io/integrations/recorder/#configure-filter) for the full precedence matrix.
+- `include.domains` — only states from these domains are ingested
+- `include.entities` — only these specific entity IDs are ingested
+- `include.entity_globs` — only entities matching these glob patterns are ingested
+- `exclude.domains`, `exclude.entities`, `exclude.entity_globs` — exclude matching entities even if they satisfy an include rule
+- All keys are optional; omitting both `include` and `exclude` ingests all entities
+- When only `include` is specified, non-matching entities are dropped (allow-list)
+- When only `exclude` is specified, matching entities are dropped (deny-list)
+- When both are specified, HA recorder precedence rules apply: include first, then exclude wins
+
+After editing `configuration.yaml`, call the reload service to apply the new filter without restarting HA:
+
+**Developer Tools → Services → `ha_timescaledb_recorder.reload`** (no parameters needed)
+
+This re-parses `configuration.yaml` and reloads the integration's config entry. A full HA restart also works but is not required.
 
 ## Schema
 

@@ -1,5 +1,5 @@
 """Config flow and options flow for TimescaleDB Recorder."""
-import asyncpg
+import psycopg
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -30,7 +30,7 @@ class TimescaleDBConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             dsn = user_input[CONF_DSN]
             try:
-                conn = await asyncpg.connect(dsn)
+                conn = await psycopg.AsyncConnection.connect(dsn)
                 await conn.close()
             except Exception:  # noqa: BLE001
                 errors["base"] = "cannot_connect"

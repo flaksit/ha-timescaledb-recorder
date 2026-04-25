@@ -1,0 +1,5 @@
+reload:
+  name: Reload
+  description: >
+    Re-parse the entity filter from configuration.yaml and reload the
+    integration without restarting Home Assistant.

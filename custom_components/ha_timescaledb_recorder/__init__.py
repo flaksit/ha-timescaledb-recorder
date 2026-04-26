@@ -548,7 +548,13 @@ async def async_setup_entry(
         )
         data.orchestrator_task = task
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_ha_started)
+    # On initial startup the event fires once and _on_ha_started runs normally.
+    # On reload (YAML filter change, options update) HA is already running so the
+    # event will never fire again — call the handler directly in that case.
+    if hass.is_running:
+        _on_ha_started(None)
+    else:
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_ha_started)
 
     entry.runtime_data = data
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))

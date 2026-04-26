@@ -501,27 +501,7 @@ async def async_setup_entry(
         name="ha_timescaledb_recorder_watchdog",
     )
 
-    def _spawn_orchestrator(take_startup_snapshot: bool) -> None:
-        # Snapshot only on initial boot — catches states that fired before
-        # StateListener was active (zone.home, sun.sun, person.*, etc. load
-        # before custom config entries). On reload the previous StateListener
-        # session covered the gap; snapshotting hass.states would write
-        # stale/transitional attribute values and create duplicate rows.
-        if take_startup_snapshot:
-            snapshot: dict[str, list] = {
-                state.entity_id: [state]
-                for state in hass.states.async_all()
-                if entity_filter(state.entity_id)
-            }
-            if snapshot:
-                try:
-                    backfill_queue.put_nowait(snapshot)
-                except queue.Full:
-                    _LOGGER.warning(
-                        "backfill_queue full at startup — startup snapshot dropped; "
-                        "run backfill_gaps.py manually to fill any resulting gaps"
-                    )
-
+    def _spawn_orchestrator() -> None:
         orchestrator_kwargs = dict(
             hass=hass,
             live_queue=live_queue,
@@ -544,13 +524,18 @@ async def async_setup_entry(
 
     # D-12 step 8: defer orchestrator spawn until HA has fully started.
     # On reload, EVENT_HOMEASSISTANT_STARTED has already fired and will not fire
-    # again — spawn the orchestrator directly, skipping the startup snapshot.
+    # again — spawn the orchestrator directly.
+    # Startup snapshot removed: backfill entity set already includes
+    # state_machine_entities (hass.states.async_all()) so it covers the same
+    # gap. Snapshotting hass.states first risks writing partial/transitional
+    # attribute values that ON CONFLICT DO NOTHING then locks in permanently,
+    # blocking the correct SQLite row from the subsequent backfill cycle.
     if hass.is_running:
-        _spawn_orchestrator(take_startup_snapshot=False)
+        _spawn_orchestrator()
     else:
         hass.bus.async_listen_once(
             EVENT_HOMEASSISTANT_STARTED,
-            callback(lambda _event: _spawn_orchestrator(take_startup_snapshot=True)),
+            callback(lambda _event: _spawn_orchestrator()),
         )
 
     entry.runtime_data = data

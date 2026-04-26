@@ -93,10 +93,8 @@ Filter behaviour:
 - When only `exclude` is specified, matching entities are dropped (deny-list)
 - When both are specified, HA recorder precedence rules apply: include first, then exclude wins
 
-After editing `configuration.yaml`, call the reload service to apply the new filter without restarting HA:
-
-**Developer Tools → Services → `ha_timescaledb_recorder.reload`** (no parameters needed)
-
+After editing `configuration.yaml`, call the reload service to apply the new filter without restarting HA:  
+**Settings → Developer tools → YAML → YAML configuration reloading → TimescaleDB Recorder**  
 This re-parses `configuration.yaml` and reloads the integration's config entry. A full HA restart also works but is not required.
 
 ## Schema

@@ -162,7 +162,12 @@ def _get_entity_filter(hass: HomeAssistant, entry):
     """
     raw_filter = hass.data.get(DOMAIN, {}).get("filter", {})
     if raw_filter:
-        return convert_include_exclude_filter(raw_filter)
+        _EMPTY_BLOCK = {"domains": [], "entities": [], "entity_globs": []}
+        normalized = {
+            "include": raw_filter.get("include", _EMPTY_BLOCK),
+            "exclude": raw_filter.get("exclude", _EMPTY_BLOCK),
+        }
+        return convert_include_exclude_filter(normalized)
     return convert_filter({
         "include_domains": [],
         "include_entity_globs": [],

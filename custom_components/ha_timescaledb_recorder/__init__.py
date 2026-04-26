@@ -501,32 +501,26 @@ async def async_setup_entry(
         name="ha_timescaledb_recorder_watchdog",
     )
 
-    # D-12 step 8: defer orchestrator spawn until HA has fully started.
-    @callback
-    def _on_ha_started(_event):
-        # Snapshot all current HA states into backfill_queue before the orchestrator
-        # runs. This catches startup states that fired before state_listener was
-        # active (zone.home, sun.sun, person.*, conversation.* etc. are initialized
-        # by core components that load before custom config entries). Reading from
-        # hass.states avoids the SQLite commit-lag race that affects get_significant_states
-        # at startup. ON CONFLICT DO NOTHING on INSERT makes this idempotent — any
-        # states already in ha_states are silently skipped.
-        # The worker is guaranteed to be in MODE_BACKFILL here (it entered that mode
-        # immediately on startup before HOMEASSISTANT_STARTED), so backfill_queue
-        # items will be processed before the transition to MODE_LIVE.
-        snapshot: dict[str, list] = {
-            state.entity_id: [state]
-            for state in hass.states.async_all()
-            if entity_filter(state.entity_id)
-        }
-        if snapshot:
-            try:
-                backfill_queue.put_nowait(snapshot)
-            except queue.Full:
-                _LOGGER.warning(
-                    "backfill_queue full at startup — startup snapshot dropped; "
-                    "run backfill_gaps.py manually to fill any resulting gaps"
-                )
+    def _spawn_orchestrator(take_startup_snapshot: bool) -> None:
+        # Snapshot only on initial boot — catches states that fired before
+        # StateListener was active (zone.home, sun.sun, person.*, etc. load
+        # before custom config entries). On reload the previous StateListener
+        # session covered the gap; snapshotting hass.states would write
+        # stale/transitional attribute values and create duplicate rows.
+        if take_startup_snapshot:
+            snapshot: dict[str, list] = {
+                state.entity_id: [state]
+                for state in hass.states.async_all()
+                if entity_filter(state.entity_id)
+            }
+            if snapshot:
+                try:
+                    backfill_queue.put_nowait(snapshot)
+                except queue.Full:
+                    _LOGGER.warning(
+                        "backfill_queue full at startup — startup snapshot dropped; "
+                        "run backfill_gaps.py manually to fill any resulting gaps"
+                    )
 
         orchestrator_kwargs = dict(
             hass=hass,
@@ -548,13 +542,16 @@ async def async_setup_entry(
         )
         data.orchestrator_task = task
 
-    # On initial startup the event fires once and _on_ha_started runs normally.
-    # On reload (YAML filter change, options update) HA is already running so the
-    # event will never fire again — call the handler directly in that case.
+    # D-12 step 8: defer orchestrator spawn until HA has fully started.
+    # On reload, EVENT_HOMEASSISTANT_STARTED has already fired and will not fire
+    # again — spawn the orchestrator directly, skipping the startup snapshot.
     if hass.is_running:
-        _on_ha_started(None)
+        _spawn_orchestrator(take_startup_snapshot=False)
     else:
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_ha_started)
+        hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED,
+            callback(lambda _event: _spawn_orchestrator(take_startup_snapshot=True)),
+        )
 
     entry.runtime_data = data
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))

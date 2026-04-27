@@ -440,3 +440,162 @@ def test_read_watermark_retry_wiring_captures_on_transient(mock_psycopg_conn):
     assert captured.get("on_recovery") is None
     assert captured.get("on_sustained_fail") is None
     assert captured.get("notify_stall") is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #12: retry wiring for _setup_schema and read_all_known_entities
+# ---------------------------------------------------------------------------
+
+
+def test_setup_schema_is_retry_wrapped():
+    """Issue #12: _setup_schema must be the retry-wrapped instance attribute
+    (not identical to _setup_schema_raw)."""
+    t = _make_thread()
+    assert hasattr(t, "_setup_schema_raw")
+    assert t._setup_schema is not t._setup_schema_raw
+
+
+def test_setup_schema_retries_on_transient_error(mock_psycopg_conn):
+    """Issue #12: a single OperationalError from _setup_schema_raw must be
+    retried; no exception should escape to the caller on second success."""
+    import psycopg
+
+    conn, _ = mock_psycopg_conn
+    call_count = {"n": 0}
+
+    def raw_side_effect():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise psycopg.OperationalError("transient error")
+        return None
+
+    stop_event = threading.Event()
+    t = _make_thread(stop_event=stop_event)
+    t._conn = conn
+
+    reset_mock = MagicMock()
+    t.reset_db_connection = reset_mock
+
+    # Patch the raw method and rebuild the retry wrapper with a zero backoff.
+    t._setup_schema_raw = raw_side_effect
+    from custom_components.timescaledb_recorder.retry import retry_until_success
+    t._setup_schema = retry_until_success(
+        stop_event=stop_event,
+        on_transient=t.reset_db_connection,
+        backoff_schedule=(0,),
+    )(t._setup_schema_raw)
+
+    t._setup_schema()  # must not raise
+    reset_mock.assert_called()
+
+
+def test_setup_schema_retry_wiring_captures_on_transient():
+    """Issue #12: retry_until_success for _setup_schema_raw must receive
+    on_transient=reset_db_connection and no stall/recovery hooks.
+    __init__ calls retry_until_success four times (insert, watermark, schema,
+    read_all_known_entities); this test captures all calls and inspects index 2."""
+    all_calls = []
+
+    def fake_retry(*, stop_event, on_transient=None, on_recovery=None,
+                   on_sustained_fail=None, notify_stall=None, **kwargs):
+        all_calls.append({
+            "on_transient": on_transient,
+            "on_recovery": on_recovery,
+            "on_sustained_fail": on_sustained_fail,
+        })
+        def decorator(fn):
+            # Tag which raw function was wrapped so we can verify by index.
+            decorator._wrapped_fn = fn
+            all_calls[-1]["wrapped_fn"] = fn
+            return fn
+        return decorator
+
+    with patch(
+        "custom_components.timescaledb_recorder.states_worker.retry_until_success",
+        fake_retry,
+    ):
+        t = _make_thread()
+
+    # Four retry_until_success calls: insert(0), watermark(1), schema(2), read_all(3).
+    assert len(all_calls) == 4, f"Expected 4 calls to retry_until_success, got {len(all_calls)}"
+    schema_call = all_calls[2]
+    on_transient = schema_call["on_transient"]
+    assert on_transient is not None
+    assert on_transient.__func__ is TimescaledbStateRecorderThread.reset_db_connection
+    assert schema_call["on_recovery"] is None
+    assert schema_call["on_sustained_fail"] is None
+
+
+def test_read_all_known_entities_is_retry_wrapped():
+    """Issue #12: read_all_known_entities must be the retry-wrapped instance
+    attribute (not identical to _read_all_known_entities_raw)."""
+    t = _make_thread()
+    assert hasattr(t, "_read_all_known_entities_raw")
+    assert t.read_all_known_entities is not t._read_all_known_entities_raw
+
+
+def test_read_all_known_entities_retries_on_transient_error(mock_psycopg_conn):
+    """Issue #12: a single OperationalError from _read_all_known_entities_raw
+    must be retried; the return value from the second call must propagate."""
+    import psycopg
+
+    conn, _ = mock_psycopg_conn
+    call_count = {"n": 0}
+
+    def raw_side_effect():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise psycopg.OperationalError("transient error")
+        return {"sensor.a", "sensor.b"}
+
+    stop_event = threading.Event()
+    t = _make_thread(stop_event=stop_event)
+    t._conn = conn
+
+    reset_mock = MagicMock()
+    t.reset_db_connection = reset_mock
+
+    t._read_all_known_entities_raw = raw_side_effect
+    from custom_components.timescaledb_recorder.retry import retry_until_success
+    t.read_all_known_entities = retry_until_success(
+        stop_event=stop_event,
+        on_transient=t.reset_db_connection,
+        backoff_schedule=(0,),
+    )(t._read_all_known_entities_raw)
+
+    result = t.read_all_known_entities()
+    assert result == {"sensor.a", "sensor.b"}
+    reset_mock.assert_called()
+
+
+def test_read_all_known_entities_retry_wiring_captures_on_transient():
+    """Issue #12: retry_until_success for _read_all_known_entities_raw must
+    receive on_transient=reset_db_connection and no stall/recovery hooks.
+    This is the fourth retry_until_success call in __init__ (index 3)."""
+    all_calls = []
+
+    def fake_retry(*, stop_event, on_transient=None, on_recovery=None,
+                   on_sustained_fail=None, notify_stall=None, **kwargs):
+        all_calls.append({
+            "on_transient": on_transient,
+            "on_recovery": on_recovery,
+            "on_sustained_fail": on_sustained_fail,
+        })
+        def decorator(fn):
+            return fn
+        return decorator
+
+    with patch(
+        "custom_components.timescaledb_recorder.states_worker.retry_until_success",
+        fake_retry,
+    ):
+        t = _make_thread()
+
+    # Four retry_until_success calls: insert(0), watermark(1), schema(2), read_all(3).
+    assert len(all_calls) == 4, f"Expected 4 calls to retry_until_success, got {len(all_calls)}"
+    read_all_call = all_calls[3]
+    on_transient = read_all_call["on_transient"]
+    assert on_transient is not None
+    assert on_transient.__func__ is TimescaledbStateRecorderThread.reset_db_connection
+    assert read_all_call["on_recovery"] is None
+    assert read_all_call["on_sustained_fail"] is None

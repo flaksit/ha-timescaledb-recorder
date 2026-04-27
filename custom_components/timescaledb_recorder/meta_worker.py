@@ -82,7 +82,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         registry_listener: "RegistryListener",
         stop_event: threading.Event,
     ) -> None:
-        super().__init__(daemon=True, name="ha_timescaledb_meta_worker")
+        super().__init__(daemon=True, name="timescaledb_meta_worker")
         self._hass = hass
         self._dsn = dsn
         self._meta_queue = meta_queue
@@ -164,7 +164,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             f"TimescaleDB meta worker has failed {attempts} times in a row. "
             "The integration will keep retrying. Restart HA if the issue persists.",
             "TimescaleDB Recorder",
-            "ha_timescaledb_recorder_meta_stalled",
+            "timescaledb_recorder_meta_stalled",
         )
         # New Phase 3 repair issue — auto-clears on recovery.
         self._hass.add_job(create_meta_worker_stalled_issue, self._hass)

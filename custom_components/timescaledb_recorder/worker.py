@@ -29,7 +29,7 @@ class StateRow:
     last_changed: datetime
 
     @classmethod
-    def from_ha_state(cls, state: Any) -> "StateRow":
+    def from_state(cls, state: Any) -> "StateRow":
         """Build a StateRow from a Home Assistant `State` (or compatible) object.
 
         Used by the backfill slice-to-rows transform (D-04-d) where the

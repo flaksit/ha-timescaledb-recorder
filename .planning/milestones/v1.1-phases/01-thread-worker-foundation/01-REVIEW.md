@@ -4,13 +4,13 @@ reviewed: 2026-04-19T00:00:00Z
 depth: standard
 files_reviewed: 13
 files_reviewed_list:
-  - custom_components/ha_timescaledb_recorder/const.py
-  - custom_components/ha_timescaledb_recorder/schema.py
-  - custom_components/ha_timescaledb_recorder/worker.py
-  - custom_components/ha_timescaledb_recorder/ingester.py
-  - custom_components/ha_timescaledb_recorder/syncer.py
-  - custom_components/ha_timescaledb_recorder/__init__.py
-  - custom_components/ha_timescaledb_recorder/manifest.json
+  - custom_components/timescaledb_recorder/const.py
+  - custom_components/timescaledb_recorder/schema.py
+  - custom_components/timescaledb_recorder/worker.py
+  - custom_components/timescaledb_recorder/ingester.py
+  - custom_components/timescaledb_recorder/syncer.py
+  - custom_components/timescaledb_recorder/__init__.py
+  - custom_components/timescaledb_recorder/manifest.json
   - tests/test_worker.py
   - tests/conftest.py
   - tests/test_init.py
@@ -44,7 +44,7 @@ No security vulnerabilities or data-corruption bugs were found in the production
 
 ### WR-01: `async_get` return value not guarded for `None` in all four registry event handlers
 
-**File:** `custom_components/ha_timescaledb_recorder/syncer.py:359,383,413,437`
+**File:** `custom_components/timescaledb_recorder/syncer.py:359,383,413,437`
 
 **Issue:** For non-remove registry events, each handler calls `self._entity_reg.async_get(entity_id)` (or the equivalent for device/area/label) and passes the result directly to `_extract_*_params(entry, ...)` without checking whether the entry is `None`. `async_get` returns `None` when the entry is not found, which can happen in a tight race where the event fires just before the entry is deleted. Passing `None` to any of the extract helpers raises `AttributeError` on the first attribute access (`entry.name`, `entry.entity_id`, etc.). HA's event bus will catch and log the error, but the `MetaCommand` is silently lost, creating a gap in the SCD2 history.
 
@@ -63,7 +63,7 @@ Apply the same guard to the device (`async_get`), area (`async_get_area`), and l
 
 ### WR-02: `area_id` retrieved with `.get()` instead of `[]` — silently propagates `None`
 
-**File:** `custom_components/ha_timescaledb_recorder/syncer.py:408`
+**File:** `custom_components/timescaledb_recorder/syncer.py:408`
 
 **Issue:** `_handle_area_registry_updated` extracts `area_id` with `event.data.get("area_id")`, which returns `None` if the key is absent. All three other handlers use bracket access (`event.data["action"]`, `event.data["entity_id"]`, etc.) which raises `KeyError` on unexpected event shapes, making the problem visible immediately. With `.get()` here, a `None` area_id silently flows into the `MetaCommand(registry_id=None)` and then into `SCD2_CLOSE_AREA_SQL` as a `NULL` parameter — the SQL predicate `WHERE area_id = NULL` matches zero rows (SQL `NULL = NULL` is unknown), so the close is silently dropped. For non-remove actions, `async_get_area(None)` likely returns `None`, leading to `AttributeError` in `_extract_area_params` (see WR-01).
 
@@ -76,7 +76,7 @@ area_id = event.data["area_id"]
 
 ### WR-03: Flush-tick debug log captures buffer length *after* `buffer.clear()`
 
-**File:** `custom_components/ha_timescaledb_recorder/worker.py:149`
+**File:** `custom_components/timescaledb_recorder/worker.py:149`
 
 **Issue:** In the `queue.Empty` branch of the main loop, the flush and clear happen before the `_LOGGER.debug(...)` call. The log line `"Flush tick — buffered=%d queue_depth=%d"` always shows `buffered=0` because `len(buffer)` is evaluated after `buffer.clear()`. The value is useless for diagnosing backpressure or missed flushes.
 
@@ -100,7 +100,7 @@ except queue.Empty:
 
 ### WR-04: `worker.async_stop()` called twice when `syncer.async_start()` raises
 
-**File:** `custom_components/ha_timescaledb_recorder/__init__.py:89-106`
+**File:** `custom_components/timescaledb_recorder/__init__.py:89-106`
 
 **Issue:** The nested try/except structure causes `worker.async_stop()` to be called twice when `syncer.async_start()` raises. The inner `except` block calls `worker.async_stop()` and re-raises; the outer `except` block then catches the re-raised exception and calls `worker.async_stop()` again. The second call is harmless (the thread is dead and `join()` returns immediately), but it enqueues a second `_STOP` sentinel and makes two executor-job calls unnecessarily. The test (`test_partial_start_rollback_on_syncer_failure`) passes because it asserts `worker_stopped` is truthy, not that it is exactly one call.
 
@@ -142,7 +142,7 @@ except Exception:
 
 ### IN-03: No warning logged when buffered rows are silently dropped on shutdown with no connection
 
-**File:** `custom_components/ha_timescaledb_recorder/worker.py:157-160`
+**File:** `custom_components/timescaledb_recorder/worker.py:157-160`
 
 **Issue:** When `_STOP` is processed and `self._conn is None` (DB was unreachable since startup), any buffered `StateRow` items are silently discarded with no log. Operators have no way to know how many events were lost. This is an accepted Phase 1 trade-off (documented in the daemon thread comment), but the silent drop makes post-mortem debugging harder.
 

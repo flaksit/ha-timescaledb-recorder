@@ -23,7 +23,7 @@
 
 ### `retry.py` (utility, event-driven)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/retry.py` (self — additive extension)
+**Analog:** `custom_components/timescaledb_recorder/retry.py` (self — additive extension)
 
 **Existing signature** (lines 25-32):
 ```python
@@ -106,7 +106,7 @@ from .const import STALL_THRESHOLD as _STALL_NOTIFY_THRESHOLD
 
 ### `states_worker.py` (service, CRUD + event-driven)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/states_worker.py` (self)
+**Analog:** `custom_components/timescaledb_recorder/states_worker.py` (self)
 
 **Existing retry wiring in `__init__`** (lines 88-93):
 ```python
@@ -182,7 +182,7 @@ def run(self) -> None:
 
 ### `meta_worker.py` (service, CRUD + event-driven)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/meta_worker.py` (self) — identical shape to `states_worker.py` additions.
+**Analog:** `custom_components/timescaledb_recorder/meta_worker.py` (self) — identical shape to `states_worker.py` additions.
 
 **Existing retry wiring in `__init__`** (lines 89-93):
 ```python
@@ -230,7 +230,7 @@ self._last_context: dict = {}
 
 ### `backfill.py` (service, request-response + batch)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/backfill.py` (self)
+**Analog:** `custom_components/timescaledb_recorder/backfill.py` (self)
 
 **Wrap `_fetch_slice_raw` with retry** (D-03-c) — in `backfill_orchestrator`, the call at line 142-144:
 ```python
@@ -301,7 +301,7 @@ Import `notify_backfill_gap` from `.notifications` (new module).
 
 ### `issues.py` (utility, request-response)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/issues.py` (self — additive extension)
+**Analog:** `custom_components/timescaledb_recorder/issues.py` (self — additive extension)
 
 **Existing create/clear pair pattern** (lines 18-40) — copy exactly for each new issue:
 ```python
@@ -383,7 +383,7 @@ self._hass.add_job(
     self._hass,
     f"TimescaleDB states worker has failed {attempts} times in a row. ...",
     "TimescaleDB Recorder",
-    "ha_timescaledb_recorder_states_stalled",
+    "timescaledb_recorder_states_stalled",
 )
 ```
 `notify_watchdog_recovery` is the generalized version: it does the same `persistent_notification.async_create` call but directly on the event loop (not via `add_job`) and formats a richer body with traceback.
@@ -417,7 +417,7 @@ async def _overflow_watcher(
 
 **`watchdog_loop` follows the same shape** with `runtime.loop_stop_event` as the asyncio stop event and `WATCHDOG_INTERVAL_S` as the timeout (D-05-a, D-05-c):
 ```python
-async def watchdog_loop(hass: HomeAssistant, runtime: HaTimescaleDBData) -> None:
+async def watchdog_loop(hass: HomeAssistant, runtime: TimescaledbRecorderData) -> None:
     """Async task: detect dead worker threads and restart them. D-05."""
     while not runtime.loop_stop_event.is_set():
         try:
@@ -439,10 +439,10 @@ async def watchdog_loop(hass: HomeAssistant, runtime: HaTimescaleDBData) -> None
 
 **Thread respawn** — two module-level factory helpers (D-05-c, RESEARCH.md Open Question 2):
 ```python
-def spawn_states_worker(hass: HomeAssistant, runtime: HaTimescaleDBData) -> TimescaledbStateRecorderThread:
+def spawn_states_worker(hass: HomeAssistant, runtime: TimescaledbRecorderData) -> TimescaledbStateRecorderThread:
     """Construct a new states worker with the same shared queues and stop_event."""
 
-def spawn_meta_worker(hass: HomeAssistant, runtime: HaTimescaleDBData) -> TimescaledbMetaRecorderThread:
+def spawn_meta_worker(hass: HomeAssistant, runtime: TimescaledbRecorderData) -> TimescaledbMetaRecorderThread:
     """Construct a new meta worker with the same shared queues and stop_event."""
 ```
 These replicate the constructor calls from `async_setup_entry` (lines 213-225 of `__init__.py`) but source all args from `runtime`. Avoids circular import: `watchdog.py` imports from `states_worker`, `meta_worker`, and `const`; it does NOT import from `__init__`.
@@ -462,14 +462,14 @@ from .notifications import notify_watchdog_recovery
 from .states_worker import TimescaledbStateRecorderThread
 
 if TYPE_CHECKING:
-    from . import HaTimescaleDBData
+    from . import TimescaledbRecorderData
 ```
 
 ---
 
 ### `strings.json` (config)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/strings.json` (self — additive extension)
+**Analog:** `custom_components/timescaledb_recorder/strings.json` (self — additive extension)
 
 **Existing `"issues"` entry pattern** (lines 37-43):
 ```json
@@ -493,7 +493,7 @@ Translation key in `async_create_issue` MUST match the JSON key exactly (RESEARC
 
 ### `const.py` (config)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/const.py` (self — additive extension)
+**Analog:** `custom_components/timescaledb_recorder/const.py` (self — additive extension)
 
 **Existing constants pattern** (lines 17-21):
 ```python
@@ -523,12 +523,12 @@ Import `STALL_THRESHOLD` into `retry.py` to replace the local `_STALL_NOTIFY_THR
 
 ### `__init__.py` (provider, request-response)
 
-**Analog:** `custom_components/ha_timescaledb_recorder/__init__.py` (self — additive extension)
+**Analog:** `custom_components/timescaledb_recorder/__init__.py` (self — additive extension)
 
-**Existing `HaTimescaleDBData` dataclass** (lines 57-72) — add `watchdog_task` field:
+**Existing `TimescaledbRecorderData` dataclass** (lines 57-72) — add `watchdog_task` field:
 ```python
 @dataclass
-class HaTimescaleDBData:
+class TimescaledbRecorderData:
     # ... existing fields ...
     orchestrator_task: asyncio.Task | None
     overflow_watcher_task: asyncio.Task | None
@@ -548,7 +548,7 @@ watchdog_task = hass.async_create_task(
     watchdog_loop(hass, data),
 )
 ```
-Spawn AFTER `data = HaTimescaleDBData(...)` is constructed (since `watchdog_loop` takes `runtime: HaTimescaleDBData`).
+Spawn AFTER `data = TimescaledbRecorderData(...)` is constructed (since `watchdog_loop` takes `runtime: TimescaledbRecorderData`).
 
 **Orchestrator `add_done_callback`** — in `_on_ha_started` callback (lines 272-284), after `hass.async_create_task(...)`:
 ```python
@@ -679,6 +679,6 @@ All files have close analogs in the existing codebase. No file requires falling 
 
 ## Metadata
 
-**Analog search scope:** `custom_components/ha_timescaledb_recorder/`
+**Analog search scope:** `custom_components/timescaledb_recorder/`
 **Files scanned:** 10 (all production modules)
 **Pattern extraction date:** 2026-04-22

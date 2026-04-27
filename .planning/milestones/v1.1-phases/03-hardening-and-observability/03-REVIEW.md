@@ -4,16 +4,16 @@ reviewed: 2026-04-23T00:00:00Z
 depth: standard
 files_reviewed: 20
 files_reviewed_list:
-  - custom_components/ha_timescaledb_recorder/__init__.py
-  - custom_components/ha_timescaledb_recorder/backfill.py
-  - custom_components/ha_timescaledb_recorder/const.py
-  - custom_components/ha_timescaledb_recorder/issues.py
-  - custom_components/ha_timescaledb_recorder/meta_worker.py
-  - custom_components/ha_timescaledb_recorder/notifications.py
-  - custom_components/ha_timescaledb_recorder/retry.py
-  - custom_components/ha_timescaledb_recorder/states_worker.py
-  - custom_components/ha_timescaledb_recorder/strings.json
-  - custom_components/ha_timescaledb_recorder/watchdog.py
+  - custom_components/timescaledb_recorder/__init__.py
+  - custom_components/timescaledb_recorder/backfill.py
+  - custom_components/timescaledb_recorder/const.py
+  - custom_components/timescaledb_recorder/issues.py
+  - custom_components/timescaledb_recorder/meta_worker.py
+  - custom_components/timescaledb_recorder/notifications.py
+  - custom_components/timescaledb_recorder/retry.py
+  - custom_components/timescaledb_recorder/states_worker.py
+  - custom_components/timescaledb_recorder/strings.json
+  - custom_components/timescaledb_recorder/watchdog.py
   - tests/test_backfill.py
   - tests/test_const_phase3.py
   - tests/test_init.py
@@ -55,7 +55,7 @@ Three informational items are also noted.
 
 ### WR-01: Orchestrator holds stale `read_watermark`/`read_open_entities` bindings after watchdog respawn
 
-**File:** `custom_components/ha_timescaledb_recorder/__init__.py:415-421`
+**File:** `custom_components/timescaledb_recorder/__init__.py:415-421`
 
 **Issue:** `orchestrator_kwargs` is built once inside `_on_ha_started` and captures:
 
@@ -83,11 +83,11 @@ read_watermark=lambda: data.states_worker.read_watermark(),
 open_entities_reader=lambda: data.states_worker.read_open_entities(),
 ```
 
-Because `data` is the `HaTimescaleDBData` dataclass and `data.states_worker` is reassigned by the watchdog in-place, the lambda always dereferences the **current** worker. The lambda must be called from the executor context — the existing `hass.async_add_executor_job(read_watermark)` call in `backfill.py:115` already handles that.
+Because `data` is the `TimescaledbRecorderData` dataclass and `data.states_worker` is reassigned by the watchdog in-place, the lambda always dereferences the **current** worker. The lambda must be called from the executor context — the existing `hass.async_add_executor_job(read_watermark)` call in `backfill.py:115` already handles that.
 
 ### WR-02: `DB_UNREACHABLE_THRESHOLD_SECONDS` is never passed to `retry_until_success` — changing the constant has no effect
 
-**File:** `custom_components/ha_timescaledb_recorder/states_worker.py:112-118`, `custom_components/ha_timescaledb_recorder/meta_worker.py:110-116`
+**File:** `custom_components/timescaledb_recorder/states_worker.py:112-118`, `custom_components/timescaledb_recorder/meta_worker.py:110-116`
 
 **Issue:** `const.py:35` defines `DB_UNREACHABLE_THRESHOLD_SECONDS = 300.0` as the intended single source of truth for the `on_sustained_fail` timing threshold. The docstring in both workers says the hook fires "when cumulative fail duration crosses `DB_UNREACHABLE_THRESHOLD_SECONDS` (300s default)." However, neither worker imports this constant, and neither passes `sustained_fail_seconds=DB_UNREACHABLE_THRESHOLD_SECONDS` to `retry_until_success`. The decorator uses its own hard-coded default of `300.0` (see `retry.py:31`). The values happen to match today, so behaviour is correct — but the intended tunability is broken. An operator who updates `DB_UNREACHABLE_THRESHOLD_SECONDS` in `const.py` would see no change.
 
@@ -112,7 +112,7 @@ self._insert_chunk = retry_until_success(
 
 ### IN-01: Duplicate `datetime.now(timezone.utc)` calls in `_async_initial_registry_backfill`
 
-**File:** `custom_components/ha_timescaledb_recorder/__init__.py:133,144`
+**File:** `custom_components/timescaledb_recorder/__init__.py:133,144`
 
 **Issue:** `now_iso` and `now` are computed separately — two calls to `datetime.now(timezone.utc)` within a few lines. The two timestamps differ by microseconds. `now_iso` is used for `enqueued_at` strings; `now` is passed to `_extract_*_params` helpers as `valid_from`. The slight skew is harmless but makes the relationship between the two values unclear.
 
@@ -125,7 +125,7 @@ now_iso = now.isoformat()
 
 ### IN-02: `read_open_entities` not retry-wrapped — inconsistent with `read_watermark`
 
-**File:** `custom_components/ha_timescaledb_recorder/states_worker.py:406-411`
+**File:** `custom_components/timescaledb_recorder/states_worker.py:406-411`
 
 **Issue:** `read_watermark` is wrapped with `retry_until_success(on_transient=reset_db_connection)` in `__init__` (lines 126-129). `read_open_entities` is not wrapped and not renamed to `_read_open_entities_raw`. If `read_open_entities` encounters a transient psycopg3 error when called from the orchestrator via `hass.async_add_executor_job`, the exception propagates to the orchestrator and causes an orchestrator crash — then the done-callback relaunches it after 5s. This is survivable, but the asymmetry relative to `read_watermark` is inconsistent and means no connection reset happens on failure. A note in the docstring explaining this intentional difference would prevent future confusion.
 

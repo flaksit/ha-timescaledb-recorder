@@ -117,7 +117,7 @@ async def backfill_orchestrator(
         wm = await hass.async_add_executor_job(read_watermark)
         if wm is None:
             _LOGGER.info(
-                "ha_states is empty — first-install bulk import is out of scope; "
+                "states is empty — first-install bulk import is out of scope; "
                 "use paradise-ha-tsdb/scripts/backfill/backfill.py for bulk import",
             )
             await hass.async_add_executor_job(backfill_queue.put, BACKFILL_DONE)
@@ -156,13 +156,13 @@ async def backfill_orchestrator(
         cutoff = t_clear
 
         # D-08-f: entity set = DB-known entities ∪ currently-live state-machine entities.
-        # all_entities_reader returns DISTINCT entity_id from dim_entities ∪ ha_states:
-        #   - dim_entities: all registry entities ever seen, including removed ones whose
-        #     valid_to is set (their historical ha_states records still need backfilling).
-        #   - ha_states: non-registry entities (sun.sun, zone.home, conversation.*)
+        # all_entities_reader returns DISTINCT entity_id from entities ∪ states:
+        #   - entities: all registry entities ever seen, including removed ones whose
+        #     valid_to is set (their historical states records still need backfilling).
+        #   - states: non-registry entities (sun.sun, zone.home, conversation.*)
         #     written by previous cycles.
-        # hass.states supplements for non-registry entities not yet in ha_states (first
-        # run only — after the first successful cycle they appear in ha_states).
+        # hass.states supplements for non-registry entities not yet in states (first
+        # run only — after the first successful cycle they appear in states).
         all_db_entities = await hass.async_add_executor_job(all_entities_reader)
         state_machine_entities: set[str] = {
             state.entity_id

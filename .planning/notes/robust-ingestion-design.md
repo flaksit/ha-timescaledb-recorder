@@ -84,7 +84,7 @@ async def async_start():
 ```
 
 Backfill procedure:
-1. `checkpoint = SELECT MAX(last_updated) FROM ha_states` (our DB)
+1. `checkpoint = SELECT MAX(last_updated) FROM states` (our DB)
 2. `cutoff = now()`
 3. Fetch from HA sqlite: `history.state_changes_during_period(hass, checkpoint, cutoff, entity_id=None)` with `include_start_time_state=False`
 4. Chunked write (e.g. 1000 rows/chunk) to avoid huge `executemany`
@@ -135,7 +135,7 @@ Must document:
 ## Sizing reference
 
 From user-provided measurements (HA export):
-- 1 hour raw `ha_states` CSV = 10 MB, 40,000 records
+- 1 hour raw `states` CSV = 10 MB, 40,000 records
 - In Python tuple form ≈ 2-3× CSV size ≈ 25 MB/h
 - Buffer sizing decision: 10,000 records = ~6 MB RAM = ~15–20 min at typical rate
 

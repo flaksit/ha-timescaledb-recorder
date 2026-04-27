@@ -1,11 +1,11 @@
 """Integration lifecycle tests for async_setup_entry / async_unload_entry.
 
 These tests verify that:
-1. async_setup_entry returns True and stores runtime data (HaTimescaleDBData)
+1. async_setup_entry returns True and stores runtime data (TimescaledbRecorderData)
 2. async_unload_entry executes D-13 shutdown sequence in the correct order
 3. D-12 setup steps fire in the documented order
 4. Partial-start rollback: if syncer.async_start() raises, workers are stopped
-5. Phase 3: HaTimescaleDBData extended with watchdog + spawn-factory fields
+5. Phase 3: TimescaledbRecorderData extended with watchdog + spawn-factory fields
 6. Phase 3: watchdog task spawned, orchestrator done_callback wired
 7. Phase 3: recorder_disabled check + auto-clear background task
 8. Phase 3: unload cancels and awaits watchdog before orchestrator (MEDIUM-12)
@@ -16,8 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder import (
-    HaTimescaleDBData,
+from custom_components.timescaledb_recorder import (
+    TimescaledbRecorderData,
     async_setup_entry,
     async_unload_entry,
 )
@@ -74,25 +74,25 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
     sequence: list[str] = []
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder._async_meta_init",
+        "custom_components.timescaledb_recorder._async_meta_init",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher",
+        "custom_components.timescaledb_recorder._overflow_watcher",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder:
         MockPQ.return_value
 
@@ -133,25 +133,25 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
 async def test_setup_entry_returns_true(hass, mock_entry):
     """async_setup_entry must return True and populate entry.runtime_data."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher",
+        "custom_components.timescaledb_recorder._overflow_watcher",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder:
         MockPQ.return_value.join = AsyncMock()
         mock_mw = MagicMock()
@@ -174,31 +174,31 @@ async def test_setup_entry_returns_true(hass, mock_entry):
 
     assert result is True
     assert mock_entry.runtime_data is not None
-    assert isinstance(mock_entry.runtime_data, HaTimescaleDBData)
+    assert isinstance(mock_entry.runtime_data, TimescaledbRecorderData)
 
 
 async def test_setup_entry_runtime_data_has_all_fields(hass, mock_entry):
-    """HaTimescaleDBData on runtime_data must have all Phase 2 fields populated."""
+    """TimescaledbRecorderData on runtime_data must have all Phase 2 fields populated."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher",
+        "custom_components.timescaledb_recorder._overflow_watcher",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder:
         MockPQ.return_value.join = AsyncMock()
         mock_mw = MagicMock()
@@ -245,7 +245,7 @@ async def test_async_unload_entry_runs_d13_sequence(hass, mock_entry):
     syncer.async_stop(), meta_queue.wake_consumer(), and executor joins for
     both workers.
     """
-    data = MagicMock(spec=HaTimescaleDBData)
+    data = MagicMock(spec=TimescaledbRecorderData)
     data.stop_event = MagicMock()
     data.loop_stop_event = MagicMock()
     data.state_listener = MagicMock()
@@ -290,7 +290,7 @@ async def test_async_unload_entry_runs_d13_sequence(hass, mock_entry):
 
 async def test_async_unload_entry_returns_true(hass, mock_entry):
     """async_unload_entry must return True on success."""
-    data = MagicMock(spec=HaTimescaleDBData)
+    data = MagicMock(spec=TimescaledbRecorderData)
     data.stop_event = MagicMock()
     data.loop_stop_event = MagicMock()
     data.watchdog_task = None      # Phase 3 field — None means not spawned
@@ -324,15 +324,15 @@ async def test_partial_start_rollback_on_registry_listener_failure(hass, mock_en
     The rollback path calls join on the factory-returned worker mocks.
     """
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw:
         pq = MockPQ.return_value
         pq.wake_consumer = MagicMock()
@@ -361,20 +361,20 @@ async def test_partial_start_rollback_on_registry_listener_failure(hass, mock_en
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: HaTimescaleDBData extended fields
+# Phase 3: TimescaledbRecorderData extended fields
 # ---------------------------------------------------------------------------
 
 def test_data_dataclass_has_phase3_fields():
-    """HaTimescaleDBData must carry the five Phase 3 fields added by Plan 07."""
-    field_names = {f.name for f in dataclasses.fields(HaTimescaleDBData)}
+    """TimescaledbRecorderData must carry the five Phase 3 fields added by Plan 07."""
+    field_names = {f.name for f in dataclasses.fields(TimescaledbRecorderData)}
     expected = {"watchdog_task", "dsn", "chunk_interval_days", "compress_after_hours", "entity_filter"}
     missing = expected - field_names
-    assert not missing, f"HaTimescaleDBData missing Phase 3 fields: {missing}"
+    assert not missing, f"TimescaledbRecorderData missing Phase 3 fields: {missing}"
 
 
 def test_data_dataclass_preserves_phase2_fields():
-    """All Phase 2 HaTimescaleDBData fields must still be present after Phase 3 extension."""
-    field_names = {f.name for f in dataclasses.fields(HaTimescaleDBData)}
+    """All Phase 2 TimescaledbRecorderData fields must still be present after Phase 3 extension."""
+    field_names = {f.name for f in dataclasses.fields(TimescaledbRecorderData)}
     phase2_fields = {
         "states_worker", "meta_worker", "state_listener", "registry_listener",
         "live_queue", "meta_queue", "backfill_queue", "backfill_request",
@@ -391,30 +391,30 @@ def test_data_dataclass_preserves_phase2_fields():
 async def test_setup_spawns_workers_via_factories(hass, mock_entry):
     """async_setup_entry must call spawn_states_worker and spawn_meta_worker (not direct constructors)."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher", new=AsyncMock(),
+        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", new=AsyncMock(),
+        "custom_components.timescaledb_recorder.watchdog_loop", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder._wait_for_recorder_and_clear",
+        "custom_components.timescaledb_recorder._wait_for_recorder_and_clear",
         new=AsyncMock(),
     ):
         MockPQ.return_value.join = AsyncMock()
@@ -453,31 +453,31 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
     watchdog_coro_sentinel = object()
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher", new=AsyncMock(),
+        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop",
+        "custom_components.timescaledb_recorder.watchdog_loop",
         new=MagicMock(return_value=watchdog_coro_sentinel),
     ) as mock_wl, patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder._wait_for_recorder_and_clear",
+        "custom_components.timescaledb_recorder._wait_for_recorder_and_clear",
         new=AsyncMock(),
     ):
         MockPQ.return_value.join = AsyncMock()
@@ -523,32 +523,32 @@ async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entr
     captured_kwargs = {}
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher", new=AsyncMock(),
+        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill_orchestrator",
+        "custom_components.timescaledb_recorder.backfill_orchestrator",
     ) as mock_orch, patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder._wait_for_recorder_and_clear",
+        "custom_components.timescaledb_recorder._wait_for_recorder_and_clear",
         new=AsyncMock(),
     ):
         MockPQ.return_value.join = AsyncMock()
@@ -589,7 +589,7 @@ async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entr
 
 def test_orchestrator_done_callback_returns_on_cancelled_task():
     """_on_orchestrator_done must return without side-effects if task was cancelled."""
-    from custom_components.ha_timescaledb_recorder import _make_orchestrator_done_callback
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
     runtime = MagicMock()
@@ -604,7 +604,7 @@ def test_orchestrator_done_callback_returns_on_cancelled_task():
     task.cancelled.return_value = True
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.notify_watchdog_recovery"
     ) as mock_notify:
         cb(task)
 
@@ -614,7 +614,7 @@ def test_orchestrator_done_callback_returns_on_cancelled_task():
 
 def test_orchestrator_done_callback_returns_on_stop_event_set():
     """_on_orchestrator_done must return without side-effects if stop_event is set."""
-    from custom_components.ha_timescaledb_recorder import _make_orchestrator_done_callback
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
     runtime = MagicMock()
@@ -629,7 +629,7 @@ def test_orchestrator_done_callback_returns_on_stop_event_set():
     task.cancelled.return_value = False
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.notify_watchdog_recovery"
     ) as mock_notify:
         cb(task)
 
@@ -639,7 +639,7 @@ def test_orchestrator_done_callback_returns_on_stop_event_set():
 
 def test_orchestrator_done_callback_returns_on_loop_stop_event_set():
     """_on_orchestrator_done must return without side-effects if loop_stop_event is set."""
-    from custom_components.ha_timescaledb_recorder import _make_orchestrator_done_callback
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
     runtime = MagicMock()
@@ -654,7 +654,7 @@ def test_orchestrator_done_callback_returns_on_loop_stop_event_set():
     task.cancelled.return_value = False
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.notify_watchdog_recovery"
     ) as mock_notify:
         cb(task)
 
@@ -664,7 +664,7 @@ def test_orchestrator_done_callback_returns_on_loop_stop_event_set():
 
 def test_orchestrator_done_callback_returns_on_clean_exit():
     """_on_orchestrator_done must return without side-effects if task.exception() is None (clean exit)."""
-    from custom_components.ha_timescaledb_recorder import _make_orchestrator_done_callback
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
     runtime = MagicMock()
@@ -680,7 +680,7 @@ def test_orchestrator_done_callback_returns_on_clean_exit():
     task.exception.return_value = None
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.notify_watchdog_recovery"
     ) as mock_notify:
         cb(task)
 
@@ -690,7 +690,7 @@ def test_orchestrator_done_callback_returns_on_clean_exit():
 
 def test_orchestrator_done_callback_fires_notify_and_schedules_relaunch():
     """_on_orchestrator_done must call notify_watchdog_recovery and schedule _relaunch on unhandled exc."""
-    from custom_components.ha_timescaledb_recorder import _make_orchestrator_done_callback
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
     runtime = MagicMock()
@@ -707,7 +707,7 @@ def test_orchestrator_done_callback_fires_notify_and_schedules_relaunch():
     task.exception.return_value = exc
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.notify_watchdog_recovery"
     ) as mock_notify:
         cb(task)
 
@@ -727,7 +727,7 @@ def test_orchestrator_done_callback_fires_notify_and_schedules_relaunch():
 
 async def test_orchestrator_relaunch_sleeps_5s_before_new_task():
     """_relaunch() must await asyncio.sleep(5) before creating the new orchestrator task."""
-    from custom_components.ha_timescaledb_recorder import _make_orchestrator_done_callback
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
     runtime = MagicMock()
@@ -761,11 +761,11 @@ async def test_orchestrator_relaunch_sleeps_5s_before_new_task():
     task.exception.return_value = exc
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.notify_watchdog_recovery",
+        "custom_components.timescaledb_recorder.notify_watchdog_recovery",
     ), patch(
-        "custom_components.ha_timescaledb_recorder.asyncio.sleep", new=mock_sleep,
+        "custom_components.timescaledb_recorder.asyncio.sleep", new=mock_sleep,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill_orchestrator",
+        "custom_components.timescaledb_recorder.backfill_orchestrator",
     ) as mock_borch:
         mock_borch.return_value = object()
         cb(task)
@@ -790,7 +790,7 @@ async def test_orchestrator_relaunch_sleeps_5s_before_new_task():
 
 async def test_orchestrator_relaunch_aborts_if_stop_event_set_during_sleep():
     """_relaunch() must not create a new orchestrator task if stop_event is set after the sleep."""
-    from custom_components.ha_timescaledb_recorder import _make_orchestrator_done_callback
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
     runtime = MagicMock()
@@ -831,11 +831,11 @@ async def test_orchestrator_relaunch_aborts_if_stop_event_set_during_sleep():
     task.exception.return_value = exc
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.notify_watchdog_recovery",
+        "custom_components.timescaledb_recorder.notify_watchdog_recovery",
     ), patch(
-        "custom_components.ha_timescaledb_recorder.asyncio.sleep", new=mock_sleep,
+        "custom_components.timescaledb_recorder.asyncio.sleep", new=mock_sleep,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill_orchestrator",
+        "custom_components.timescaledb_recorder.backfill_orchestrator",
     ) as mock_borch:
         mock_borch.return_value = object()
         cb(task)
@@ -858,32 +858,32 @@ async def test_orchestrator_relaunch_aborts_if_stop_event_set_during_sleep():
 async def test_recorder_disabled_check_fires_issue_on_keyerror(hass, mock_entry):
     """create_recorder_disabled_issue must be called when recorder.get_instance raises KeyError."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher", new=AsyncMock(),
+        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder.create_recorder_disabled_issue",
+        "custom_components.timescaledb_recorder.create_recorder_disabled_issue",
     ) as mock_create_issue, patch(
-        "custom_components.ha_timescaledb_recorder._wait_for_recorder_and_clear",
+        "custom_components.timescaledb_recorder._wait_for_recorder_and_clear",
         new=AsyncMock(),
     ):
         MockPQ.return_value.join = AsyncMock()
@@ -908,32 +908,32 @@ async def test_recorder_disabled_check_fires_issue_on_keyerror(hass, mock_entry)
 async def test_recorder_disabled_check_fires_issue_when_enabled_false(hass, mock_entry):
     """create_recorder_disabled_issue must be called when recorder instance has enabled=False."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher", new=AsyncMock(),
+        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder.create_recorder_disabled_issue",
+        "custom_components.timescaledb_recorder.create_recorder_disabled_issue",
     ) as mock_create_issue, patch(
-        "custom_components.ha_timescaledb_recorder._wait_for_recorder_and_clear",
+        "custom_components.timescaledb_recorder._wait_for_recorder_and_clear",
         new=AsyncMock(),
     ):
         MockPQ.return_value.join = AsyncMock()
@@ -959,30 +959,30 @@ async def test_recorder_disabled_check_fires_issue_when_enabled_false(hass, mock
 async def test_recorder_disabled_check_silent_when_enabled_true(hass, mock_entry):
     """create_recorder_disabled_issue must NOT be called when recorder is enabled."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher", new=AsyncMock(),
+        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder.create_recorder_disabled_issue",
+        "custom_components.timescaledb_recorder.create_recorder_disabled_issue",
     ) as mock_create_issue:
         MockPQ.return_value.join = AsyncMock()
         MockRL.return_value.async_start = AsyncMock()  # registry_listener
@@ -1019,32 +1019,32 @@ async def test_recorder_disabled_spawns_wait_task_on_issue_raised(hass, mock_ent
     wait_sentinel = object()
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.PersistentQueue"
+        "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.ha_timescaledb_recorder._async_initial_registry_backfill",
+        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
         new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.RegistryListener"
+        "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
-        "custom_components.ha_timescaledb_recorder.StateListener"
+        "custom_components.timescaledb_recorder.StateListener"
     ) as MockSL, patch(
-        "custom_components.ha_timescaledb_recorder._overflow_watcher", new=AsyncMock(),
+        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.spawn_states_worker"
+        "custom_components.timescaledb_recorder.spawn_states_worker"
     ) as mock_spawn_sw, patch(
-        "custom_components.ha_timescaledb_recorder.spawn_meta_worker"
+        "custom_components.timescaledb_recorder.spawn_meta_worker"
     ) as mock_spawn_mw, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog_loop", return_value=None,
+        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder.create_recorder_disabled_issue",
+        "custom_components.timescaledb_recorder.create_recorder_disabled_issue",
     ), patch(
-        "custom_components.ha_timescaledb_recorder._wait_for_recorder_and_clear",
+        "custom_components.timescaledb_recorder._wait_for_recorder_and_clear",
         new=MagicMock(return_value=wait_sentinel),
     ) as mock_wait_fn:
         MockPQ.return_value.join = AsyncMock()
@@ -1077,7 +1077,7 @@ async def test_recorder_disabled_spawns_wait_task_on_issue_raised(hass, mock_ent
 
 async def test_wait_for_recorder_and_clear_calls_clear_when_recorder_enabled():
     """_wait_for_recorder_and_clear must call clear_recorder_disabled_issue when recorder is enabled."""
-    from custom_components.ha_timescaledb_recorder import _wait_for_recorder_and_clear
+    from custom_components.timescaledb_recorder import _wait_for_recorder_and_clear
 
     hass = MagicMock()
 
@@ -1085,9 +1085,9 @@ async def test_wait_for_recorder_and_clear_calls_clear_when_recorder_enabled():
     recorder_instance.enabled = True
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder.clear_recorder_disabled_issue",
+        "custom_components.timescaledb_recorder.clear_recorder_disabled_issue",
     ) as mock_clear:
         mock_recorder.async_wait_recorder = AsyncMock(return_value=recorder_instance)
         # hasattr check must succeed
@@ -1100,14 +1100,14 @@ async def test_wait_for_recorder_and_clear_calls_clear_when_recorder_enabled():
 
 async def test_wait_for_recorder_and_clear_does_not_clear_when_recorder_none():
     """_wait_for_recorder_and_clear must NOT call clear when async_wait_recorder returns None."""
-    from custom_components.ha_timescaledb_recorder import _wait_for_recorder_and_clear
+    from custom_components.timescaledb_recorder import _wait_for_recorder_and_clear
 
     hass = MagicMock()
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.ha_recorder",
+        "custom_components.timescaledb_recorder.ha_recorder",
     ) as mock_recorder, patch(
-        "custom_components.ha_timescaledb_recorder.clear_recorder_disabled_issue",
+        "custom_components.timescaledb_recorder.clear_recorder_disabled_issue",
     ) as mock_clear:
         mock_recorder.async_wait_recorder = AsyncMock(return_value=None)
         mock_recorder.__dict__["async_wait_recorder"] = mock_recorder.async_wait_recorder
@@ -1151,7 +1151,7 @@ async def test_unload_cancels_and_awaits_watchdog_before_orchestrator():
     watchdog_tracked = _TrackedFuture("watchdog_cancel")
     orch_tracked = _TrackedFuture("orch_cancel")
 
-    data = MagicMock(spec=HaTimescaleDBData)
+    data = MagicMock(spec=TimescaledbRecorderData)
     data.stop_event = MagicMock()
     data.loop_stop_event = MagicMock()
     data.state_listener = MagicMock()
@@ -1184,7 +1184,7 @@ async def test_unload_cancels_and_awaits_watchdog_before_orchestrator():
 
 async def test_unload_handles_none_watchdog_task_gracefully():
     """async_unload_entry must handle watchdog_task=None without error (setup may have failed early)."""
-    data = MagicMock(spec=HaTimescaleDBData)
+    data = MagicMock(spec=TimescaledbRecorderData)
     data.stop_event = MagicMock()
     data.loop_stop_event = MagicMock()
     data.watchdog_task = None
@@ -1222,7 +1222,7 @@ async def test_unload_preserves_phase2_behaviour():
         fut.cancel()
         return fut
 
-    data = MagicMock(spec=HaTimescaleDBData)
+    data = MagicMock(spec=TimescaledbRecorderData)
     data.stop_event = MagicMock()
     data.loop_stop_event = MagicMock()
     data.state_listener = MagicMock()

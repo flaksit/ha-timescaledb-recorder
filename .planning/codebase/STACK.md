@@ -61,7 +61,7 @@ focus: tech
 - `pyproject.toml` — project metadata, Python version constraint, dev dependency groups
 - `uv.lock` — full dependency lock
 - `hacs.json` — HACS integration metadata
-- `custom_components/ha_timescaledb_recorder/manifest.json` — HA integration manifest (version, requirements, config_flow, integration_type)
+- `custom_components/timescaledb_recorder/manifest.json` — HA integration manifest (version, requirements, config_flow, integration_type)
 
 ## Dev Tooling
 

@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A custom Home Assistant integration that captures HA state changes and registry metadata (entities, devices, areas, labels) into a TimescaleDB instance. State data lands in the `ha_states` hypertable; metadata is tracked via four SCD2 dimension tables with full temporal history. Deployed as a HACS custom component against a companion TimescaleDB add-on.
+A custom Home Assistant integration that captures HA state changes and registry metadata (entities, devices, areas, labels) into a TimescaleDB instance. State data lands in the `states` hypertable; metadata is tracked via four SCD2 dimension tables with full temporal history. Deployed as a HACS custom component against a companion TimescaleDB add-on.
 
 v1.1 shipped 2026-04-23. All DB writes run in a dedicated OS thread (psycopg3); a bounded RAM buffer + file-backed persistent queue provides zero data loss up to 10+ days DB outage; HA sqlite backfill fills gaps on startup and recovery; a watchdog task auto-restarts dead workers and fires structured notifications; 5 repair issues surface ongoing problems in the HA Repairs UI and auto-clear when conditions resolve.
 
@@ -16,7 +16,7 @@ State changes and registry metadata land in TimescaleDB reliably even when the d
 
 These capabilities were confirmed shipped in v1.1:
 
-- ✓ State changes written to `ha_states` hypertable (buffered/batched, configurable batch size + flush interval) — existing pre-v1.1
+- ✓ State changes written to `states` hypertable (buffered/batched, configurable batch size + flush interval) — existing pre-v1.1
 - ✓ Entity filter (include/exclude by entity_id) applied before buffering — existing pre-v1.1
 - ✓ Registry metadata (entities, devices, areas, labels) tracked via SCD2 dimension tables — existing pre-v1.1
 - ✓ Full SCD2 temporal history: close-and-insert on update, `valid_to IS NULL` marks current row — existing pre-v1.1
@@ -55,7 +55,7 @@ Next milestone requirements (to be defined in `/gsd-new-milestone`):
 ## Context
 
 **Current state (v1.1, 2026-04-23):**
-- Source: 3,669 LOC Python (custom_components/ha_timescaledb_recorder/)
+- Source: 3,669 LOC Python (custom_components/timescaledb_recorder/)
 - Tests: 5,565 LOC Python, 194 passing tests
 - Tech stack: Python 3.14+, psycopg[binary]==3.3.3, HA 2026.3.4, TimescaleDB ≥ 2.18.1
 
@@ -81,7 +81,7 @@ Next milestone requirements (to be defined in `/gsd-new-milestone`):
 
 - **Tech stack**: Python 3.14+, uv, HA 2026.x custom component model — no HTTP, no inter-process; all data via event bus
 - **HA model**: Event handlers must be sync `@callback`; no blocking the event loop; DB writes confined to worker thread
-- **Schema**: `ha_states` hypertable and four `dim_*` tables remain schema-identical to v0.3.6 (no migration in v1.1)
+- **Schema**: `states` hypertable and four `dim_*` tables remain schema-identical to v0.3.6 (no migration in v1.1)
 - **Config surface**: Same user-facing options (DSN, batch_size, flush_interval, compress_after_hours, chunk_interval_days)
 - **HACS distribution**: All runtime dependencies declared in `manifest.json`; no system packages
 - **HA recorder dependency**: Backfill requires HA recorder enabled with sqlite backend and retention ≥ expected outage window

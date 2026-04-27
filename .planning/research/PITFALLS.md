@@ -9,7 +9,7 @@
 ### Pitfall 1: Calling `hass.async_*` methods directly from the worker thread
 
 **What goes wrong:**
-The worker thread calls `hass.async_create_task`, `hass.bus.async_fire`, `async_write_ha_state`, or any registry mutation directly. These are not thread-safe. Internals of the asyncio event loop get corrupted or the call silently schedules work on the wrong loop, causing intermittent crashes, lost events, or state corruption that is extremely hard to reproduce.
+The worker thread calls `hass.async_create_task`, `hass.bus.async_fire`, `async_write_state`, or any registry mutation directly. These are not thread-safe. Internals of the asyncio event loop get corrupted or the call silently schedules work on the wrong loop, causing intermittent crashes, lost events, or state corruption that is extremely hard to reproduce.
 
 **Why it happens:**
 The `async_*` prefix reads as "the async version" of a method; developers assume it is always the right one. The distinction between "safe to call from any thread" (sync API) and "must only be called from the event loop thread" (async API) is not obvious unless you have read the HA thread-safety documentation.

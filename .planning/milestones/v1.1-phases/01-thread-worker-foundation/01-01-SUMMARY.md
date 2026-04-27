@@ -19,7 +19,7 @@ tech_stack:
     - psycopg3 %s positional placeholder syntax
 key_files:
   modified:
-    - custom_components/ha_timescaledb_recorder/const.py
+    - custom_components/timescaledb_recorder/const.py
 decisions:
   - "SCD2_SNAPSHOT_*_SQL: each %s is a separate positional slot in psycopg3 (unlike asyncpg $N reuse); first ID param must be passed twice when executing snapshot SQL"
   - "SELECT_*_CURRENT_SQL placed after SCD2_INSERT_*_SQL constants in const.py for logical grouping (DDL → SCD2 close → snapshot → insert → select)"
@@ -79,6 +79,6 @@ None — `const.py` contains only static string constants. No new network endpoi
 
 ## Self-Check: PASSED
 
-- FOUND: `custom_components/ha_timescaledb_recorder/const.py`
+- FOUND: `custom_components/timescaledb_recorder/const.py`
 - FOUND: `.planning/phases/01-thread-worker-foundation/01-01-SUMMARY.md`
 - FOUND: commit `a3fd4b3`

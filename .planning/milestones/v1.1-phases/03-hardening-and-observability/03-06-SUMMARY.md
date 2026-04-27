@@ -14,7 +14,7 @@ dependency_graph:
     - spawn_meta_worker (factory — constructs TimescaledbMetaRecorderThread from runtime)
     - _watchdog_respawn (async helper — notify + throttle + respawn)
   affects:
-    - 03-07 (async_setup_entry wires watchdog_task; HaTimescaleDBData gains dsn/queue fields that factories read)
+    - 03-07 (async_setup_entry wires watchdog_task; TimescaledbRecorderData gains dsn/queue fields that factories read)
 tech_stack:
   added: []
   patterns:
@@ -25,14 +25,14 @@ tech_stack:
     - asyncio.sleep(5) restart throttle (MEDIUM-5)
 key_files:
   created:
-    - custom_components/ha_timescaledb_recorder/watchdog.py
+    - custom_components/timescaledb_recorder/watchdog.py
     - tests/test_watchdog.py
   modified: []
 decisions:
   - "_watchdog_respawn is async def (not sync) — it must await asyncio.sleep(5) for the restart throttle; making it async is correct even though the sleep is the only await"
   - "Restart throttle placed between notify and respawn — this ensures the notification is visible to the user before the potentially-crashing worker is restarted, preventing silent crash-loop churn (MEDIUM-5)"
   - "Poll body try/except catches all Exception — a monitoring bug (e.g. AttributeError on runtime) must not kill the watchdog; WARNING is logged and loop continues (MEDIUM-9)"
-  - "Factories use TYPE_CHECKING import of HaTimescaleDBData — avoids circular import of __init__.py at module load time; fields are accessed at runtime, not import time"
+  - "Factories use TYPE_CHECKING import of TimescaledbRecorderData — avoids circular import of __init__.py at module load time; fields are accessed at runtime, not import time"
   - "Test async functions use async def + @pytest.mark.asyncio pattern; asyncio.wait_for is patched with side_effect to simulate cadence without real timers"
 metrics:
   duration: "176 seconds"
@@ -52,7 +52,7 @@ New module `watchdog.py` — async supervisor turning "thread silently dies" int
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
 | 1 (RED) | Failing tests for watchdog_loop + factories | aaf6e65 | tests/test_watchdog.py |
-| 1 (GREEN) | watchdog.py implementation | a6212ce | custom_components/ha_timescaledb_recorder/watchdog.py |
+| 1 (GREEN) | watchdog.py implementation | a6212ce | custom_components/timescaledb_recorder/watchdog.py |
 
 ## Watchdog Loop Architecture
 
@@ -135,7 +135,7 @@ Required runtime fields consumed:
 
 ### Plan 07 Note
 
-HaTimescaleDBData currently does NOT have the fields `dsn`, `chunk_interval_days`, `compress_after_hours`, `live_queue`, `backfill_queue`, `backfill_request`, `meta_queue`, `syncer` as dataclass fields — they are passed directly to worker constructors in `async_setup_entry`. **Plan 07 must add these fields to HaTimescaleDBData** before calling the factories. The factories here have been written against the expected Plan 07 runtime shape.
+TimescaledbRecorderData currently does NOT have the fields `dsn`, `chunk_interval_days`, `compress_after_hours`, `live_queue`, `backfill_queue`, `backfill_request`, `meta_queue`, `syncer` as dataclass fields — they are passed directly to worker constructors in `async_setup_entry`. **Plan 07 must add these fields to TimescaledbRecorderData** before calling the factories. The factories here have been written against the expected Plan 07 runtime shape.
 
 ## Test Coverage (14 tests)
 
@@ -164,7 +164,7 @@ None — plan executed exactly as written. Test functions use `async def` with `
 
 ## Known Stubs
 
-None — `watchdog_loop` is fully implemented and functional. The `spawn_*` factories reference `runtime.dsn` etc. which do not yet exist on `HaTimescaleDBData` — but this is intentional and documented above: Plan 07 adds those fields. The factories are not stubs; they are correctly implemented ahead of Plan 07's dataclass extension.
+None — `watchdog_loop` is fully implemented and functional. The `spawn_*` factories reference `runtime.dsn` etc. which do not yet exist on `TimescaledbRecorderData` — but this is intentional and documented above: Plan 07 adds those fields. The factories are not stubs; they are correctly implemented ahead of Plan 07's dataclass extension.
 
 ## Threat Surface Scan
 
@@ -183,7 +183,7 @@ T-03-06-04 mitigation applied: factories source all args from `runtime` — same
 
 ## Self-Check: PASSED
 
-- FOUND: `custom_components/ha_timescaledb_recorder/watchdog.py`
+- FOUND: `custom_components/timescaledb_recorder/watchdog.py`
 - FOUND: `tests/test_watchdog.py`
 - FOUND: commit `aaf6e65` (RED gate)
 - FOUND: commit `a6212ce` (GREEN gate)

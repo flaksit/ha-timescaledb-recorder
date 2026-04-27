@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.const import (
+from custom_components.timescaledb_recorder.const import (
     SCD2_CLOSE_AREA_SQL,
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
@@ -17,7 +17,7 @@ from custom_components.ha_timescaledb_recorder.const import (
     SCD2_SNAPSHOT_ENTITY_SQL,
     SCD2_SNAPSHOT_LABEL_SQL,
 )
-from custom_components.ha_timescaledb_recorder.meta_worker import (
+from custom_components.timescaledb_recorder.meta_worker import (
     _VALID_FROM_INDEX,
     TimescaledbMetaRecorderThread,
 )
@@ -227,7 +227,7 @@ def test_stall_hook_fires_persistent_notification_and_repair_issue():
 
     assert hass.add_job.call_count == 2
 
-    from custom_components.ha_timescaledb_recorder.issues import (
+    from custom_components.timescaledb_recorder.issues import (
         create_meta_worker_stalled_issue,
     )
     assert call(create_meta_worker_stalled_issue, hass) in hass.add_job.call_args_list
@@ -243,7 +243,7 @@ def test_recovery_hook_clears_both_issues():
 
     assert hass.add_job.call_count == 2
 
-    from custom_components.ha_timescaledb_recorder.issues import (
+    from custom_components.timescaledb_recorder.issues import (
         clear_db_unreachable_issue,
         clear_meta_worker_stalled_issue,
     )
@@ -260,7 +260,7 @@ def test_sustained_fail_hook_creates_db_unreachable_issue():
 
     assert hass.add_job.call_count == 1
 
-    from custom_components.ha_timescaledb_recorder.issues import create_db_unreachable_issue
+    from custom_components.timescaledb_recorder.issues import create_db_unreachable_issue
     assert call(create_db_unreachable_issue, hass) in hass.add_job.call_args_list
 
 
@@ -278,7 +278,7 @@ def test_retry_decorator_wired_with_all_phase3_hooks():
         return decorator
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.meta_worker.retry_until_success",
+        "custom_components.timescaledb_recorder.meta_worker.retry_until_success",
         fake_retry,
     ):
         w = _make_worker()

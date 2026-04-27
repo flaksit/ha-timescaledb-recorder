@@ -5,7 +5,7 @@ in-memory queue for live events; a file-persisted queue for metadata; an
 event-loop orchestrator driving backfill from HA sqlite on demand.
 
 Phase 3 additions:
-- HaTimescaleDBData gains watchdog_task, dsn, chunk_interval_days,
+- TimescaledbRecorderData gains watchdog_task, dsn, chunk_interval_days,
   compress_after_hours, entity_filter fields required by spawn factories.
 - Workers constructed via spawn_states_worker / spawn_meta_worker factories
   so initial spawn and watchdog respawn share one code path (D-05-c).
@@ -124,7 +124,7 @@ _OVERFLOW_WATCH_INTERVAL_S = 0.5
 
 
 @dataclass
-class HaTimescaleDBData:
+class TimescaledbRecorderData:
     """Runtime data stored on a config entry."""
 
     states_worker: TimescaledbStateRecorderThread | None
@@ -149,7 +149,7 @@ class HaTimescaleDBData:
     entity_filter: Callable[[str], bool]    # entity filter for orchestrator relaunch kwargs
 
 
-HaTimescaleDBConfigEntry = ConfigEntry[HaTimescaleDBData]
+TimescaledbRecorderConfigEntry = ConfigEntry[TimescaledbRecorderData]
 
 
 def _get_entity_filter(hass: HomeAssistant, entry):
@@ -314,7 +314,7 @@ async def _wait_for_recorder_and_clear(hass: HomeAssistant) -> None:
 
 def _make_orchestrator_done_callback(
     hass: HomeAssistant,
-    runtime: HaTimescaleDBData,
+    runtime: TimescaledbRecorderData,
     orchestrator_kwargs: dict,
 ):
     """Return the done-callback closure for the orchestrator task.
@@ -352,12 +352,12 @@ def _make_orchestrator_done_callback(
                 return
             new_task = hass.async_create_background_task(
                 backfill_orchestrator(**orchestrator_kwargs),
-                name="ha_timescaledb_recorder_backfill_orchestrator",
+                name="timescaledb_recorder_backfill_orchestrator",
             )
             new_task.add_done_callback(_on_orchestrator_done)
             runtime.orchestrator_task = new_task
 
-        hass.async_create_background_task(_relaunch(), name="ha_timescaledb_recorder_orchestrator_relaunch")
+        hass.async_create_background_task(_relaunch(), name="timescaledb_recorder_orchestrator_relaunch")
 
     return _on_orchestrator_done
 
@@ -387,7 +387,7 @@ async def _async_meta_init(
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: HaTimescaleDBConfigEntry,
+    hass: HomeAssistant, entry: TimescaledbRecorderConfigEntry,
 ) -> bool:
     """Set up the TimescaleDB integration from a config entry."""
     dsn = entry.data[CONF_DSN]
@@ -413,7 +413,7 @@ async def async_setup_entry(
 
     # Build data first so spawn factories can read dsn, queue fields, etc.
     # Enables a single code path for initial spawn and watchdog respawn (D-05-c).
-    data = HaTimescaleDBData(
+    data = TimescaledbRecorderData(
         states_worker=None,         # filled by spawn_states_worker below
         meta_worker=None,           # filled by spawn_meta_worker below
         state_listener=state_listener,
@@ -467,7 +467,7 @@ async def async_setup_entry(
     # Background task does not block homeassistant_started (HA: "Will not block startup").
     hass.async_create_background_task(
         _async_meta_init(hass, meta_queue, registry_listener),
-        name="ha_timescaledb_recorder_meta_init",
+        name="timescaledb_recorder_meta_init",
     )
 
     # D-11: recorder_disabled detection — one-shot check at setup. Backfill
@@ -478,10 +478,10 @@ async def async_setup_entry(
         _recorder_check = ha_recorder.get_instance(hass)
         if not _recorder_check.enabled:
             create_recorder_disabled_issue(hass)
-            hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="ha_timescaledb_recorder_wait_recorder")
+            hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="timescaledb_recorder_wait_recorder")
     except KeyError:
         create_recorder_disabled_issue(hass)
-        hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="ha_timescaledb_recorder_wait_recorder")
+        hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="timescaledb_recorder_wait_recorder")
 
     # Spawn the overflow watcher now that workers are running; it fires the
     # D-10-b repair issue on first overflow flip until orchestrator clears it.
@@ -490,7 +490,7 @@ async def async_setup_entry(
     # warnings or delay HA shutdown beyond the unload cancellation we do explicitly.
     data.overflow_watcher_task = hass.async_create_background_task(
         _overflow_watcher(hass, live_queue, loop_stop_event),
-        name="ha_timescaledb_recorder_overflow_watcher",
+        name="timescaledb_recorder_overflow_watcher",
     )
 
     # D-05-a: watchdog task supervising both worker threads. Must be spawned
@@ -498,7 +498,7 @@ async def async_setup_entry(
     # Cancelled first in async_unload_entry before orchestrator teardown.
     data.watchdog_task = hass.async_create_background_task(
         watchdog_loop(hass, data),
-        name="ha_timescaledb_recorder_watchdog",
+        name="timescaledb_recorder_watchdog",
     )
 
     def _spawn_orchestrator() -> None:
@@ -515,7 +515,7 @@ async def async_setup_entry(
         )
         task = hass.async_create_background_task(
             backfill_orchestrator(**orchestrator_kwargs),
-            name="ha_timescaledb_recorder_backfill_orchestrator",
+            name="timescaledb_recorder_backfill_orchestrator",
         )
         task.add_done_callback(
             _make_orchestrator_done_callback(hass, data, orchestrator_kwargs),
@@ -544,14 +544,14 @@ async def async_setup_entry(
 
 
 async def _async_options_updated(
-    hass: HomeAssistant, entry: HaTimescaleDBConfigEntry,
+    hass: HomeAssistant, entry: TimescaledbRecorderConfigEntry,
 ) -> None:
     """Restart the integration when options change (unchanged Phase 1 behaviour)."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(
-    hass: HomeAssistant, entry: HaTimescaleDBConfigEntry,
+    hass: HomeAssistant, entry: TimescaledbRecorderConfigEntry,
 ) -> bool:
     """Unload a config entry (D-13 six steps, Phase 3: watchdog cancel added).
 
@@ -568,7 +568,7 @@ async def async_unload_entry(
 
     No run_coroutine_threadsafe().result() anywhere — deadlocks on HA shutdown.
     """
-    data: HaTimescaleDBData = entry.runtime_data
+    data: TimescaledbRecorderData = entry.runtime_data
 
     # D-13-b step 1: signal shutdown to worker threads + retry decorators +
     # orchestrator sleep points.

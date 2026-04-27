@@ -13,8 +13,8 @@ dependency_graph:
     - BACKFILL_QUEUE_MAXSIZE (consumed by __init__.py plan 09)
     - SELECT_WATERMARK_SQL, SELECT_OPEN_ENTITIES_SQL (consumed by states_worker plan 05, backfill plan 07)
   affects:
-    - custom_components/ha_timescaledb_recorder/const.py
-    - custom_components/ha_timescaledb_recorder/schema.py
+    - custom_components/timescaledb_recorder/const.py
+    - custom_components/timescaledb_recorder/schema.py
 tech_stack:
   added: []
   patterns:
@@ -23,8 +23,8 @@ tech_stack:
     - ON CONFLICT (last_updated, entity_id) DO NOTHING (TimescaleDB ≥ 2.18.1 required)
 key_files:
   modified:
-    - custom_components/ha_timescaledb_recorder/const.py
-    - custom_components/ha_timescaledb_recorder/schema.py
+    - custom_components/timescaledb_recorder/const.py
+    - custom_components/timescaledb_recorder/schema.py
 decisions:
   - "Phase 2 tunables are module-level int/float constants (not classes/enums) — simple and grep-able"
   - "CREATE_UNIQUE_INDEX_SQL placed adjacent to CREATE_INDEX_SQL in const.py for collocation of index DDL"
@@ -62,7 +62,7 @@ Five Phase 2 internal tunables added (not user-configurable):
 
 New DDL constant:
 
-- `CREATE_UNIQUE_INDEX_SQL` — `CREATE UNIQUE INDEX IF NOT EXISTS idx_ha_states_uniq ON ha_states (last_updated, entity_id)` (D-09-a)
+- `CREATE_UNIQUE_INDEX_SQL` — `CREATE UNIQUE INDEX IF NOT EXISTS idx_states_uniq ON states (last_updated, entity_id)` (D-09-a)
 
 Modified INSERT:
 
@@ -70,8 +70,8 @@ Modified INSERT:
 
 New SELECT constants for backfill support:
 
-- `SELECT_WATERMARK_SQL` — `SELECT MAX(last_updated) FROM ha_states` (D-08-d)
-- `SELECT_OPEN_ENTITIES_SQL` — `SELECT entity_id FROM dim_entities WHERE valid_to IS NULL` (D-08-f)
+- `SELECT_WATERMARK_SQL` — `SELECT MAX(last_updated) FROM states` (D-08-d)
+- `SELECT_OPEN_ENTITIES_SQL` — `SELECT entity_id FROM entities WHERE valid_to IS NULL` (D-08-f)
 
 ### Task 2 — schema.py update
 
@@ -100,13 +100,13 @@ None — this plan delivers only constants and DDL; no UI-visible data paths.
 
 | Flag | File | Description |
 |------|------|-------------|
-| threat_flag: schema-change | custom_components/ha_timescaledb_recorder/const.py | New unique index on (last_updated, entity_id) in ha_states hypertable. Requires TimescaleDB ≥ 2.18.1 for safe ON CONFLICT DO NOTHING behavior (≤ 2.17.2 bug aborts entire batch on first conflict). This constraint is documented in CLAUDE.md and STATE.md. |
+| threat_flag: schema-change | custom_components/timescaledb_recorder/const.py | New unique index on (last_updated, entity_id) in states hypertable. Requires TimescaleDB ≥ 2.18.1 for safe ON CONFLICT DO NOTHING behavior (≤ 2.17.2 bug aborts entire batch on first conflict). This constraint is documented in CLAUDE.md and STATE.md. |
 
 ## Self-Check: PASSED
 
 Files exist:
-- custom_components/ha_timescaledb_recorder/const.py: FOUND
-- custom_components/ha_timescaledb_recorder/schema.py: FOUND
+- custom_components/timescaledb_recorder/const.py: FOUND
+- custom_components/timescaledb_recorder/schema.py: FOUND
 
 Commits exist:
 - bf1724b: FOUND (feat(02-01): add Phase 2 SQL + tuning constants to const.py)

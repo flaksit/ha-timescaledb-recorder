@@ -19,7 +19,7 @@ Assumptions:
 - runtime.stop_event is the threading.Event shared with workers.
 - runtime has fields dsn, live_queue, backfill_queue, backfill_request,
   meta_queue, registry_listener, chunk_interval_days, compress_after_hours — added
-  to HaTimescaleDBData by Plan 07. See PATTERNS.md __init__.py section.
+  to TimescaledbRecorderData by Plan 07. See PATTERNS.md __init__.py section.
 """
 from __future__ import annotations
 
@@ -36,14 +36,14 @@ from .notifications import notify_watchdog_recovery
 from .states_worker import TimescaledbStateRecorderThread
 
 if TYPE_CHECKING:
-    from . import HaTimescaleDBData
+    from . import TimescaledbRecorderData
 
 _LOGGER = logging.getLogger(__name__)
 
 
 def spawn_states_worker(
     hass: HomeAssistant,
-    runtime: "HaTimescaleDBData",
+    runtime: "TimescaledbRecorderData",
 ) -> TimescaledbStateRecorderThread:
     """Construct a new states_worker with shared queues + stop_event.
 
@@ -66,7 +66,7 @@ def spawn_states_worker(
 
 def spawn_meta_worker(
     hass: HomeAssistant,
-    runtime: "HaTimescaleDBData",
+    runtime: "TimescaledbRecorderData",
 ) -> TimescaledbMetaRecorderThread:
     """Construct a new meta_worker with shared meta_queue + registry_listener + stop_event."""
     return TimescaledbMetaRecorderThread(
@@ -80,7 +80,7 @@ def spawn_meta_worker(
 
 async def _watchdog_respawn(
     hass: HomeAssistant,
-    runtime: "HaTimescaleDBData",
+    runtime: "TimescaledbRecorderData",
     *,
     component: str,
     dead_thread,
@@ -108,7 +108,7 @@ async def _watchdog_respawn(
 
 async def watchdog_loop(
     hass: HomeAssistant,
-    runtime: "HaTimescaleDBData",
+    runtime: "TimescaledbRecorderData",
 ) -> None:
     """Async supervisor for both worker threads (D-05).
 

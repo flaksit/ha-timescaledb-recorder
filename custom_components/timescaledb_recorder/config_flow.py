@@ -18,7 +18,7 @@ from .const import (
 )
 
 
-class TimescaleDBConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class TimescaledbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle initial configuration — collect and validate the DSN."""
 
     VERSION = 1
@@ -50,10 +50,10 @@ class TimescaleDBConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     def async_get_options_flow(config_entry):
         """Return the options flow handler."""
-        return TimescaleDBOptionsFlow(config_entry)
+        return TimescaledbOptionsFlow(config_entry)
 
 
-class TimescaleDBOptionsFlow(config_entries.OptionsFlow):
+class TimescaledbOptionsFlow(config_entries.OptionsFlow):
     """Allow the user to tune batch/flush/compression parameters."""
 
     def __init__(self, config_entry) -> None:

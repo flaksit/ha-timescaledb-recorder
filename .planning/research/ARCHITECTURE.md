@@ -38,8 +38,8 @@
 ┌───────────────────────────────────────────────────────────────────┘
 │              TimescaleDB (PostgreSQL add-on)                       │
 │                                                                    │
-│  ha_states hypertable (partitioned by last_updated, 7d chunks)    │
-│  dim_entities / dim_devices / dim_areas / dim_labels (SCD2)       │
+│  states hypertable (partitioned by last_updated, 7d chunks)    │
+│  entities / devices / areas / labels (SCD2)       │
 └────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
@@ -66,7 +66,7 @@
 ## Recommended Project Structure
 
 ```
-custom_components/ha_timescaledb_recorder/
+custom_components/timescaledb_recorder/
 ├── __init__.py          # async_setup_entry, async_unload_entry, watchdog task
 ├── config_flow.py       # unchanged from v0.3.6
 ├── const.py             # SQL constants, config keys, defaults
@@ -136,7 +136,7 @@ StateBuffer.append()  →  drop-oldest + warning if full
     ↓ (worker thread polls buffer, or timer fires)
 FlushWriter acquires write_lock
     ↓
-psycopg3 executemany → ha_states hypertable
+psycopg3 executemany → states hypertable
     ↓
 write_lock released
 ```
@@ -179,9 +179,9 @@ MetadataSyncer.full_snapshot():
 
 ## Group A — TimescaleDB Unique Constraints: Findings
 
-### A1: UNIQUE (last_updated, entity_id) on ha_states hypertable
+### A1: UNIQUE (last_updated, entity_id) on states hypertable
 
-**ALLOWED.** TimescaleDB requires all partitioning columns to be present in any unique index. `ha_states` is partitioned by `last_updated` (timestamptz). `UNIQUE (last_updated, entity_id)` includes the partitioning column — this satisfies the requirement.
+**ALLOWED.** TimescaleDB requires all partitioning columns to be present in any unique index. `states` is partitioned by `last_updated` (timestamptz). `UNIQUE (last_updated, entity_id)` includes the partitioning column — this satisfies the requirement.
 
 Source: TimescaleDB docs (tigerdata.com/docs/use-timescale/latest/hypertables/hypertables-and-unique-indexes): "When you create a unique index, it must contain all the partitioning columns of the hypertable."
 
@@ -201,7 +201,7 @@ Compressed chunk bug: TimescaleDB ≤ 2.17.2 had a bug (#7672) where `ON CONFLIC
 
 Adding `UNIQUE (last_updated, entity_id)` creates a B-tree index across all chunks. Expected impact:
 
-- **Storage:** Approximately 1 B-tree entry per row. For ha_states with `compress_segmentby = 'entity_id'`, the unique index is a secondary index alongside the existing `idx_ha_states_entity_time (entity_id, last_updated DESC)`. Extra storage is roughly proportional to the existing index.
+- **Storage:** Approximately 1 B-tree entry per row. For states with `compress_segmentby = 'entity_id'`, the unique index is a secondary index alongside the existing `idx_states_entity_time (entity_id, last_updated DESC)`. Extra storage is roughly proportional to the existing index.
 - **Insert cost:** Secondary index maintenance adds 20–40% lower throughput vs no secondary index at high write rates (MEDIUM confidence — from benchmark articles, not TimescaleDB-official). For the HA use-case (100–500 states/s peak, batched 200-row inserts), this is negligible.
 - **Compression interaction:** `compress_segmentby = 'entity_id'` is already set. `entity_id` is in the unique constraint, which avoids the decompression-to-verify-uniqueness worst case (issue #5892 warning: if a unique index column is not in `segmentby` or `orderby`, PostgreSQL must decompress to check uniqueness). Since `entity_id` is the segmentby column, the index aligns well with the compression scheme.
 
@@ -354,11 +354,11 @@ Deadlock requires a circular wait: Thread A holds lock X and waits for lock Y; T
 
 ### Anti-Pattern 2: Using ON CONFLICT ON CONSTRAINT Syntax
 
-**What people do:** `INSERT INTO ha_states ... ON CONFLICT ON CONSTRAINT uq_ha_states DO NOTHING`
+**What people do:** `INSERT INTO states ... ON CONFLICT ON CONSTRAINT uq_states DO NOTHING`
 
 **Why it's wrong:** TimescaleDB hypertables do not support constraint-name conflict resolution (issue #1094). This raises a runtime error.
 
-**Do this instead:** `INSERT INTO ha_states ... ON CONFLICT (last_updated, entity_id) DO NOTHING`
+**Do this instead:** `INSERT INTO states ... ON CONFLICT (last_updated, entity_id) DO NOTHING`
 
 ### Anti-Pattern 3: Holding write_lock During HA SQLite Read
 

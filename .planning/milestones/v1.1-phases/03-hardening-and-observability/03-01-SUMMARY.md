@@ -31,9 +31,9 @@ key_files:
     - tests/test_const_phase3.py
     - tests/test_strings_phase3.py
   modified:
-    - custom_components/ha_timescaledb_recorder/const.py
-    - custom_components/ha_timescaledb_recorder/strings.json
-    - custom_components/ha_timescaledb_recorder/issues.py
+    - custom_components/timescaledb_recorder/const.py
+    - custom_components/timescaledb_recorder/strings.json
+    - custom_components/timescaledb_recorder/issues.py
     - tests/test_issues.py
 decisions:
   - "Severity ERROR for states_worker_stalled, meta_worker_stalled, db_unreachable; WARNING for buffer_dropping and recorder_disabled — matches HA repair-issue convention (actionable=ERROR, advisory=WARNING)"
@@ -57,11 +57,11 @@ Phase 3 Wave 1 foundation: three new constants in const.py, four new issue trans
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
 | 1 (RED) | Phase 3 constants — failing tests | 7b6fbbb | tests/test_const_phase3.py |
-| 1 (GREEN) | Phase 3 constants to const.py | 998e6f3 | custom_components/ha_timescaledb_recorder/const.py |
+| 1 (GREEN) | Phase 3 constants to const.py | 998e6f3 | custom_components/timescaledb_recorder/const.py |
 | 2 (RED) | strings.json entries — failing tests | ed79e14 | tests/test_strings_phase3.py |
-| 2 (GREEN) | Four issue translation keys to strings.json | 8b59742 | custom_components/ha_timescaledb_recorder/strings.json |
+| 2 (GREEN) | Four issue translation keys to strings.json | 8b59742 | custom_components/timescaledb_recorder/strings.json |
 | 3 (RED) | Issue helpers — failing tests | 49117f4 | tests/test_issues.py |
-| 3 (GREEN) | Four create/clear pairs to issues.py | f144685 | custom_components/ha_timescaledb_recorder/issues.py, tests/test_issues.py |
+| 3 (GREEN) | Four create/clear pairs to issues.py | f144685 | custom_components/timescaledb_recorder/issues.py, tests/test_issues.py |
 
 ## Constants Added to const.py
 
@@ -134,9 +134,9 @@ None — all functions are fully wired to HA's `ir.async_create_issue` / `ir.asy
 ## Self-Check: PASSED
 
 Files exist:
-- custom_components/ha_timescaledb_recorder/const.py — FOUND (STALL_THRESHOLD, WATCHDOG_INTERVAL_S, DB_UNREACHABLE_THRESHOLD_SECONDS)
-- custom_components/ha_timescaledb_recorder/strings.json — FOUND (5 issues keys)
-- custom_components/ha_timescaledb_recorder/issues.py — FOUND (8 new helpers)
+- custom_components/timescaledb_recorder/const.py — FOUND (STALL_THRESHOLD, WATCHDOG_INTERVAL_S, DB_UNREACHABLE_THRESHOLD_SECONDS)
+- custom_components/timescaledb_recorder/strings.json — FOUND (5 issues keys)
+- custom_components/timescaledb_recorder/issues.py — FOUND (8 new helpers)
 - tests/test_issues.py — FOUND (13 test functions)
 - tests/test_const_phase3.py — FOUND (2 test functions)
 - tests/test_strings_phase3.py — FOUND (4 test functions)

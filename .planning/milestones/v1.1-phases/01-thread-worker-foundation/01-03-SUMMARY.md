@@ -16,7 +16,7 @@ dependency_graph:
 tech_stack:
   added:
     - psycopg3 (psycopg.connect, psycopg.rows.dict_row, psycopg.types.json.Jsonb)
-    - threading.Thread (daemon=True, name="ha_timescaledb_worker")
+    - threading.Thread (daemon=True, name="timescaledb_worker")
     - queue.Queue (get(timeout=5.0) as flush timer)
   patterns:
     - frozen=True, slots=True dataclasses for queue payloads
@@ -29,7 +29,7 @@ tech_stack:
     - dict_row cursor factory for syncer change-detection helpers
 key_files:
   created:
-    - custom_components/ha_timescaledb_recorder/worker.py
+    - custom_components/timescaledb_recorder/worker.py
 decisions:
   - "sync_setup_schema imported at module level (not TYPE_CHECKING) — fails at import if plan 02 not merged; acceptable in parallel wave execution"
   - "MetaCommand.params tuple for entity has 13 elements; snapshot SQL requires (*cmd.params, cmd.params[0]) to supply entity_id twice"
@@ -106,6 +106,6 @@ No new trust boundaries beyond those in the plan's threat model. All T-03-01 thr
 
 ## Self-Check: PASSED
 
-- FOUND: `custom_components/ha_timescaledb_recorder/worker.py`
+- FOUND: `custom_components/timescaledb_recorder/worker.py`
 - FOUND: commit `63cbebf` (Task 1)
 - FOUND: commit `ebb81ac` (Task 2)

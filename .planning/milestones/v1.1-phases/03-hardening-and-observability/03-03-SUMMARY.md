@@ -25,7 +25,7 @@ key_files:
   created:
     - tests/test_retry.py (new test functions added to existing file)
   modified:
-    - custom_components/ha_timescaledb_recorder/retry.py
+    - custom_components/timescaledb_recorder/retry.py
     - tests/test_retry.py
 decisions:
   - "time.monotonic() used for all threshold timing — immune to NTP adjustments, DST, VM migration (MEDIUM-7)"
@@ -51,7 +51,7 @@ Extended `retry_until_success` with three new keyword-only hooks and monotonic-t
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
 | 1 (RED) | Failing tests for on_recovery + on_sustained_fail | c3a005c | tests/test_retry.py |
-| 2 (GREEN) | Extend retry.py; update test import | 5c51151 | custom_components/ha_timescaledb_recorder/retry.py, tests/test_retry.py |
+| 2 (GREEN) | Extend retry.py; update test import | 5c51151 | custom_components/timescaledb_recorder/retry.py, tests/test_retry.py |
 
 ## New Signature
 
@@ -171,7 +171,7 @@ None — all new code paths are fully implemented. Hook callables are passed by 
 ## Self-Check: PASSED
 
 Files exist:
-- custom_components/ha_timescaledb_recorder/retry.py — FOUND (on_recovery, on_sustained_fail, time.monotonic)
+- custom_components/timescaledb_recorder/retry.py — FOUND (on_recovery, on_sustained_fail, time.monotonic)
 - tests/test_retry.py — FOUND (20 test functions, 12 new)
 
 Commits verified: c3a005c, 5c51151

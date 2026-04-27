@@ -42,7 +42,7 @@ condition retains only rows where the state *value* changed (or the very first r
 where `last_changed_ts` is NULL by convention). Attribute-only updates do **not** appear in results.
 
 **Implication for backfill:** The returned rows are safe to `INSERT … ON CONFLICT DO NOTHING` against
-`ha_states` without concern about double-counting attribute noise. The row count per entity per
+`states` without concern about double-counting attribute noise. The row count per entity per
 window is the number of actual state-value transitions.
 
 ### A2 — `include_start_time_state=False`
@@ -294,7 +294,7 @@ hass.add_job(
     hass,
     "TimescaleDB worker thread died — check logs. Restart HA to recover.",
     "ha-timescaledb-recorder: Worker died",
-    "ha_timescaledb_recorder_worker_dead",
+    "timescaledb_recorder_worker_dead",
 )
 ```
 

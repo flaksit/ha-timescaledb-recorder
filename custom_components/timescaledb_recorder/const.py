@@ -1,6 +1,6 @@
 """Constants for the TimescaleDB Recorder integration."""
 
-DOMAIN = "ha_timescaledb_recorder"
+DOMAIN = "timescaledb_recorder"
 
 # Defaults
 DEFAULT_BATCH_SIZE = 200
@@ -41,7 +41,7 @@ CONF_FLUSH_INTERVAL = "flush_interval_seconds"
 CONF_COMPRESS_AFTER = "compress_after_hours"
 CONF_CHUNK_INTERVAL = "chunk_interval_days"
 
-TABLE_NAME = "ha_states"
+TABLE_NAME = "states"
 
 CREATE_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -117,7 +117,7 @@ ON CONFLICT (last_updated, entity_id) DO UPDATE
 # so they can safely execute on every integration startup (D-11).
 
 CREATE_DIM_ENTITIES_SQL = """
-CREATE TABLE IF NOT EXISTS dim_entities (
+CREATE TABLE IF NOT EXISTS entities (
     entity_id           TEXT        NOT NULL,
     ha_entity_uuid      TEXT        NOT NULL,
     name                TEXT,
@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS dim_entities (
 """
 
 CREATE_DIM_DEVICES_SQL = """
-CREATE TABLE IF NOT EXISTS dim_devices (
+CREATE TABLE IF NOT EXISTS devices (
     device_id   TEXT        NOT NULL,
     name        TEXT,
     manufacturer TEXT,
@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS dim_devices (
 """
 
 CREATE_DIM_AREAS_SQL = """
-CREATE TABLE IF NOT EXISTS dim_areas (
+CREATE TABLE IF NOT EXISTS areas (
     area_id    TEXT        NOT NULL,
     name       TEXT,
     valid_from TIMESTAMPTZ NOT NULL,
@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS dim_areas (
 """
 
 CREATE_DIM_LABELS_SQL = """
-CREATE TABLE IF NOT EXISTS dim_labels (
+CREATE TABLE IF NOT EXISTS labels (
     label_id   TEXT        NOT NULL,
     name       TEXT,
     color      TEXT,
@@ -176,29 +176,29 @@ CREATE TABLE IF NOT EXISTS dim_labels (
 # (the primary access pattern for Grafana joins in Phase 7).
 CREATE_DIM_ENTITIES_IDX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_dim_entities_entity_time
-    ON dim_entities (entity_id, valid_from DESC);
+    ON entities (entity_id, valid_from DESC);
 """
 
 # Partial index — avoids scanning historical rows when only current state is needed.
 CREATE_DIM_ENTITIES_CURRENT_IDX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_dim_entities_current
-    ON dim_entities (entity_id)
+    ON entities (entity_id)
     WHERE valid_to IS NULL;
 """
 
 CREATE_DIM_DEVICES_IDX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_dim_devices_device_time
-    ON dim_devices (device_id, valid_from DESC);
+    ON devices (device_id, valid_from DESC);
 """
 
 CREATE_DIM_AREAS_IDX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_dim_areas_area_time
-    ON dim_areas (area_id, valid_from DESC);
+CREATE INDEX IF NOT EXISTS idx_areas_area_time
+    ON areas (area_id, valid_from DESC);
 """
 
 CREATE_DIM_LABELS_IDX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_dim_labels_label_time
-    ON dim_labels (label_id, valid_from DESC);
+    ON labels (label_id, valid_from DESC);
 """
 
 # SCD2 close-and-insert SQL.
@@ -208,25 +208,25 @@ CREATE INDEX IF NOT EXISTS idx_dim_labels_label_time
 # Close (expire) the currently-open row for an entity.
 # %s = valid_to timestamp, %s = entity_id.
 SCD2_CLOSE_ENTITY_SQL = """
-UPDATE dim_entities
+UPDATE entities
 SET valid_to = %s
 WHERE entity_id = %s AND valid_to IS NULL;
 """
 
 SCD2_CLOSE_DEVICE_SQL = """
-UPDATE dim_devices
+UPDATE devices
 SET valid_to = %s
 WHERE device_id = %s AND valid_to IS NULL;
 """
 
 SCD2_CLOSE_AREA_SQL = """
-UPDATE dim_areas
+UPDATE areas
 SET valid_to = %s
 WHERE area_id = %s AND valid_to IS NULL;
 """
 
 SCD2_CLOSE_LABEL_SQL = """
-UPDATE dim_labels
+UPDATE labels
 SET valid_to = %s
 WHERE label_id = %s AND valid_to IS NULL;
 """
@@ -239,12 +239,12 @@ WHERE label_id = %s AND valid_to IS NULL;
 # %s=unit_of_measurement, %s=disabled_by, %s=valid_from, %s=extra
 # NOTE: first positional param (%s for entity_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_ENTITY_SQL = """
-INSERT INTO dim_entities
+INSERT INTO entities
     (entity_id, ha_entity_uuid, name, domain, platform, device_id, area_id,
      labels, device_class, unit_of_measurement, disabled_by, valid_from, valid_to, extra)
 SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_entities WHERE entity_id = %s AND valid_to IS NULL
+    SELECT 1 FROM entities WHERE entity_id = %s AND valid_to IS NULL
 );
 """
 
@@ -252,33 +252,33 @@ WHERE NOT EXISTS (
 # %s=area_id, %s=labels, %s=valid_from, %s=extra
 # NOTE: first positional param (%s for device_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_DEVICE_SQL = """
-INSERT INTO dim_devices
+INSERT INTO devices
     (device_id, name, manufacturer, model, area_id, labels, valid_from, valid_to, extra)
 SELECT %s, %s, %s, %s, %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_devices WHERE device_id = %s AND valid_to IS NULL
+    SELECT 1 FROM devices WHERE device_id = %s AND valid_to IS NULL
 );
 """
 
 # %s=area_id, %s=name, %s=valid_from, %s=extra
 # NOTE: first positional param (%s for area_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_AREA_SQL = """
-INSERT INTO dim_areas
+INSERT INTO areas
     (area_id, name, valid_from, valid_to, extra)
 SELECT %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_areas WHERE area_id = %s AND valid_to IS NULL
+    SELECT 1 FROM areas WHERE area_id = %s AND valid_to IS NULL
 );
 """
 
 # %s=label_id, %s=name, %s=color, %s=valid_from, %s=extra
 # NOTE: first positional param (%s for label_id) appears TWICE — once in SELECT, once in WHERE NOT EXISTS subquery.
 SCD2_SNAPSHOT_LABEL_SQL = """
-INSERT INTO dim_labels
+INSERT INTO labels
     (label_id, name, color, valid_from, valid_to, extra)
 SELECT %s, %s, %s, %s, NULL, %s
 WHERE NOT EXISTS (
-    SELECT 1 FROM dim_labels WHERE label_id = %s AND valid_to IS NULL
+    SELECT 1 FROM labels WHERE label_id = %s AND valid_to IS NULL
 );
 """
 
@@ -286,26 +286,26 @@ WHERE NOT EXISTS (
 # (incremental updates after snapshot; the close step runs first).
 # Parameters match snapshot SQL but without the WHERE NOT EXISTS guard.
 SCD2_INSERT_ENTITY_SQL = """
-INSERT INTO dim_entities
+INSERT INTO entities
     (entity_id, ha_entity_uuid, name, domain, platform, device_id, area_id,
      labels, device_class, unit_of_measurement, disabled_by, valid_from, valid_to, extra)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s);
 """
 
 SCD2_INSERT_DEVICE_SQL = """
-INSERT INTO dim_devices
+INSERT INTO devices
     (device_id, name, manufacturer, model, area_id, labels, valid_from, valid_to, extra)
 VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s);
 """
 
 SCD2_INSERT_AREA_SQL = """
-INSERT INTO dim_areas
+INSERT INTO areas
     (area_id, name, valid_from, valid_to, extra)
 VALUES (%s, %s, %s, NULL, %s);
 """
 
 SCD2_INSERT_LABEL_SQL = """
-INSERT INTO dim_labels
+INSERT INTO labels
     (label_id, name, color, valid_from, valid_to, extra)
 VALUES (%s, %s, %s, %s, NULL, %s);
 """
@@ -313,13 +313,13 @@ VALUES (%s, %s, %s, %s, NULL, %s);
 # D-08-d step 4: watermark read (orchestrator → states worker connection).
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
 
-# D-08-f: all-known entities reader — dim_entities (all rows, incl. removed)
-# unioned with all entity_ids ever written to ha_states.
-# GROUP BY on the ha_states branch forces the planner to use the
-# idx_ha_states_entity_time index before the UNION deduplication step.
+# D-08-f: all-known entities reader — entities (all rows, incl. removed)
+# unioned with all entity_ids ever written to states.
+# GROUP BY on the states branch forces the planner to use the
+# idx_states_entity_time index before the UNION deduplication step.
 # Plain UNION without pre-grouping causes a full hypertable scan (~27 s).
 SELECT_ALL_KNOWN_ENTITIES_SQL = (
-    "SELECT entity_id FROM dim_entities"
+    "SELECT entity_id FROM entities"
     " UNION"
     f" SELECT DISTINCT entity_id FROM {TABLE_NAME}"
 )
@@ -330,18 +330,18 @@ SELECT_ALL_KNOWN_ENTITIES_SQL = (
 SELECT_ENTITY_CURRENT_SQL = (
     "SELECT name, platform, device_id, area_id, labels, device_class,"
     " unit_of_measurement, disabled_by, extra"
-    " FROM dim_entities WHERE entity_id = %s AND valid_to IS NULL"
+    " FROM entities WHERE entity_id = %s AND valid_to IS NULL"
 )
 
 SELECT_DEVICE_CURRENT_SQL = (
     "SELECT name, manufacturer, model, area_id, labels, extra"
-    " FROM dim_devices WHERE device_id = %s AND valid_to IS NULL"
+    " FROM devices WHERE device_id = %s AND valid_to IS NULL"
 )
 
 SELECT_AREA_CURRENT_SQL = (
-    "SELECT name, extra FROM dim_areas WHERE area_id = %s AND valid_to IS NULL"
+    "SELECT name, extra FROM areas WHERE area_id = %s AND valid_to IS NULL"
 )
 
 SELECT_LABEL_CURRENT_SQL = (
-    "SELECT name, color, extra FROM dim_labels WHERE label_id = %s AND valid_to IS NULL"
+    "SELECT name, color, extra FROM labels WHERE label_id = %s AND valid_to IS NULL"
 )

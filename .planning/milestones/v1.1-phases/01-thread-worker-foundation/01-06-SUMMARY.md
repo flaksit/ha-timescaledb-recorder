@@ -16,8 +16,8 @@ dependency_graph:
     - integration entry point with full lifecycle wiring
     - rollback guard on partial setup failure
   affects:
-    - custom_components/ha_timescaledb_recorder/__init__.py
-    - custom_components/ha_timescaledb_recorder/manifest.json
+    - custom_components/timescaledb_recorder/__init__.py
+    - custom_components/timescaledb_recorder/manifest.json
 tech_stack:
   added:
     - psycopg[binary]==3.3.3 declared in manifest.json (replaces asyncpg==0.31.0)
@@ -28,8 +28,8 @@ tech_stack:
     - WATCH-02: ingester.stop() (sync) then syncer/worker async_stop() in unload
 key_files:
   modified:
-    - custom_components/ha_timescaledb_recorder/__init__.py
-    - custom_components/ha_timescaledb_recorder/manifest.json
+    - custom_components/timescaledb_recorder/__init__.py
+    - custom_components/timescaledb_recorder/manifest.json
 decisions:
   - "Two-phase construction order: syncer(hass) → worker(syncer) → bind_queue() → ingester(queue) — worker needs syncer for SCD2 change-detection; syncer needs worker.queue for enqueuing"
   - "Rollback uses nested try/except; outer except handles ingester.async_start() failure, inner handles syncer.async_start() failure; worker.async_stop() may be called twice in syncer-failure path but that is safe (second join() returns immediately)"
@@ -50,7 +50,7 @@ metrics:
 
 `__init__.py` was rewritten to wire the three components built in plans 03, 04, 05:
 
-- `HaTimescaleDBData` dataclass now holds `worker: DbWorker`, `ingester: StateIngester`, `syncer: MetadataSyncer` — the `pool: asyncpg.Pool` field is gone
+- `TimescaledbRecorderData` dataclass now holds `worker: DbWorker`, `ingester: StateIngester`, `syncer: MetadataSyncer` — the `pool: asyncpg.Pool` field is gone
 - `async_setup_entry` follows D-01: no DB calls, returns True immediately; worker thread starts in the background
 - Two-phase construction: syncer created first (no queue), worker created with syncer reference, `syncer.bind_queue(worker.queue)` wires the shared queue via public API
 - Rollback guard: nested try/except stops all started components in reverse order if any step raises after `worker.start()`
@@ -80,8 +80,8 @@ No new security surface introduced beyond what the plan's threat model covers. A
 
 ## Self-Check: PASSED
 
-- [x] `custom_components/ha_timescaledb_recorder/__init__.py` exists and has no `asyncpg`, no `async_setup_schema`
-- [x] `custom_components/ha_timescaledb_recorder/manifest.json` requires `psycopg[binary]==3.3.3`, version `1.1.0`
+- [x] `custom_components/timescaledb_recorder/__init__.py` exists and has no `asyncpg`, no `async_setup_schema`
+- [x] `custom_components/timescaledb_recorder/manifest.json` requires `psycopg[binary]==3.3.3`, version `1.1.0`
 - [x] Commit `5a66a96` exists: `feat(01-06): wire DbWorker/StateIngester/MetadataSyncer lifecycle in __init__.py`
 - [x] Verification script: PASS
 - [x] Overall verification: OK

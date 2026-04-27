@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder import const
-from custom_components.ha_timescaledb_recorder.retry import (
+from custom_components.timescaledb_recorder import const
+from custom_components.timescaledb_recorder.retry import (
     _BACKOFF_SCHEDULE,
     retry_until_success,
 )
@@ -253,7 +253,7 @@ def test_on_sustained_fail_fires_once_when_duration_exceeded():
     fn_impl = _FailNTimesThenSucceed(n=3, value="ok")
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.retry.time.monotonic",
+        "custom_components.timescaledb_recorder.retry.time.monotonic",
         side_effect=monotonic_values,
     ):
         @retry_until_success(
@@ -283,7 +283,7 @@ def test_on_sustained_fail_not_called_twice_in_same_streak():
     fn_impl = _FailNTimesThenSucceed(n=5, value="ok")
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.retry.time.monotonic",
+        "custom_components.timescaledb_recorder.retry.time.monotonic",
         side_effect=monotonic_values,
     ):
         @retry_until_success(
@@ -326,7 +326,7 @@ def test_on_sustained_fail_resets_after_success():
     )
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.retry.time.monotonic",
+        "custom_components.timescaledb_recorder.retry.time.monotonic",
         side_effect=monotonic_side_effect,
     ):
         @retry_until_success(
@@ -369,7 +369,7 @@ def test_on_transient_none_is_ok():
 def test_stall_threshold_default_imports_from_const():
     """stall_threshold defaults to STALL_THRESHOLD (5) from const.py."""
     import inspect
-    from custom_components.ha_timescaledb_recorder.retry import retry_until_success
+    from custom_components.timescaledb_recorder.retry import retry_until_success
 
     sig = inspect.signature(retry_until_success)
     default = sig.parameters["stall_threshold"].default
@@ -407,7 +407,7 @@ def test_on_sustained_fail_hook_exception_logged_and_swallowed():
     fn_impl = _FailNTimesThenSucceed(n=2, value="ok")
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.retry.time.monotonic",
+        "custom_components.timescaledb_recorder.retry.time.monotonic",
         side_effect=monotonic_values,
     ):
         @retry_until_success(
@@ -474,7 +474,7 @@ def test_on_sustained_fail_uses_monotonic_not_wall_clock():
     fn_exceeds = _FailNTimesThenSucceed(n=2, value="ok")
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.retry.time.monotonic",
+        "custom_components.timescaledb_recorder.retry.time.monotonic",
         side_effect=monotonic_exceeds,
     ):
         @retry_until_success(
@@ -497,7 +497,7 @@ def test_on_sustained_fail_uses_monotonic_not_wall_clock():
     fn_under = _FailNTimesThenSucceed(n=2, value="ok")
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.retry.time.monotonic",
+        "custom_components.timescaledb_recorder.retry.time.monotonic",
         side_effect=monotonic_under,
     ):
         @retry_until_success(

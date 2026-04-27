@@ -23,7 +23,7 @@ Decision: option (a) with further refinement — orchestrator on event loop, ONL
 
 ### Entity set for backfill
 
-Options: (a) live entity_registry filtered; (b) dim_entities open rows; (c) union of both.
+Options: (a) live entity_registry filtered; (b) entities open rows; (c) union of both.
 
 Decision: (c) union — captures live tracked entities plus entities removed from HA during outage.
 
@@ -31,13 +31,13 @@ Decision: (c) union — captures live tracked entities plus entities removed fro
 
 Initial proposal: BackfillChunk(rows, slice_end_ts, done_fut) passed through queue with orchestrator awaiting done_fut for backpressure.
 
-User challenged: `ha_states` has no UNIQUE constraint; `ON CONFLICT` would fail. Claude verified — `const.py` shows only non-unique `idx_ha_states_entity_time`. Two paths: add UNIQUE INDEX or rely on tight watermark math. User pushed further: "if backfill intermixed in buffer with live events and we crash mid-backfill, gap will never be discovered."
+User challenged: `states` has no UNIQUE constraint; `ON CONFLICT` would fail. Claude verified — `const.py` shows only non-unique `idx_states_entity_time`. Two paths: add UNIQUE INDEX or rely on tight watermark math. User pushed further: "if backfill intermixed in buffer with live events and we crash mid-backfill, gap will never be discovered."
 
 Claude walked through the crash-gap scenario confirming the silent-gap hole. Proposed solution: `recorder_meta` table with `backfill_watermark` updated in same transaction as INSERT.
 
 User sharpened two points:
 - "_fetch_and_build_slice never yields" — holds recorder pool thread for full slice duration; all chunks held in memory. Not acceptable for first-install or large gaps.
-- "watermark will be max(ha_states.last_updated) anyway" — atomic watermark update adds no value over MAX query.
+- "watermark will be max(states.last_updated) anyway" — atomic watermark update adds no value over MAX query.
 
 Claude redesigned: streaming slices (one at a time with await between); drop recorder_meta; rely on MAX query. Late-arrival hole still open. Proposed UNIQUE INDEX + ON CONFLICT DO NOTHING as belt-and-suspenders.
 
@@ -165,7 +165,7 @@ Decision: `_flush` plain-loops in INSERT_CHUNK_SIZE=200 sub-batches; `_insert_ch
 
 Decision: `hass.config.path(DOMAIN, "metadata_queue.jsonl")`.
 
-User noted: integration module should be renamed `ha_timescaledb_recorder` → `timescaledb_recorder` (ha_ prefix belongs only on GitHub repo slug). Breaking change for existing config entries. Bundled as separate Phase 2.5 chore.
+User noted: integration module should be renamed `timescaledb_recorder` → `timescaledb_recorder` (ha_ prefix belongs only on GitHub repo slug). Breaking change for existing config entries. Bundled as separate Phase 2.5 chore.
 
 ### Initial registry backfill
 
@@ -197,7 +197,7 @@ User decision: NOT needed. PersistentQueue ensures no meta event loss during out
 ## Claude's Discretion
 
 - Module naming: `overflow_queue.py`, `persistent_queue.py`, `issues.py`, `backfill.py`, `retry.py`.
-- StateRow.from_ha_state helper signature.
+- StateRow.from_state helper signature.
 - JSON dict schema for persistent metadata queue items.
 - Notification retry-count threshold (N=5 suggested).
 - Initial registry backfill iteration order (areas → labels → entities → devices suggested to match FK-like dependencies).

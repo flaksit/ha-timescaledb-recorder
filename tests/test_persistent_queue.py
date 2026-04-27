@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.persistent_queue import PersistentQueue
+from custom_components.timescaledb_recorder.persistent_queue import PersistentQueue
 
 
 def test_put_get_task_done_roundtrip(tmp_path):

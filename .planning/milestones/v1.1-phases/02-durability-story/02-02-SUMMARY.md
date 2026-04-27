@@ -25,9 +25,9 @@ tech-stack:
 
 key-files:
   created:
-    - custom_components/ha_timescaledb_recorder/issues.py
+    - custom_components/timescaledb_recorder/issues.py
   modified:
-    - custom_components/ha_timescaledb_recorder/strings.json
+    - custom_components/timescaledb_recorder/strings.json
 
 key-decisions:
   - "Module named issues.py (plural) per D-10-a — matches HA convention"
@@ -73,8 +73,8 @@ Each task was committed atomically:
 
 ## Files Created/Modified
 
-- `custom_components/ha_timescaledb_recorder/issues.py` - New module; two public helpers delegating to `ir.async_create_issue` / `ir.async_delete_issue`; `_BUFFER_DROPPING_ISSUE_ID = "buffer_dropping"` constant ties the module to the strings.json key
-- `custom_components/ha_timescaledb_recorder/strings.json` - New top-level `"issues"` key appended after `"options"` with `buffer_dropping` title + description; existing `config` and `options` sections unchanged
+- `custom_components/timescaledb_recorder/issues.py` - New module; two public helpers delegating to `ir.async_create_issue` / `ir.async_delete_issue`; `_BUFFER_DROPPING_ISSUE_ID = "buffer_dropping"` constant ties the module to the strings.json key
+- `custom_components/timescaledb_recorder/strings.json` - New top-level `"issues"` key appended after `"options"` with `buffer_dropping` title + description; existing `config` and `options` sections unchanged
 
 ## Decisions Made
 
@@ -105,8 +105,8 @@ None — `issues.py` introduces no new network surface, auth paths, file access,
 
 ## Self-Check: PASSED
 
-- `custom_components/ha_timescaledb_recorder/issues.py` exists: FOUND
-- `custom_components/ha_timescaledb_recorder/strings.json` has `"issues"` key: FOUND
+- `custom_components/timescaledb_recorder/issues.py` exists: FOUND
+- `custom_components/timescaledb_recorder/strings.json` has `"issues"` key: FOUND
 - Commit `9ed1e00` exists: FOUND
 - Commit `f16fa3b` exists: FOUND
 

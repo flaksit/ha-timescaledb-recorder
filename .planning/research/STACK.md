@@ -85,7 +85,7 @@ Note: `psycopg[binary]` installs both `psycopg==3.3.3` and `psycopg-binary==3.3.
 
 These are behavioural differences from asyncpg that affect the migration:
 
-**JSONB columns (e.g. `attributes`, `context` in `ha_states`):**
+**JSONB columns (e.g. `attributes`, `context` in `states`):**
 psycopg3 does NOT auto-adapt Python dicts to JSONB. Explicit wrapper required:
 ```python
 from psycopg.types.json import Jsonb

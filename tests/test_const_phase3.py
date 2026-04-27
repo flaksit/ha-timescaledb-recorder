@@ -2,7 +2,7 @@
 
 
 def test_phase3_constants_importable():
-    from custom_components.ha_timescaledb_recorder.const import (
+    from custom_components.timescaledb_recorder.const import (
         STALL_THRESHOLD,
         WATCHDOG_INTERVAL_S,
         DB_UNREACHABLE_THRESHOLD_SECONDS,
@@ -17,7 +17,7 @@ def test_phase3_constants_importable():
 
 def test_phase2_constants_unchanged():
     """Regression guard — Phase 2 constants must retain their exact values."""
-    from custom_components.ha_timescaledb_recorder.const import (
+    from custom_components.timescaledb_recorder.const import (
         BATCH_FLUSH_SIZE,
         INSERT_CHUNK_SIZE,
         FLUSH_INTERVAL,

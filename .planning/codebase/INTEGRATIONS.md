@@ -30,15 +30,15 @@ focus: tech
   - Pool usage: acquired per-operation with `async with pool.acquire() as conn`; `pool.expire_connections()` called on `PostgresConnectionError` to force reconnect
 
 **Tables created by the integration (all DDL is idempotent via `IF NOT EXISTS`):**
-- `ha_states` — TimescaleDB hypertable; fact table for state history
+- `states` — TimescaleDB hypertable; fact table for state history
   - Columns: `last_updated TIMESTAMPTZ`, `last_changed TIMESTAMPTZ`, `entity_id TEXT`, `state TEXT`, `attributes JSONB`
   - Hypertable chunk interval: configurable (default 7 days)
   - Compression: enabled, segmented by `entity_id`, ordered by `last_updated DESC`; default compress after 2 hours
-  - Index: `idx_ha_states_entity_time ON ha_states (entity_id, last_updated DESC)`
-- `dim_entities` — SCD2 dimension table for entity registry metadata
-- `dim_devices` — SCD2 dimension table for device registry metadata
-- `dim_areas` — SCD2 dimension table for area registry metadata
-- `dim_labels` — SCD2 dimension table for label registry metadata
+  - Index: `idx_states_entity_time ON states (entity_id, last_updated DESC)`
+- `entities` — SCD2 dimension table for entity registry metadata
+- `devices` — SCD2 dimension table for device registry metadata
+- `areas` — SCD2 dimension table for area registry metadata
+- `labels` — SCD2 dimension table for label registry metadata
 
 **File Storage:**
 - Local filesystem only — no external object storage
@@ -58,7 +58,7 @@ focus: tech
 - None — no Sentry or similar external service
 
 **Logs:**
-- Standard Python `logging` module; logger name `custom_components.ha_timescaledb_recorder` (via `logging.getLogger(__name__)` in each module)
+- Standard Python `logging` module; logger name `custom_components.timescaledb_recorder` (via `logging.getLogger(__name__)` in each module)
 - Log levels used: `DEBUG` for skip/no-op events, `WARNING` for connection errors with row counts, `ERROR` for `PostgresError` batch drops
 
 ## CI/CD & Deployment

@@ -27,8 +27,8 @@ tech_stack:
 key_files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/backfill.py
-    - custom_components/ha_timescaledb_recorder/states_worker.py
+    - custom_components/timescaledb_recorder/backfill.py
+    - custom_components/timescaledb_recorder/states_worker.py
     - tests/test_backfill.py
     - tests/test_states_worker.py
 decisions:
@@ -56,9 +56,9 @@ Extends the backfill orchestrator with recorder-retention gap detection (None-sa
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
 | 1 (RED) | states_worker read_watermark retry — failing tests | 5a0cbab | tests/test_states_worker.py |
-| 1 (GREEN) | retry-wrap read_watermark on states_worker | e16c4bd | custom_components/ha_timescaledb_recorder/states_worker.py, tests/test_states_worker.py |
+| 1 (GREEN) | retry-wrap read_watermark on states_worker | e16c4bd | custom_components/timescaledb_recorder/states_worker.py, tests/test_states_worker.py |
 | 2 (RED) | backfill gap detection + retry — failing tests | 422d0ff | tests/test_backfill.py |
-| 2 (GREEN) | backfill gap detection + retry-wrap _fetch_slice_raw | 6cee1a3 | custom_components/ha_timescaledb_recorder/backfill.py, tests/test_backfill.py |
+| 2 (GREEN) | backfill gap detection + retry-wrap _fetch_slice_raw | 6cee1a3 | custom_components/timescaledb_recorder/backfill.py, tests/test_backfill.py |
 
 ## backfill_orchestrator Signature Changes
 
@@ -206,8 +206,8 @@ None — all code paths are fully implemented. `notify_backfill_gap` is called w
 ## Self-Check: PASSED
 
 Files exist:
-- custom_components/ha_timescaledb_recorder/backfill.py — FOUND (notify_backfill_gap, retry_until_success, threading_stop_event, fetch_slice, gap detection block)
-- custom_components/ha_timescaledb_recorder/states_worker.py — FOUND (_read_watermark_raw, self.read_watermark = retry_until_success)
+- custom_components/timescaledb_recorder/backfill.py — FOUND (notify_backfill_gap, retry_until_success, threading_stop_event, fetch_slice, gap detection block)
+- custom_components/timescaledb_recorder/states_worker.py — FOUND (_read_watermark_raw, self.read_watermark = retry_until_success)
 - tests/test_backfill.py — FOUND (10 test functions including 7 new)
 - tests/test_states_worker.py — FOUND (23 test functions including 3 new)
 

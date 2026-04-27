@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.watchdog import (
+from custom_components.timescaledb_recorder.watchdog import (
     spawn_meta_worker,
     spawn_states_worker,
     watchdog_loop,
@@ -40,9 +40,9 @@ from custom_components.ha_timescaledb_recorder.watchdog import (
 
 @dataclass
 class _MockRuntime:
-    """Minimal HaTimescaleDBData stand-in for watchdog tests.
+    """Minimal TimescaledbRecorderData stand-in for watchdog tests.
 
-    Real HaTimescaleDBData will be extended in Plan 07 with dsn, chunk_interval_days,
+    Real TimescaledbRecorderData will be extended in Plan 07 with dsn, chunk_interval_days,
     compress_after_hours, etc. Tests here use this dataclass to avoid depending
     on Plan 07 work landing first.
     """
@@ -132,12 +132,12 @@ async def test_watchdog_no_action_when_both_workers_alive():
     )
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.watchdog.notify_watchdog_recovery"
     ) as mock_notify, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.asyncio.sleep",
+        "custom_components.timescaledb_recorder.watchdog.asyncio.sleep",
         new_callable=AsyncMock,
     ) as mock_sleep:
         # Allow one poll cycle then signal stop
@@ -188,15 +188,15 @@ async def test_watchdog_respawns_dead_states_worker():
     mock_spawn = MagicMock(return_value=new_thread)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.spawn_states_worker",
+        "custom_components.timescaledb_recorder.watchdog.spawn_states_worker",
         mock_spawn,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.watchdog.notify_watchdog_recovery"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.asyncio.sleep",
+        "custom_components.timescaledb_recorder.watchdog.asyncio.sleep",
         new_callable=AsyncMock,
     ):
         call_count = 0
@@ -236,15 +236,15 @@ async def test_watchdog_respawns_dead_meta_worker():
     mock_spawn = MagicMock(return_value=new_thread)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.spawn_meta_worker",
+        "custom_components.timescaledb_recorder.watchdog.spawn_meta_worker",
         mock_spawn,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.watchdog.notify_watchdog_recovery"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.asyncio.sleep",
+        "custom_components.timescaledb_recorder.watchdog.asyncio.sleep",
         new_callable=AsyncMock,
     ):
         call_count = 0
@@ -282,15 +282,15 @@ async def test_watchdog_fires_notify_with_last_exception_and_context():
     mock_spawn = MagicMock(return_value=new_thread)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.spawn_states_worker",
+        "custom_components.timescaledb_recorder.watchdog.spawn_states_worker",
         mock_spawn,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.watchdog.notify_watchdog_recovery"
     ) as mock_notify, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.asyncio.sleep",
+        "custom_components.timescaledb_recorder.watchdog.asyncio.sleep",
         new_callable=AsyncMock,
     ):
         call_count = 0
@@ -347,16 +347,16 @@ async def test_watchdog_sleeps_5s_before_respawn():
     new_thread.start = _mock_start
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.spawn_states_worker",
+        "custom_components.timescaledb_recorder.watchdog.spawn_states_worker",
         mock_spawn,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.notify_watchdog_recovery",
+        "custom_components.timescaledb_recorder.watchdog.notify_watchdog_recovery",
         side_effect=_mock_notify,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.asyncio.sleep",
+        "custom_components.timescaledb_recorder.watchdog.asyncio.sleep",
         side_effect=_mock_sleep,
     ):
         call_count = 0
@@ -401,12 +401,12 @@ async def test_watchdog_skips_respawn_when_stop_event_set():
     )
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.watchdog.notify_watchdog_recovery"
     ) as mock_notify, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.asyncio.sleep",
+        "custom_components.timescaledb_recorder.watchdog.asyncio.sleep",
         new_callable=AsyncMock,
     ) as mock_sleep:
         call_count = 0
@@ -455,15 +455,15 @@ async def test_watchdog_defensive_none_exc_and_missing_context():
     mock_spawn = MagicMock(return_value=new_thread)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.spawn_states_worker",
+        "custom_components.timescaledb_recorder.watchdog.spawn_states_worker",
         mock_spawn,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.notify_watchdog_recovery"
+        "custom_components.timescaledb_recorder.watchdog.notify_watchdog_recovery"
     ) as mock_notify, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.asyncio.sleep",
+        "custom_components.timescaledb_recorder.watchdog.asyncio.sleep",
         new_callable=AsyncMock,
     ):
         call_count = 0
@@ -516,7 +516,7 @@ async def test_watchdog_poll_body_exception_does_not_kill_loop():
     cycles_after_error = 0
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ):
         call_count = 0
@@ -560,7 +560,7 @@ async def test_watchdog_polls_cadence_interruptible_by_loop_stop_event():
     poll_count = 0
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
+        "custom_components.timescaledb_recorder.watchdog.WATCHDOG_INTERVAL_S",
         0.01,
     ):
         call_count = 0
@@ -607,7 +607,7 @@ def test_spawn_states_worker_uses_runtime_fields():
     )
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.watchdog.TimescaledbStateRecorderThread"
     ) as MockThread:
         mock_instance = MagicMock()
         MockThread.return_value = mock_instance
@@ -645,7 +645,7 @@ def test_spawn_meta_worker_uses_runtime_fields():
     )
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.watchdog.TimescaledbMetaRecorderThread"
     ) as MockThread:
         mock_instance = MagicMock()
         MockThread.return_value = mock_instance
@@ -674,9 +674,9 @@ def test_spawn_factories_do_not_start_thread():
     )
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.TimescaledbStateRecorderThread"
+        "custom_components.timescaledb_recorder.watchdog.TimescaledbStateRecorderThread"
     ) as MockStates, patch(
-        "custom_components.ha_timescaledb_recorder.watchdog.TimescaledbMetaRecorderThread"
+        "custom_components.timescaledb_recorder.watchdog.TimescaledbMetaRecorderThread"
     ) as MockMeta:
         mock_states_instance = MagicMock()
         mock_meta_instance = MagicMock()

@@ -28,7 +28,7 @@ tech-stack:
 key-files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/syncer.py
+    - custom_components/timescaledb_recorder/syncer.py
 
 key-decisions:
   - "bind_queue() preferred over direct _queue attribute mutation for stable public API"
@@ -78,7 +78,7 @@ completed: 2026-04-19
 
 ## Files Created/Modified
 
-- `custom_components/ha_timescaledb_recorder/syncer.py` — Complete rewrite: asyncpg removed, MetaCommand enqueue pattern, sync change-detection helpers, bind_queue() API, snapshot-before-listeners ordering
+- `custom_components/timescaledb_recorder/syncer.py` — Complete rewrite: asyncpg removed, MetaCommand enqueue pattern, sync change-detection helpers, bind_queue() API, snapshot-before-listeners ordering
 
 ## Decisions Made
 
@@ -95,7 +95,7 @@ completed: 2026-04-19
 - **Found during:** Task 1 + 2 verification
 - **Issue:** The plan's automated `python3 -c` verification checks use broad string matching (`if 'asyncpg' in src`) which matched comment text, not just imports. Two comments contained the words "asyncpg" and "fetchrow" as historical context. The checks failed even though no actual asyncpg import or fetchrow call existed.
 - **Fix:** Rewrote those two comments to describe the behavior without mentioning the old API names. The functional correctness is unchanged.
-- **Files modified:** `custom_components/ha_timescaledb_recorder/syncer.py`
+- **Files modified:** `custom_components/timescaledb_recorder/syncer.py`
 - **Verification:** All six automated checks pass; `grep -c 'fetchrow\|async_create_task\|asyncpg'` returns 0
 - **Committed in:** `dc79521` (same task commit)
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Backfill gaps in ha_states (TimescaleDB) from Home Assistant's SQLite recorder.
+"""Backfill gaps in states (TimescaleDB) from Home Assistant's SQLite recorder.
 
 From the HA host terminal (SSH addon):
 
     docker exec homeassistant python3 \
-        /config/custom_components/ha_timescaledb_recorder/backfill_gaps.py
+        /config/custom_components/timescaledb_recorder/backfill_gaps.py
 
 No arguments needed — auto-detects SQLite path (/config/home-assistant_v2.db)
-and reads the DSN from the ha_timescaledb_recorder integration config.
+and reads the DSN from the timescaledb_recorder integration config.
 
 Requires psycopg[binary] — already present in the HA container once the
-ha_timescaledb_recorder integration is installed.
+timescaledb_recorder integration is installed.
 
 Safe to run while HA is running — SQLite is opened read-only. Re-running is safe:
 (entity_id, last_updated) fingerprint comparison skips rows already in TimescaleDB.
@@ -48,28 +48,28 @@ from typing import Any
 import psycopg  # pyright: ignore[reportMissingImports]
 from psycopg.types.json import Jsonb  # pyright: ignore[reportMissingImports]
 
-# ha_states has no unique constraint; deduplication handled by fingerprint
+# states has no unique constraint; deduplication handled by fingerprint
 # comparison before this INSERT runs. Placeholders are %s (psycopg3 style).
 INSERT_SQL = """
-INSERT INTO ha_states (entity_id, state, attributes, last_updated, last_changed)
+INSERT INTO states (entity_id, state, attributes, last_updated, last_changed)
 VALUES (%s, %s, %s, %s, %s)
 """
 
 PG_COUNT_SQL = """
-SELECT COUNT(*) FROM ha_states
+SELECT COUNT(*) FROM states
 WHERE last_updated >= %s AND last_updated < %s
 """
 
 # Filtered count — only used when --entities is set and full counts differ.
 PG_COUNT_FILTERED_SQL = """
-SELECT COUNT(*) FROM ha_states
+SELECT COUNT(*) FROM states
 WHERE last_updated >= %s AND last_updated < %s
   AND entity_id = ANY(%s::text[])
 """
 
 PG_FINGERPRINT_SQL = """
 SELECT entity_id, last_updated
-FROM ha_states
+FROM states
 WHERE last_updated >= %s AND last_updated < %s
   AND entity_id = ANY(%s::text[])
 """
@@ -158,7 +158,7 @@ def _parse_end_exclusive(s: str) -> datetime:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Backfill gaps in ha_states (TimescaleDB) from Home Assistant's "
+            "Backfill gaps in states (TimescaleDB) from Home Assistant's "
             "SQLite recorder database."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -259,7 +259,7 @@ def build_missing_rows(
 ) -> list[tuple[Any, ...]]:
     """Return rows present in SQLite but absent from TimescaleDB.
 
-    NULL shared_attrs → insert NULL attributes (ha_states.attributes is nullable).
+    NULL shared_attrs → insert NULL attributes (states.attributes is nullable).
     Non-null shared_attrs → wrap in Jsonb() as required by psycopg3 for JSONB columns.
     """
     missing: list[tuple[Any, ...]] = []
@@ -298,7 +298,7 @@ def insert_batches(
 
 _DEFAULT_SQLITE = "/config/home-assistant_v2.db"
 _HA_CONFIG_ENTRIES = "/config/.storage/core.config_entries"
-_HA_DOMAIN = "ha_timescaledb_recorder"
+_HA_DOMAIN = "timescaledb_recorder"
 
 
 def _detect_pg_dsn() -> str:
@@ -418,8 +418,8 @@ def main() -> None:
         )
 
         if total_inserted > 0 and not args.dry_run:
-            print("Running ANALYZE ha_states …", end="", flush=True)
-            pg_conn.execute("ANALYZE ha_states")
+            print("Running ANALYZE states …", end="", flush=True)
+            pg_conn.execute("ANALYZE states")
             print(" done.")
 
 

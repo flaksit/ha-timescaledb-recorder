@@ -31,7 +31,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 
 ### Manual
 
-1. Copy the `custom_components/ha_timescaledb_recorder/` directory into your HA config's `custom_components/` folder
+1. Copy the `custom_components/timescaledb_recorder/` directory into your HA config's `custom_components/` folder
 2. Restart Home Assistant
 
 ## Configuration
@@ -64,7 +64,7 @@ Options take effect immediately — the integration reloads automatically when y
 Entity filtering is configured via `configuration.yaml` and mirrors [HA recorder semantics](https://www.home-assistant.io/integrations/recorder/#configure-filter). Omitting the filter block ingests all entities.
 
 ```yaml
-ha_timescaledb_recorder:
+timescaledb_recorder:
   include:
     domains:
       - sensor
@@ -99,10 +99,10 @@ This re-parses `configuration.yaml` and reloads the integration's config entry. 
 
 ## Schema
 
-The `ha_states` table is created automatically on the first HA start after the integration is installed:
+The `states` table is created automatically on the first HA start after the integration is installed:
 
 ```sql
-CREATE TABLE IF NOT EXISTS ha_states (
+CREATE TABLE IF NOT EXISTS states (
     last_updated  TIMESTAMPTZ NOT NULL,
     last_changed  TIMESTAMPTZ NOT NULL,
     entity_id     TEXT        NOT NULL,
@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS ha_states (
 
 **Compression** — segments by `entity_id`, ordered by `last_updated DESC`. Chunks older than `compress_after_days` (default 7, matching the chunk interval) are compressed automatically by the background policy.
 
-**Index** — `idx_ha_states_entity_time ON ha_states (entity_id, last_updated DESC)` for fast per-entity time-series lookups.
+**Index** — `idx_states_entity_time ON states (entity_id, last_updated DESC)` for fast per-entity time-series lookups.
 
 ## Querying
 
@@ -126,7 +126,7 @@ SELECT DISTINCT ON (entity_id)
     entity_id,
     state,
     last_updated
-FROM ha_states
+FROM states
 ORDER BY entity_id, last_updated DESC;
 ```
 
@@ -134,7 +134,7 @@ ORDER BY entity_id, last_updated DESC;
 
 ```sql
 SELECT last_updated, state::numeric AS value
-FROM ha_states
+FROM states
 WHERE entity_id = 'sensor.living_room_temperature'
   AND last_updated > NOW() - INTERVAL '7 days'
 ORDER BY last_updated;
@@ -149,7 +149,7 @@ SELECT hypertable_name,
        compressed_total_size,
        uncompressed_total_size
 FROM timescaledb_information.chunks
-WHERE hypertable_name = 'ha_states'
+WHERE hypertable_name = 'states'
 ORDER BY range_start DESC;
 ```
 
@@ -158,14 +158,14 @@ ORDER BY range_start DESC;
 ```sql
 SELECT *
 FROM timescaledb_information.compression_settings
-WHERE hypertable_name = 'ha_states';
+WHERE hypertable_name = 'states';
 ```
 
 ## Metadata Sync
 
 In addition to state ingestion, the integration syncs HA registry metadata (entities, devices, areas, labels) to PostgreSQL dimension tables. These tables use **SCD2 (Slowly Changing Dimension Type 2)** temporal tracking, which means every historical version of a registry object is preserved with a time range indicating when it was current.
 
-This enables historically correct joins: for any row in `ha_states`, you can join to the metadata that was current at that exact moment — entity name, area, device, labels, device class, and more.
+This enables historically correct joins: for any row in `states`, you can join to the metadata that was current at that exact moment — entity name, area, device, labels, device class, and more.
 
 ### Dimension tables
 
@@ -173,7 +173,7 @@ All four tables follow the same SCD2 pattern. The current row for any object has
 
 Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`.
 
-#### dim_entities
+#### entities
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -182,8 +182,8 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 | `name` | TEXT | Friendly name |
 | `domain` | TEXT | Domain (e.g. `sensor`, `switch`) |
 | `platform` | TEXT | Integration that provides the entity |
-| `device_id` | TEXT | FK to `dim_devices.device_id` |
-| `area_id` | TEXT | FK to `dim_areas.area_id` |
+| `device_id` | TEXT | FK to `devices.device_id` |
+| `area_id` | TEXT | FK to `areas.area_id` |
 | `labels` | TEXT[] | Array of label IDs |
 | `device_class` | TEXT | Device class (e.g. `temperature`, `power`) |
 | `unit_of_measurement` | TEXT | Unit (e.g. `°C`, `W`) |
@@ -192,7 +192,7 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 | `valid_to` | TIMESTAMPTZ | When this version was superseded (NULL = current) |
 | `extra` | JSONB | Full registry entry serialisation |
 
-#### dim_devices
+#### devices
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -200,13 +200,13 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 | `name` | TEXT | Device name |
 | `manufacturer` | TEXT | Manufacturer |
 | `model` | TEXT | Model |
-| `area_id` | TEXT | FK to `dim_areas.area_id` |
+| `area_id` | TEXT | FK to `areas.area_id` |
 | `labels` | TEXT[] | Array of label IDs |
 | `valid_from` | TIMESTAMPTZ | When this version became current |
 | `valid_to` | TIMESTAMPTZ | When this version was superseded (NULL = current) |
 | `extra` | JSONB | Full registry entry serialisation |
 
-#### dim_areas
+#### areas
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -216,7 +216,7 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 | `valid_to` | TIMESTAMPTZ | When this version was superseded (NULL = current) |
 | `extra` | JSONB | Full registry entry serialisation |
 
-#### dim_labels
+#### labels
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -240,17 +240,17 @@ After the snapshot, the integration subscribes to four HA registry events:
 
 Each event triggers the SCD2 close-and-insert cycle: the current open row is closed (`valid_to = now()`), and a new row is inserted with the updated fields (`valid_from = now()`). Entity renames (entity_id changes) are handled the same way — the old entity_id row closes and a new one opens under the new entity_id.
 
-The dimension tables are created idempotently on every integration startup (same as `ha_states`), so no manual schema migration is needed after updates.
+The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates.
 
 ### Example query: point-in-time metadata join
 
 ```sql
 SELECT s.entity_id, s.state, e.name, e.area_id, a.name AS area_name
-FROM ha_states s
-JOIN dim_entities e ON e.entity_id = s.entity_id
+FROM states s
+JOIN entities e ON e.entity_id = s.entity_id
   AND s.last_updated >= e.valid_from
   AND (e.valid_to IS NULL OR s.last_updated < e.valid_to)
-LEFT JOIN dim_areas a ON a.area_id = e.area_id
+LEFT JOIN areas a ON a.area_id = e.area_id
   AND s.last_updated >= a.valid_from
   AND (a.valid_to IS NULL OR s.last_updated < a.valid_to)
 WHERE s.entity_id = 'sensor.living_room_temperature'
@@ -274,9 +274,9 @@ This integration runs alongside the built-in recorder — it does not replace it
 - Check that the TimescaleDB app is running and shows "Started" in the HA Supervisor panel
 - Confirm the user in the DSN is the `homeassistant` role (has DDL rights) — `homeassistant_rw` cannot create tables
 
-**No data appearing in `ha_states`**
+**No data appearing in `states`**
 
-- Open the HA log viewer and filter for `custom_components.ha_timescaledb_recorder` — any connection errors appear here
+- Open the HA log viewer and filter for `custom_components.timescaledb_recorder` — any connection errors appear here
 - Check your entity filter: if you added an `include` block, only listed domains/entities are written
 - The default `flush_interval` is 10 seconds — wait at least 10 seconds after a state change before querying
 
@@ -293,7 +293,7 @@ From the HA host terminal (SSH addon):
 
 ```bash
 docker exec homeassistant python3 \
-    /config/custom_components/ha_timescaledb_recorder/backfill_gaps.py
+    /config/custom_components/timescaledb_recorder/backfill_gaps.py
 ```
 
 No arguments needed. The script auto-detects the SQLite database path and reads the TimescaleDB DSN from the integration config. `psycopg[binary]` is already present in the HA container once the integration is installed.

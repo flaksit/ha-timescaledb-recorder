@@ -88,7 +88,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         chunk_interval_days: int,
         compress_after_hours: int,
     ) -> None:
-        super().__init__(daemon=True, name="ha_timescaledb_states_worker")
+        super().__init__(daemon=True, name="timescaledb_states_worker")
         self._hass = hass
         self._dsn = dsn
         self._live_queue = live_queue
@@ -185,7 +185,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
             f"TimescaleDB states worker has failed {attempts} times in a row. "
             "The integration will keep retrying. Restart HA if the issue persists.",
             "TimescaleDB Recorder",
-            "ha_timescaledb_recorder_states_stalled",
+            "timescaledb_recorder_states_stalled",
         )
         # New Phase 3 repair issue — auto-clears on recovery.
         self._hass.add_job(create_states_worker_stalled_issue, self._hass)
@@ -391,7 +391,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         for states in slice_dict.values():
             all_states.extend(states)
         all_states.sort(key=lambda s: s.last_updated)
-        return [StateRow.from_ha_state(s) for s in all_states]
+        return [StateRow.from_state(s) for s in all_states]
 
     # ------------------------------------------------------------------
     # Orchestrator-facing reads (D-08-d, D-08-f)
@@ -417,11 +417,11 @@ class TimescaledbStateRecorderThread(threading.Thread):
         return row[0] if row and row[0] is not None else None
 
     def read_all_known_entities(self) -> set[str]:
-        """Return every entity_id ever seen: dim_entities ∪ ha_states.
+        """Return every entity_id ever seen: entities ∪ states.
 
-        No valid_to filter on dim_entities: removed entities still need
+        No valid_to filter on entities: removed entities still need
         backfilling for the period before removal.
-        ha_states uses GROUP BY (not DISTINCT) to force index-based grouping
+        states uses GROUP BY (not DISTINCT) to force index-based grouping
         before the UNION deduplication step — plain UNION causes a full scan.
         """
         conn = self.get_db_connection()

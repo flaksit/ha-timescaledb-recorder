@@ -31,7 +31,7 @@ tech-stack:
 
 key-files:
   created:
-    - custom_components/ha_timescaledb_recorder/persistent_queue.py
+    - custom_components/timescaledb_recorder/persistent_queue.py
   modified: []
 
 key-decisions:
@@ -79,7 +79,7 @@ Each task was committed atomically:
 
 ## Files Created/Modified
 
-- `custom_components/ha_timescaledb_recorder/persistent_queue.py` - PersistentQueue class: file-backed FIFO, JSON-lines, single Condition lock, atomic rewrite on task_done
+- `custom_components/timescaledb_recorder/persistent_queue.py` - PersistentQueue class: file-backed FIFO, JSON-lines, single Condition lock, atomic rewrite on task_done
 
 ## Decisions Made
 
@@ -109,7 +109,7 @@ The file path passed to `PersistentQueue.__init__` comes from `hass.config.path(
 
 ## Self-Check: PASSED
 
-- File exists: FOUND `custom_components/ha_timescaledb_recorder/persistent_queue.py`
+- File exists: FOUND `custom_components/timescaledb_recorder/persistent_queue.py`
 - Commit exists: FOUND `73f612c`
 - Smoke test: PASSED (crash-replay scenario verified)
 - All 10 grep acceptance criteria: PASSED

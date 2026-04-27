@@ -166,7 +166,7 @@ Worker Thread (states/meta)
 ### Recommended Project Structure
 
 ```
-custom_components/ha_timescaledb_recorder/
+custom_components/timescaledb_recorder/
 ├── watchdog.py          # NEW: watchdog_loop coroutine
 ├── notifications.py     # NEW: notify_watchdog_recovery + notify_backfill_gap
 ├── issues.py            # EXTEND: add worker_stalled + db_unreachable + recorder_disabled helpers
@@ -267,7 +267,7 @@ def retry_until_success(
 ```python
 # Source: verified semantics via Python stdlib + asyncio Task docs
 
-async def watchdog_loop(hass: HomeAssistant, runtime: HaTimescaleDBData) -> None:
+async def watchdog_loop(hass: HomeAssistant, runtime: TimescaledbRecorderData) -> None:
     """Async task: detect dead workers, restart, notify. D-05."""
     while not runtime.stop_event.is_set():
         try:
@@ -548,7 +548,7 @@ if oldest_recorder_ts > needed_from:
 
 **How to avoid:** In `async_setup_entry` step 7 (before orchestrator spawn), catch `KeyError` from `recorder.get_instance(hass)` and fire the `recorder_disabled` repair issue. Pass `recorder_instance=None` to the orchestrator and add a guard at the top of the orchestrator that returns early (or awaits indefinitely on `backfill_request`) when `recorder_instance is None`.
 
-**Warning signs:** Rapid notification storm for `orchestrator restarted` with `KeyError` tracebacks, no data in ha_states.
+**Warning signs:** Rapid notification storm for `orchestrator restarted` with `KeyError` tracebacks, no data in states.
 
 [VERIFIED: `get_instance` source code inspection; `hass.data[DATA_INSTANCE]` — no defensive check present]
 
@@ -717,7 +717,7 @@ Claims A1-A3 are LOW risk and based on verified code, but involve behavioral ass
 
 2. **Watchdog factory: `watchdog.py`-owned spawn helpers vs `__init__.py` refactor**
    - What we know: Thread construction requires the same `hass`, `dsn`, `live_queue`, `stop_event`, etc. that are already on `runtime_data`. The watchdog needs to construct a new `Thread` identical to what `async_setup_entry` originally built.
-   - Recommendation: Define `spawn_states_worker(hass, runtime) -> Thread` and `spawn_meta_worker(hass, runtime) -> Thread` as module-level helpers in `watchdog.py`. They accept `runtime: HaTimescaleDBData` which carries all required constructor args. This avoids importing `__init__.py` helpers into `watchdog.py` (circular import risk).
+   - Recommendation: Define `spawn_states_worker(hass, runtime) -> Thread` and `spawn_meta_worker(hass, runtime) -> Thread` as module-level helpers in `watchdog.py`. They accept `runtime: TimescaledbRecorderData` which carries all required constructor args. This avoids importing `__init__.py` helpers into `watchdog.py` (circular import risk).
 
 3. **`db_unreachable` `sustained_fail_seconds` constant placement**
    - The `DB_UNREACHABLE_THRESHOLD_SECONDS = 300` constant should live in `const.py` per project convention (D-03-d places `STALL_THRESHOLD` there). The `sustained_fail_seconds` parameter to `retry_until_success` should default to this constant.
@@ -744,8 +744,8 @@ Step 2.6: SKIPPED (no new external dependencies — Phase 3 uses only existing H
 ### Secondary (MEDIUM confidence)
 
 - [Python asyncio docs](https://docs.python.org/3/library/asyncio-task.html) — Task lifecycle, add_done_callback runs on event loop via call_soon
-- Existing `custom_components/ha_timescaledb_recorder/issues.py` — Phase 2 pattern confirmed for `@callback` issue helpers + `hass.add_job` bridge
-- Existing `custom_components/ha_timescaledb_recorder/__init__.py` — `_overflow_watcher` pattern confirms `asyncio.wait_for(event.wait(), timeout=N)` as interruptible sleep
+- Existing `custom_components/timescaledb_recorder/issues.py` — Phase 2 pattern confirmed for `@callback` issue helpers + `hass.add_job` bridge
+- Existing `custom_components/timescaledb_recorder/__init__.py` — `_overflow_watcher` pattern confirms `asyncio.wait_for(event.wait(), timeout=N)` as interruptible sleep
 
 ## Metadata
 

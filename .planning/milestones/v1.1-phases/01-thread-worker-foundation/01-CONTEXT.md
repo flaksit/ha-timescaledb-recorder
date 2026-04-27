@@ -36,7 +36,7 @@ Replace the async, event-loop-resident write path (asyncpg + `async_create_task`
 - **D-09:** New `worker.py` module containing `DbWorker` class. `DbWorker` owns: `threading.Thread`, `queue.Queue`, `psycopg.Connection`, schema setup at startup, flush loop, SCD2 dispatch logic.
 - **D-10:** `ingester.py` (`StateIngester`) becomes a thin event relay: registers `STATE_CHANGED` listener, applies entity filter, builds `StateRow`, enqueues to shared queue. No async flush, no asyncpg.
 - **D-11:** `syncer.py` (`MetadataSyncer`) becomes a thin event relay: registers four registry event listeners, extracts params in `@callbacks`, enqueues `MetaCommand` items. SCD2 DB operations (change detection reads + close/insert writes) move to `DbWorker`.
-- **D-12:** `__init__.py` runtime data (`HaTimescaleDBData`) drops `pool: asyncpg.Pool`; holds `worker: DbWorker` instead. `async_unload_entry` calls `worker.async_stop()` (puts sentinel, awaits `async_add_executor_job(thread.join)`).
+- **D-12:** `__init__.py` runtime data (`TimescaledbRecorderData`) drops `pool: asyncpg.Pool`; holds `worker: DbWorker` instead. `async_unload_entry` calls `worker.async_stop()` (puts sentinel, awaits `async_add_executor_job(thread.join)`).
 
 ### MetadataSyncer Architecture (Claude's Discretion)
 
@@ -77,11 +77,11 @@ Replace the async, event-loop-resident write path (asyncpg + `async_create_task`
 - `.planning/research/SUMMARY.md` — Key API constraints: `state_changes_during_period` entity_id=None raises ValueError; `hass.async_*` thread-safety; `run_coroutine_threadsafe().result()` deadlock on shutdown; psycopg3 Jsonb(); strings.json issues section required; TimescaleDB ≥2.18.1 for ON CONFLICT
 
 ### Existing Implementation
-- `custom_components/ha_timescaledb_recorder/__init__.py` — current async_setup_entry lifecycle to replace
-- `custom_components/ha_timescaledb_recorder/ingester.py` — current StateIngester to refactor
-- `custom_components/ha_timescaledb_recorder/syncer.py` — current MetadataSyncer to refactor (SCD2 logic reference)
-- `custom_components/ha_timescaledb_recorder/const.py` — SQL constants to migrate from $1/$2 to %s
-- `custom_components/ha_timescaledb_recorder/schema.py` — async_setup_schema to move to worker startup
+- `custom_components/timescaledb_recorder/__init__.py` — current async_setup_entry lifecycle to replace
+- `custom_components/timescaledb_recorder/ingester.py` — current StateIngester to refactor
+- `custom_components/timescaledb_recorder/syncer.py` — current MetadataSyncer to refactor (SCD2 logic reference)
+- `custom_components/timescaledb_recorder/const.py` — SQL constants to migrate from $1/$2 to %s
+- `custom_components/timescaledb_recorder/schema.py` — async_setup_schema to move to worker startup
 
 </canonical_refs>
 
@@ -102,11 +102,11 @@ Replace the async, event-loop-resident write path (asyncpg + `async_create_task`
 - `async_add_executor_job` for crossing thread boundary from HA — correct pattern per WATCH-02
 
 ### Integration Points
-- `async_setup_entry` → `HaTimescaleDBData` → `async_unload_entry` lifecycle; pool replaced by worker
+- `async_setup_entry` → `TimescaledbRecorderData` → `async_unload_entry` lifecycle; pool replaced by worker
 - HA event bus: `hass.bus.async_listen(EVENT_STATE_CHANGED, ...)` stays in StateIngester
 - Four registry event listeners stay in MetadataSyncer
 - `async_add_executor_job(thread.join)` in `async_unload_entry` for graceful shutdown
-- `entry.runtime_data` stores the new `HaTimescaleDBData(worker=DbWorker, ingester=StateIngester, syncer=MetadataSyncer)`
+- `entry.runtime_data` stores the new `TimescaledbRecorderData(worker=DbWorker, ingester=StateIngester, syncer=MetadataSyncer)`
 
 </code_context>
 

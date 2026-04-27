@@ -28,7 +28,7 @@ Open questions to resolve during planning / research phases.
 - Best practice for clearing resolved issues (`async_delete_issue`?).
 
 ### TimescaleDB unique constraint on hypertables
-- Confirm `UNIQUE (last_updated, entity_id)` is allowed on `ha_states` hypertable (TimescaleDB requires unique index to include partitioning column).
+- Confirm `UNIQUE (last_updated, entity_id)` is allowed on `states` hypertable (TimescaleDB requires unique index to include partitioning column).
 - If allowed, use for `INSERT ... ON CONFLICT DO NOTHING` as alternative dedup mechanism (backup plan if mutex-based isolation proves insufficient).
 - Index space + insert cost delta.
 

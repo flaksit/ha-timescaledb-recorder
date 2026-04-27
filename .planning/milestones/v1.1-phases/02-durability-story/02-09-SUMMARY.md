@@ -6,14 +6,14 @@ tags: [ingester, syncer, overflow-queue, persistent-queue, json-safe, metacomman
 dependency_graph:
   requires: [02-04, 02-05, 02-06]
   provides: [producer-side-queue-topology]
-  affects: [custom_components/ha_timescaledb_recorder/ingester.py, custom_components/ha_timescaledb_recorder/syncer.py]
+  affects: [custom_components/timescaledb_recorder/ingester.py, custom_components/timescaledb_recorder/syncer.py]
 tech_stack:
   added: []
   patterns: [OverflowQueue-binding, PersistentQueue-put_async-via-async_create_task, JSON-safe-dict-enqueue]
 key_files:
   modified:
-    - custom_components/ha_timescaledb_recorder/ingester.py
-    - custom_components/ha_timescaledb_recorder/syncer.py
+    - custom_components/timescaledb_recorder/ingester.py
+    - custom_components/timescaledb_recorder/syncer.py
 decisions:
   - "Snapshot loops use async_create_task (not await put_async) to avoid serializing event-loop on fsync (D-01-c)"
   - "_to_json_safe accepts None and returns None (remove actions carry null params)"

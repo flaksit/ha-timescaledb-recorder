@@ -28,7 +28,7 @@ tech-stack:
 key-files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/ingester.py
+    - custom_components/timescaledb_recorder/ingester.py
 
 key-decisions:
   - "stop() named without async_ prefix to prevent callers from incorrectly awaiting it — async_stop naming on a sync method is misleading"
@@ -71,7 +71,7 @@ StateIngester rewritten as a minimal @callback event relay: filters by entity_id
 
 ## Files Created/Modified
 
-- `custom_components/ha_timescaledb_recorder/ingester.py` - Rewritten as thin relay; 81 lines down to ~80 lines but with all batch/flush/pool logic removed and replaced by one put_nowait() call
+- `custom_components/timescaledb_recorder/ingester.py` - Rewritten as thin relay; 81 lines down to ~80 lines but with all batch/flush/pool logic removed and replaced by one put_nowait() call
 
 ## Decisions Made
 
@@ -96,7 +96,7 @@ No new trust boundaries beyond those in the plan's threat model.
 
 ## Self-Check: PASSED
 
-- FOUND: `custom_components/ha_timescaledb_recorder/ingester.py`
+- FOUND: `custom_components/timescaledb_recorder/ingester.py`
 - FOUND: commit `40e048f` (Task 1 — refactor StateIngester)
 - ingester.py parses cleanly: `python3 -c "import ast; ast.parse(...)"` exits 0
 - grep for `asyncpg|_buffer|_async_flush|async_stop` returns 0 matches

@@ -43,7 +43,7 @@ uv run pytest tests/test_ingester.py   # Run single module
 tests/
 ├── __init__.py
 ├── conftest.py          # Shared fixtures: mock_conn, mock_pool, hass, registry mocks
-├── test_config_flow.py  # 3 tests for TimescaleDBConfigFlow
+├── test_config_flow.py  # 3 tests for TimescaledbConfigFlow
 ├── test_ingester.py     # 14 tests for StateIngester
 ├── test_schema.py       # 8 tests for async_setup_schema
 └── test_syncer.py       # 8 tests for MetadataSyncer

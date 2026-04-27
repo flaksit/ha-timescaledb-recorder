@@ -4,7 +4,7 @@ import pathlib
 
 
 def _load_strings():
-    src = pathlib.Path("custom_components/ha_timescaledb_recorder/strings.json")
+    src = pathlib.Path("custom_components/timescaledb_recorder/strings.json")
     return json.loads(src.read_text())
 
 

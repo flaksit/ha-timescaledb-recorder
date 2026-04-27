@@ -18,7 +18,7 @@ tech_stack:
     - "Plain def helpers bridged to event loop via hass.add_job() from worker threads"
 key_files:
   created:
-    - custom_components/ha_timescaledb_recorder/notifications.py
+    - custom_components/timescaledb_recorder/notifications.py
     - tests/test_notifications.py
   modified: []
 decisions:
@@ -136,7 +136,7 @@ None — this module creates no new network endpoints, file access, or trust-bou
 
 ## Self-Check: PASSED
 
-- FOUND: `custom_components/ha_timescaledb_recorder/notifications.py`
+- FOUND: `custom_components/timescaledb_recorder/notifications.py`
 - FOUND: `tests/test_notifications.py`
 - FOUND: `.planning/phases/03-hardening-and-observability/03-02-SUMMARY.md`
 - FOUND: RED gate commit `c343fb2` (test(03-02): add failing tests...)

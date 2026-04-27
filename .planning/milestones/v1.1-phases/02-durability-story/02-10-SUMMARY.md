@@ -31,9 +31,9 @@ tech_stack:
 key_files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/__init__.py
+    - custom_components/timescaledb_recorder/__init__.py
 decisions:
-  - HaTimescaleDBData gains loop_stop_event (asyncio.Event) alongside stop_event (threading.Event) — the orchestrator and overflow watcher run on the event loop so they need the asyncio variant; worker threads use the threading variant
+  - TimescaledbRecorderData gains loop_stop_event (asyncio.Event) alongside stop_event (threading.Event) — the orchestrator and overflow watcher run on the event loop so they need the asyncio variant; worker threads use the threading variant
   - _async_initial_registry_backfill constructs a throwaway MetadataSyncer to reuse _extract_*_params helpers rather than duplicating extraction logic; the throwaway instance's _entity_reg etc. are None but the extract helpers receive entry directly so this is safe
   - orchestrator_holder dict is a defensive guard against the edge case where _on_ha_started fires before `data` is assigned (cannot happen in practice, but the dict is robust)
   - run_coroutine_threadsafe mentioned only in docstring as WATCH-02 warning; not called functionally
@@ -51,9 +51,9 @@ metrics:
 
 ## What Was Built
 
-`custom_components/ha_timescaledb_recorder/__init__.py` was completely rewritten to wire together every Phase 2 module:
+`custom_components/timescaledb_recorder/__init__.py` was completely rewritten to wire together every Phase 2 module:
 
-### HaTimescaleDBData (new dataclass shape)
+### TimescaledbRecorderData (new dataclass shape)
 
 The Phase 1 single-field `worker: DbWorker` dataclass is replaced with a 12-field dataclass holding all Phase 2 collaborators: `states_worker`, `meta_worker`, `ingester`, `syncer`, `live_queue`, `meta_queue`, `backfill_queue`, `backfill_request`, `stop_event`, `loop_stop_event`, `orchestrator_task`, `overflow_watcher_task`.
 
@@ -111,7 +111,7 @@ None to check (plan creates no new files, only modifies `__init__.py`).
 
 ### Modified file exists:
 
-- FOUND: `custom_components/ha_timescaledb_recorder/__init__.py`
+- FOUND: `custom_components/timescaledb_recorder/__init__.py`
 
 ### Commits exist:
 

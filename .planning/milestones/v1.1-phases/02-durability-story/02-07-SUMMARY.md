@@ -16,7 +16,7 @@ tech_stack:
     - Cross-class syncer helper reuse (_entity_row_changed etc.) — established Phase 1 pattern
 key_files:
   created:
-    - custom_components/ha_timescaledb_recorder/meta_worker.py
+    - custom_components/timescaledb_recorder/meta_worker.py
   modified: []
 decisions:
   - "D-15-a: TimescaledbMetaRecorderThread is a separate daemon thread from states worker — each owns its own psycopg3 connection"
@@ -38,7 +38,7 @@ One-liner: `TimescaledbMetaRecorderThread` draining `PersistentQueue` with retry
 
 ## What Was Built
 
-Created `custom_components/ha_timescaledb_recorder/meta_worker.py` with a single class `TimescaledbMetaRecorderThread(threading.Thread)` that:
+Created `custom_components/timescaledb_recorder/meta_worker.py` with a single class `TimescaledbMetaRecorderThread(threading.Thread)` that:
 
 - Owns a single psycopg3 connection (D-15-a separation from states worker)
 - Loops on `PersistentQueue.get()` (blocking, Condition-based); breaks on `None` or `stop_event`
@@ -68,7 +68,7 @@ None. All four registry dispatches are fully implemented. The Task 1 `NotImpleme
 ### Created files exist
 
 ```
-[ -f custom_components/ha_timescaledb_recorder/meta_worker.py ] → FOUND
+[ -f custom_components/timescaledb_recorder/meta_worker.py ] → FOUND
 ```
 
 ### Commits exist

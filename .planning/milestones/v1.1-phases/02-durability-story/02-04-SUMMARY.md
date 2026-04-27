@@ -12,7 +12,7 @@ tech_stack:
   patterns: [queue.Queue subclass, threading.Lock, drop-newest-on-full]
 key_files:
   created:
-    - custom_components/ha_timescaledb_recorder/overflow_queue.py
+    - custom_components/timescaledb_recorder/overflow_queue.py
   modified: []
 decisions:
   - "D-02/D-11: OverflowQueue.put_nowait never raises — @callback producers require exception-free enqueue; first-drop logs once, subsequent drops are silent counter increments"
@@ -33,13 +33,13 @@ OverflowQueue — a `queue.Queue` subclass that silently drops newest items on f
 
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
-| 1 | Create overflow_queue.py with OverflowQueue class | 222343c | `custom_components/ha_timescaledb_recorder/overflow_queue.py` (created, 78 lines) |
+| 1 | Create overflow_queue.py with OverflowQueue class | 222343c | `custom_components/timescaledb_recorder/overflow_queue.py` (created, 78 lines) |
 
 ## Verification
 
 All 7 acceptance criteria passed:
 
-1. File `custom_components/ha_timescaledb_recorder/overflow_queue.py` exists
+1. File `custom_components/timescaledb_recorder/overflow_queue.py` exists
 2. `class OverflowQueue(queue.Queue):` present
 3. `self.overflowed: bool = False` present
 4. `def put_nowait(self, item)` present
@@ -63,5 +63,5 @@ None — this is a pure stdlib utility (no network endpoints, no auth paths, no 
 
 ## Self-Check: PASSED
 
-- File exists: `custom_components/ha_timescaledb_recorder/overflow_queue.py` FOUND
+- File exists: `custom_components/timescaledb_recorder/overflow_queue.py` FOUND
 - Commit exists: `222343c` FOUND (`feat(02-04): add OverflowQueue — drop-newest-on-full queue.Queue subclass`)

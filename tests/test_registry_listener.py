@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.registry_listener import RegistryListener, _to_json_safe
-from custom_components.ha_timescaledb_recorder.persistent_queue import PersistentQueue
+from custom_components.timescaledb_recorder.registry_listener import RegistryListener, _to_json_safe
+from custom_components.timescaledb_recorder.persistent_queue import PersistentQueue
 
 
 # ---------------------------------------------------------------------------

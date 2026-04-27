@@ -3,8 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.const import DOMAIN
-from custom_components.ha_timescaledb_recorder.issues import (
+from custom_components.timescaledb_recorder.const import DOMAIN
+from custom_components.timescaledb_recorder.issues import (
     create_buffer_dropping_issue,
     clear_buffer_dropping_issue,
     create_states_worker_stalled_issue,
@@ -25,7 +25,7 @@ from custom_components.ha_timescaledb_recorder.issues import (
 def _ir_create_kwargs(hass, func):
     """Call func(hass) under a patch and return the kwargs passed to async_create_issue."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.issues.ir.async_create_issue"
+        "custom_components.timescaledb_recorder.issues.ir.async_create_issue"
     ) as mock_create:
         func(hass)
     mock_create.assert_called_once()
@@ -35,7 +35,7 @@ def _ir_create_kwargs(hass, func):
 def _ir_delete_args(hass, func):
     """Call func(hass) under a patch and return positional args to async_delete_issue."""
     with patch(
-        "custom_components.ha_timescaledb_recorder.issues.ir.async_delete_issue"
+        "custom_components.timescaledb_recorder.issues.ir.async_delete_issue"
     ) as mock_delete:
         func(hass)
     mock_delete.assert_called_once()
@@ -204,7 +204,7 @@ def test_all_issue_id_constants_present_in_strings_json():
     import re
     import pathlib
 
-    import custom_components.ha_timescaledb_recorder.issues as issues_mod
+    import custom_components.timescaledb_recorder.issues as issues_mod
 
     # Collect all private module-level constants whose name ends in _ID
     id_constants = {
@@ -214,7 +214,7 @@ def test_all_issue_id_constants_present_in_strings_json():
     }
 
     strings_path = pathlib.Path(
-        "custom_components/ha_timescaledb_recorder/strings.json"
+        "custom_components/timescaledb_recorder/strings.json"
     )
     strings = json.loads(strings_path.read_text())
     issues_keys = set(strings.get("issues", {}).keys())
@@ -231,7 +231,7 @@ def test_strings_json_has_matching_translation_key():
     import json
     import pathlib
 
-    src = pathlib.Path("custom_components/ha_timescaledb_recorder/strings.json")
+    src = pathlib.Path("custom_components/timescaledb_recorder/strings.json")
     data = json.loads(src.read_text())
     assert "issues" in data
     assert "buffer_dropping" in data["issues"]

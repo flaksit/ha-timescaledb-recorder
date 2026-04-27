@@ -1,4 +1,4 @@
-"""Idempotent schema setup for the ha_timescaledb_recorder hypertable."""
+"""Idempotent schema setup for the timescaledb_recorder hypertable."""
 import logging
 
 import psycopg

@@ -1,7 +1,7 @@
 """Tests for the schema module (psycopg3 sync API)."""
 import pytest
 
-from custom_components.ha_timescaledb_recorder.schema import sync_setup_schema
+from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
@@ -44,10 +44,10 @@ def test_create_schema_order(mock_psycopg_conn):
     assert "CREATE INDEX" in calls[5]
     assert "UNIQUE INDEX" in calls[6]   # D-09-a: Phase 2 addition
     # Dimension table DDL follows at offset 7
-    assert "dim_entities" in calls[7]
-    assert "dim_devices" in calls[8]
-    assert "dim_areas" in calls[9]
-    assert "dim_labels" in calls[10]
+    assert "entities" in calls[7]
+    assert "devices" in calls[8]
+    assert "areas" in calls[9]
+    assert "labels" in calls[10]
 
 
 def test_custom_chunk_interval(mock_psycopg_conn):
@@ -104,10 +104,10 @@ def test_dim_tables_ddl_executed(mock_psycopg_conn):
 
     all_sql = " ".join(call.args[0] for call in cur.execute.call_args_list)
 
-    assert "CREATE TABLE IF NOT EXISTS dim_entities" in all_sql
-    assert "CREATE TABLE IF NOT EXISTS dim_devices" in all_sql
-    assert "CREATE TABLE IF NOT EXISTS dim_areas" in all_sql
-    assert "CREATE TABLE IF NOT EXISTS dim_labels" in all_sql
+    assert "CREATE TABLE IF NOT EXISTS entities" in all_sql
+    assert "CREATE TABLE IF NOT EXISTS devices" in all_sql
+    assert "CREATE TABLE IF NOT EXISTS areas" in all_sql
+    assert "CREATE TABLE IF NOT EXISTS labels" in all_sql
 
 
 def test_dim_indexes_created(mock_psycopg_conn):
@@ -121,13 +121,13 @@ def test_dim_indexes_created(mock_psycopg_conn):
     assert "idx_dim_entities_entity_time" in all_sql
     assert "idx_dim_entities_current" in all_sql
     assert "idx_dim_devices_device_time" in all_sql
-    assert "idx_dim_areas_area_time" in all_sql
+    assert "idx_areas_area_time" in all_sql
     assert "idx_dim_labels_label_time" in all_sql
 
 
 def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):
     """sync_setup_schema must execute CREATE_UNIQUE_INDEX_SQL (D-09-a: enables ON CONFLICT DO NOTHING)."""
-    from custom_components.ha_timescaledb_recorder.const import CREATE_UNIQUE_INDEX_SQL
+    from custom_components.timescaledb_recorder.const import CREATE_UNIQUE_INDEX_SQL
 
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn, chunk_interval_days=7, compress_after_hours=2)

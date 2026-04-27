@@ -12,7 +12,7 @@ tech_stack:
   patterns: [decorator-factory, stop_event-interruptible-sleep, capped-exponential-backoff]
 key_files:
   created:
-    - custom_components/ha_timescaledb_recorder/retry.py
+    - custom_components/timescaledb_recorder/retry.py
   modified: []
 decisions:
   - "keyword-only stop_event parameter prevents accidental positional confusion with on_transient"
@@ -33,7 +33,7 @@ One-liner: Shutdown-aware retry decorator with capped (1,5,10,30,60)s backoff, b
 
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
-| 1 | Create retry.py with retry_until_success decorator | 500f862 | custom_components/ha_timescaledb_recorder/retry.py |
+| 1 | Create retry.py with retry_until_success decorator | 500f862 | custom_components/timescaledb_recorder/retry.py |
 
 ## Decisions Made
 
@@ -59,7 +59,7 @@ None. `retry.py` is a pure stdlib utility with no network endpoints, auth paths,
 
 ## Self-Check: PASSED
 
-- `custom_components/ha_timescaledb_recorder/retry.py` — found
+- `custom_components/timescaledb_recorder/retry.py` — found
 - Commit `500f862` — found
 - All 7 acceptance criteria grep checks passed
 - All 4 smoke verification test cases passed

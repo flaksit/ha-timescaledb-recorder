@@ -3,12 +3,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.config_flow import TimescaleDBConfigFlow
-from custom_components.ha_timescaledb_recorder.const import CONF_DSN
+from custom_components.timescaledb_recorder.config_flow import TimescaledbConfigFlow
+from custom_components.timescaledb_recorder.const import CONF_DSN
 
 
 async def test_show_form():
-    flow = TimescaleDBConfigFlow()
+    flow = TimescaledbConfigFlow()
     flow.hass = MagicMock()
     result = await flow.async_step_user(None)
     assert result["type"] == "form"
@@ -16,7 +16,7 @@ async def test_show_form():
 
 
 async def test_valid_dsn():
-    flow = TimescaleDBConfigFlow()
+    flow = TimescaledbConfigFlow()
     flow.hass = MagicMock()
     mock_conn = AsyncMock()
     with patch("asyncpg.connect", return_value=mock_conn) as mock_connect:
@@ -28,7 +28,7 @@ async def test_valid_dsn():
 
 
 async def test_invalid_dsn():
-    flow = TimescaleDBConfigFlow()
+    flow = TimescaledbConfigFlow()
     flow.hass = MagicMock()
     with patch("asyncpg.connect", side_effect=Exception("connection refused")):
         result = await flow.async_step_user({CONF_DSN: "postgresql://bad/db"})

@@ -5,9 +5,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.state_listener import StateListener
-from custom_components.ha_timescaledb_recorder.overflow_queue import OverflowQueue
-from custom_components.ha_timescaledb_recorder.worker import StateRow
+from custom_components.timescaledb_recorder.state_listener import StateListener
+from custom_components.timescaledb_recorder.overflow_queue import OverflowQueue
+from custom_components.timescaledb_recorder.worker import StateRow
 from homeassistant.helpers.entityfilter import convert_filter
 
 

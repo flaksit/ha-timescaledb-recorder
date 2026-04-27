@@ -8,19 +8,19 @@
 
 | New/Modified File | Role | Data Flow | Closest Analog | Match Quality |
 |---|---|---|---|---|
-| `custom_components/ha_timescaledb_recorder/overflow_queue.py` | utility | transform (queue wrapper) | `worker.py` (queue usage site) | role-match — subclass of `queue.Queue`, pure stdlib |
-| `custom_components/ha_timescaledb_recorder/persistent_queue.py` | utility | file-I/O + event-driven | none in repo — synthesis of `queue.Queue` + jsonl append | no analog (see "No Analog Found") |
-| `custom_components/ha_timescaledb_recorder/retry.py` | utility | transform (decorator) | none in repo — synthesis | no analog (see "No Analog Found") |
-| `custom_components/ha_timescaledb_recorder/issues.py` | utility | request-response | `worker.py` `hass.add_job` bridge site | role-match — thin wrapper around HA helper |
-| `custom_components/ha_timescaledb_recorder/backfill.py` | service | event-driven + batch | `worker.py` `DbWorker` (orchestrator lifecycle) | role-match — event-loop coroutine orchestrator |
-| `custom_components/ha_timescaledb_recorder/states_worker.py` (or `worker.py` refactor — planner decides name) | service | event-driven + batch | `worker.py` `DbWorker` (self) | exact — split of existing class |
-| `custom_components/ha_timescaledb_recorder/meta_worker.py` (or `worker.py` refactor) | service | event-driven + CRUD | `worker.py` `DbWorker._process_meta_command` | exact — existing SCD2 dispatch moves here |
-| `custom_components/ha_timescaledb_recorder/const.py` | config | transform | `const.py` (self) | exact — append constants + modify INSERT_SQL |
-| `custom_components/ha_timescaledb_recorder/schema.py` | utility | CRUD (DDL) | `schema.py` (self, `sync_setup_schema`) | exact — one-line addition |
-| `custom_components/ha_timescaledb_recorder/ingester.py` | event-relay | event-driven | `ingester.py` (self) | exact — target queue type swap only |
-| `custom_components/ha_timescaledb_recorder/syncer.py` | event-relay | event-driven | `syncer.py` (self) | exact — target queue type + JSON serialization |
-| `custom_components/ha_timescaledb_recorder/__init__.py` | config | request-response | `__init__.py` (self) | exact — startup ordering D-12 + shutdown D-13 |
-| `custom_components/ha_timescaledb_recorder/strings.json` | config | transform | `strings.json` (self) | exact — add `"issues"` section |
+| `custom_components/timescaledb_recorder/overflow_queue.py` | utility | transform (queue wrapper) | `worker.py` (queue usage site) | role-match — subclass of `queue.Queue`, pure stdlib |
+| `custom_components/timescaledb_recorder/persistent_queue.py` | utility | file-I/O + event-driven | none in repo — synthesis of `queue.Queue` + jsonl append | no analog (see "No Analog Found") |
+| `custom_components/timescaledb_recorder/retry.py` | utility | transform (decorator) | none in repo — synthesis | no analog (see "No Analog Found") |
+| `custom_components/timescaledb_recorder/issues.py` | utility | request-response | `worker.py` `hass.add_job` bridge site | role-match — thin wrapper around HA helper |
+| `custom_components/timescaledb_recorder/backfill.py` | service | event-driven + batch | `worker.py` `DbWorker` (orchestrator lifecycle) | role-match — event-loop coroutine orchestrator |
+| `custom_components/timescaledb_recorder/states_worker.py` (or `worker.py` refactor — planner decides name) | service | event-driven + batch | `worker.py` `DbWorker` (self) | exact — split of existing class |
+| `custom_components/timescaledb_recorder/meta_worker.py` (or `worker.py` refactor) | service | event-driven + CRUD | `worker.py` `DbWorker._process_meta_command` | exact — existing SCD2 dispatch moves here |
+| `custom_components/timescaledb_recorder/const.py` | config | transform | `const.py` (self) | exact — append constants + modify INSERT_SQL |
+| `custom_components/timescaledb_recorder/schema.py` | utility | CRUD (DDL) | `schema.py` (self, `sync_setup_schema`) | exact — one-line addition |
+| `custom_components/timescaledb_recorder/ingester.py` | event-relay | event-driven | `ingester.py` (self) | exact — target queue type swap only |
+| `custom_components/timescaledb_recorder/syncer.py` | event-relay | event-driven | `syncer.py` (self) | exact — target queue type + JSON serialization |
+| `custom_components/timescaledb_recorder/__init__.py` | config | request-response | `__init__.py` (self) | exact — startup ordering D-12 + shutdown D-13 |
+| `custom_components/timescaledb_recorder/strings.json` | config | transform | `strings.json` (self) | exact — add `"issues"` section |
 
 ## Pattern Assignments
 
@@ -507,7 +507,7 @@ async def backfill_orchestrator(
         wm = await hass.async_add_executor_job(read_watermark)
         if wm is None:
             _LOGGER.info(
-                "ha_states is empty — first-install backfill is out of scope; "
+                "states is empty — first-install backfill is out of scope; "
                 "use paradise-ha-tsdb/scripts/backfill/backfill.py for bulk import",
             )
             await hass.async_add_executor_job(backfill_queue.put, BACKFILL_DONE)
@@ -516,7 +516,7 @@ async def backfill_orchestrator(
         from_ = wm - timedelta(minutes=10)   # D-08-d step 6: late-arrival grace
         cutoff = t_clear
 
-        # Entity set = live registry (filtered) ∪ open rows in dim_entities (D-08-f)
+        # Entity set = live registry (filtered) ∪ open rows in entities (D-08-f)
         entity_reg = er.async_get(hass)
         live_entities = {
             e.entity_id for e in entity_reg.entities.values()
@@ -639,7 +639,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         backfill_request,        # asyncio.Event owned by event loop
         stop_event: threading.Event,
     ) -> None:
-        super().__init__(daemon=True, name="ha_timescaledb_states_worker")
+        super().__init__(daemon=True, name="timescaledb_states_worker")
         self._hass = hass
         self._dsn = dsn
         self._live_queue = live_queue
@@ -770,14 +770,14 @@ def _slice_to_rows(self, slice_dict: dict) -> list[StateRow]:
     for eid, states in slice_dict.items():
         all_states.extend(states)
     all_states.sort(key=lambda s: s.last_updated)
-    return [StateRow.from_ha_state(s) for s in all_states]
+    return [StateRow.from_state(s) for s in all_states]
 ```
 
 **Watermark + open-entities readers** — exposed for orchestrator (D-08-d, D-08-f):
 
 ```python
 def read_watermark(self) -> datetime | None:
-    """Return MAX(last_updated) from ha_states, or None if empty hypertable."""
+    """Return MAX(last_updated) from states, or None if empty hypertable."""
     conn = self.get_db_connection()
     with conn.cursor() as cur:
         cur.execute(SELECT_WATERMARK_SQL)
@@ -785,7 +785,7 @@ def read_watermark(self) -> datetime | None:
     return row[0] if row and row[0] is not None else None
 
 def read_open_entities(self) -> set[str]:
-    """Return entity_ids with open (valid_to IS NULL) rows in dim_entities."""
+    """Return entity_ids with open (valid_to IS NULL) rows in entities."""
     conn = self.get_db_connection()
     with conn.cursor() as cur:
         cur.execute(SELECT_OPEN_ENTITIES_SQL)
@@ -816,7 +816,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         syncer: "MetadataSyncer",    # for change-detection helpers (reused from Phase 1)
         stop_event: threading.Event,
     ) -> None:
-        super().__init__(daemon=True, name="ha_timescaledb_meta_worker")
+        super().__init__(daemon=True, name="timescaledb_meta_worker")
         self._hass = hass
         self._dsn = dsn
         self._meta_queue = meta_queue
@@ -932,7 +932,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_{TABLE_NAME}_uniq
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
 
 # D-08-f: open entities reader.
-SELECT_OPEN_ENTITIES_SQL = "SELECT entity_id FROM dim_entities WHERE valid_to IS NULL"
+SELECT_OPEN_ENTITIES_SQL = "SELECT entity_id FROM entities WHERE valid_to IS NULL"
 ```
 
 **Modify INSERT_SQL** (D-06-d) — append ON CONFLICT clause to the existing string at lines 63-66:
@@ -1117,11 +1117,11 @@ def _to_json_safe(params: tuple | list) -> list:
 
 **Analog:** `__init__.py` (self, lines 53-127). Same skeleton, expanded orchestration.
 
-**HaTimescaleDBData** (lines 26-32) — replace single `worker` field with the new collaborators:
+**TimescaledbRecorderData** (lines 26-32) — replace single `worker` field with the new collaborators:
 
 ```python
 @dataclass
-class HaTimescaleDBData:
+class TimescaledbRecorderData:
     states_worker: "TimescaledbStateRecorderThread"
     meta_worker: "TimescaledbMetaRecorderThread"
     ingester: StateIngester
@@ -1137,7 +1137,7 @@ class HaTimescaleDBData:
 **async_setup_entry** (adapts lines 53-108 with D-12's 8 steps):
 
 ```python
-async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: TimescaledbRecorderConfigEntry) -> bool:
     dsn = entry.data[CONF_DSN]
     options = entry.options
     chunk_interval_days = options.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS)
@@ -1218,7 +1218,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_ha_started)
 
-    entry.runtime_data = HaTimescaleDBData(
+    entry.runtime_data = TimescaledbRecorderData(
         states_worker=states_worker,
         meta_worker=meta_worker,
         ingester=ingester,
@@ -1237,8 +1237,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
 **async_unload_entry** (adapts lines 116-127, D-13):
 
 ```python
-async def async_unload_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:
-    data: HaTimescaleDBData = entry.runtime_data
+async def async_unload_entry(hass: HomeAssistant, entry: TimescaledbRecorderConfigEntry) -> bool:
+    data: TimescaledbRecorderData = entry.runtime_data
     # D-13-b step 1: stop_event.set() — orchestrator backoff, worker loops observe
     data.stop_event.set()
     # D-13-b step 2: cancel orchestrator
@@ -1498,6 +1498,6 @@ Files with no close match in the codebase (planner should synthesize from RESEAR
 
 ## Metadata
 
-**Analog search scope:** `custom_components/ha_timescaledb_recorder/` (7 source files), `scripts/backfill_gaps.py` (external reference for `ON CONFLICT DO NOTHING` shape), `tests/conftest.py` (fixture reuse).
+**Analog search scope:** `custom_components/timescaledb_recorder/` (7 source files), `scripts/backfill_gaps.py` (external reference for `ON CONFLICT DO NOTHING` shape), `tests/conftest.py` (fixture reuse).
 **Files scanned:** 13
 **Pattern extraction date:** 2026-04-21

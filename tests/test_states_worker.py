@@ -7,19 +7,19 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.const import (
+from custom_components.timescaledb_recorder.const import (
     INSERT_SQL,
     SELECT_OPEN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
 )
-from custom_components.ha_timescaledb_recorder.overflow_queue import OverflowQueue
-from custom_components.ha_timescaledb_recorder.states_worker import (
+from custom_components.timescaledb_recorder.overflow_queue import OverflowQueue
+from custom_components.timescaledb_recorder.states_worker import (
     MODE_BACKFILL,
     MODE_INIT,
     MODE_LIVE,
     TimescaledbStateRecorderThread,
 )
-from custom_components.ha_timescaledb_recorder.worker import StateRow
+from custom_components.timescaledb_recorder.worker import StateRow
 
 
 def _make_thread(hass=None, live_queue=None, backfill_queue=None,
@@ -192,7 +192,7 @@ def test_stall_hook_fires_persistent_notification_and_repair_issue():
     assert hass.add_job.call_count == 2
 
     # One of the calls must be for create_states_worker_stalled_issue.
-    from custom_components.ha_timescaledb_recorder.issues import (
+    from custom_components.timescaledb_recorder.issues import (
         create_states_worker_stalled_issue,
     )
     issue_call = call(create_states_worker_stalled_issue, hass)
@@ -208,7 +208,7 @@ def test_recovery_hook_clears_both_issues():
 
     assert hass.add_job.call_count == 2
 
-    from custom_components.ha_timescaledb_recorder.issues import (
+    from custom_components.timescaledb_recorder.issues import (
         clear_db_unreachable_issue,
         clear_states_worker_stalled_issue,
     )
@@ -224,7 +224,7 @@ def test_sustained_fail_hook_creates_db_unreachable_issue():
 
     assert hass.add_job.call_count == 1
 
-    from custom_components.ha_timescaledb_recorder.issues import create_db_unreachable_issue
+    from custom_components.timescaledb_recorder.issues import create_db_unreachable_issue
     assert call(create_db_unreachable_issue, hass) in hass.add_job.call_args_list
 
 
@@ -249,7 +249,7 @@ def test_retry_decorator_wired_with_all_phase3_hooks():
         return decorator
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.states_worker.retry_until_success",
+        "custom_components.timescaledb_recorder.states_worker.retry_until_success",
         fake_retry,
     ):
         t = _make_thread()
@@ -392,7 +392,7 @@ def test_read_watermark_retries_on_transient_error(mock_psycopg_conn):
 
     # Patch the raw method and rebuild the retry wrapper with a zero backoff.
     t._read_watermark_raw = raw_side_effect
-    from custom_components.ha_timescaledb_recorder.retry import retry_until_success
+    from custom_components.timescaledb_recorder.retry import retry_until_success
     t.read_watermark = retry_until_success(
         stop_event=stop_event,
         on_transient=t.reset_db_connection,
@@ -424,7 +424,7 @@ def test_read_watermark_retry_wiring_captures_on_transient(mock_psycopg_conn):
         return decorator
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.states_worker.retry_until_success",
+        "custom_components.timescaledb_recorder.states_worker.retry_until_success",
         fake_retry,
     ):
         t = _make_thread()

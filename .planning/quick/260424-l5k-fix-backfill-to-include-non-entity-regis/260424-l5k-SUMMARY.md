@@ -17,16 +17,16 @@ open_entities) with a cleaner two-source design:
 
 `SELECT_ALL_KNOWN_ENTITIES_SQL`:
 
-    SELECT entity_id FROM dim_entities
+    SELECT entity_id FROM entities
     UNION
-    SELECT entity_id FROM ha_states GROUP BY entity_id
+    SELECT entity_id FROM states GROUP BY entity_id
 
-`dim_entities` (no `valid_to` filter) covers all registry entities ever seen,
-including removed ones. `ha_states GROUP BY` covers non-registry entities written
+`entities` (no `valid_to` filter) covers all registry entities ever seen,
+including removed ones. `states GROUP BY` covers non-registry entities written
 by prior cycles. `GROUP BY` forces index use before the UNION dedup step —
 plain `UNION` caused a full hypertable scan (~27 s).
 
-Dropped `live_entities` / `entity_reg` entirely — redundant given `dim_entities`.
+Dropped `live_entities` / `entity_reg` entirely — redundant given `entities`.
 Renamed `open_entities_reader` → `all_entities_reader` throughout.
 Used decorator syntax for `fetch_slice` retry wrap.
 

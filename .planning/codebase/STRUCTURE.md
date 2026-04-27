@@ -11,7 +11,7 @@ focus: arch
 ha-timescaledb-recorder/
 ├── custom_components/
 │   ├── __init__.py                        # Empty package marker
-│   └── ha_timescaledb_recorder/
+│   └── timescaledb_recorder/
 │       ├── __init__.py                    # Integration setup/teardown lifecycle
 │       ├── const.py                       # All SQL strings and configuration constants
 │       ├── schema.py                      # Idempotent DDL setup function
@@ -33,7 +33,7 @@ ha-timescaledb-recorder/
 
 ## Directory Purposes
 
-**`custom_components/ha_timescaledb_recorder/`:**
+**`custom_components/timescaledb_recorder/`:**
 - Purpose: The entire integration lives here; HA discovers integrations by `custom_components/<domain>/`
 - Contains: All production Python source files, `manifest.json`
 - Key files: `__init__.py` (lifecycle entry point), `const.py` (all SQL), `ingester.py`, `syncer.py`
@@ -46,25 +46,25 @@ ha-timescaledb-recorder/
 ## Key File Locations
 
 **Integration Lifecycle:**
-- `custom_components/ha_timescaledb_recorder/__init__.py`: `async_setup_entry`, `async_unload_entry`, `HaTimescaleDBData`, entity filter construction
+- `custom_components/timescaledb_recorder/__init__.py`: `async_setup_entry`, `async_unload_entry`, `TimescaledbRecorderData`, entity filter construction
 
 **SQL and Constants:**
-- `custom_components/ha_timescaledb_recorder/const.py`: Every SQL string (DDL, DML, SCD2 variants) and every config key/default value — the single source of truth for all database interaction
+- `custom_components/timescaledb_recorder/const.py`: Every SQL string (DDL, DML, SCD2 variants) and every config key/default value — the single source of truth for all database interaction
 
 **Schema Initialization:**
-- `custom_components/ha_timescaledb_recorder/schema.py`: `async_setup_schema(pool, chunk_interval_days, compress_after_hours)` — idempotent, called once per startup
+- `custom_components/timescaledb_recorder/schema.py`: `async_setup_schema(pool, chunk_interval_days, compress_after_hours)` — idempotent, called once per startup
 
 **State Write Pipeline:**
-- `custom_components/ha_timescaledb_recorder/ingester.py`: `StateIngester` — in-memory buffer, event listener, periodic flush timer
+- `custom_components/timescaledb_recorder/ingester.py`: `StateIngester` — in-memory buffer, event listener, periodic flush timer
 
 **Metadata Write Pipeline:**
-- `custom_components/ha_timescaledb_recorder/syncer.py`: `MetadataSyncer` — startup snapshot, four registry event handlers, SCD2 change detection helpers
+- `custom_components/timescaledb_recorder/syncer.py`: `MetadataSyncer` — startup snapshot, four registry event handlers, SCD2 change detection helpers
 
 **Configuration UI:**
-- `custom_components/ha_timescaledb_recorder/config_flow.py`: `TimescaleDBConfigFlow` (initial DSN), `TimescaleDBOptionsFlow` (batch/flush/compression tuning)
+- `custom_components/timescaledb_recorder/config_flow.py`: `TimescaledbConfigFlow` (initial DSN), `TimescaledbOptionsFlow` (batch/flush/compression tuning)
 
 **HA Integration Declaration:**
-- `custom_components/ha_timescaledb_recorder/manifest.json`: domain name, version (`0.3.6`), `requirements: ["asyncpg==0.31.0"]`, `config_flow: true`, `single_config_entry: true`
+- `custom_components/timescaledb_recorder/manifest.json`: domain name, version (`0.3.6`), `requirements: ["asyncpg==0.31.0"]`, `config_flow: true`, `single_config_entry: true`
 
 **Test Fixtures:**
 - `tests/conftest.py`: `mock_conn`, `mock_pool`, `hass`, `mock_entity_registry`, `mock_device_registry`, `mock_area_registry`, `mock_label_registry`
@@ -76,7 +76,7 @@ ha-timescaledb-recorder/
 - Test files mirror the module they test: `ingester.py` → `test_ingester.py`
 
 **Classes:**
-- PascalCase: `StateIngester`, `MetadataSyncer`, `TimescaleDBConfigFlow`, `TimescaleDBOptionsFlow`, `HaTimescaleDBData`
+- PascalCase: `StateIngester`, `MetadataSyncer`, `TimescaledbConfigFlow`, `TimescaledbOptionsFlow`, `TimescaledbRecorderData`
 
 **Functions:**
 - Async public methods: `async_start`, `async_stop`, `async_setup_schema`, `async_setup_entry`
@@ -97,21 +97,21 @@ ha-timescaledb-recorder/
 ## Where to Add New Code
 
 **New time-series table (additional data type to record):**
-- Add DDL SQL constants to `custom_components/ha_timescaledb_recorder/const.py`
-- Add DDL execution to `custom_components/ha_timescaledb_recorder/schema.py:async_setup_schema`
-- Add new writer class in a new file at `custom_components/ha_timescaledb_recorder/<name>.py` following the `StateIngester` pattern (constructor, `async_start`, `async_stop`, private flush)
-- Instantiate in `custom_components/ha_timescaledb_recorder/__init__.py:async_setup_entry` and add to `HaTimescaleDBData`
+- Add DDL SQL constants to `custom_components/timescaledb_recorder/const.py`
+- Add DDL execution to `custom_components/timescaledb_recorder/schema.py:async_setup_schema`
+- Add new writer class in a new file at `custom_components/timescaledb_recorder/<name>.py` following the `StateIngester` pattern (constructor, `async_start`, `async_stop`, private flush)
+- Instantiate in `custom_components/timescaledb_recorder/__init__.py:async_setup_entry` and add to `TimescaledbRecorderData`
 - Tests go in `tests/test_<name>.py`
 
 **New dimension table (new registry type to track):**
 - Add DDL and SCD2 SQL constants to `const.py` following the `dim_*` naming pattern
 - Add DDL execution to `schema.py:async_setup_schema`
-- Add typed-key frozenset, snapshot/event-handler methods to `custom_components/ha_timescaledb_recorder/syncer.py:MetadataSyncer`
+- Add typed-key frozenset, snapshot/event-handler methods to `custom_components/timescaledb_recorder/syncer.py:MetadataSyncer`
 - Subscribe the new event in `MetadataSyncer.async_start`
 
 **New config option:**
 - Add `CONF_*` key and `DEFAULT_*` value to `const.py`
-- Add field to `TimescaleDBOptionsFlow.async_step_init` schema in `config_flow.py`
+- Add field to `TimescaledbOptionsFlow.async_step_init` schema in `config_flow.py`
 - Consume in `async_setup_entry` in `__init__.py`
 
 **New utility/helper function:**

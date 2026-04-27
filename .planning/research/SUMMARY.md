@@ -92,7 +92,7 @@ The build has a clear dependency chain: buffer.py before worker.py; worker.py be
 
 ### Phase 2: psycopg3 Connection + Flush Path
 
-**Rationale:** Replace asyncpg pool with a single persistent psycopg3 connection owned by the worker thread. Migrate the existing `ha_states` batch insert. This is the hot path and must work before backfill or observability are layered on.
+**Rationale:** Replace asyncpg pool with a single persistent psycopg3 connection owned by the worker thread. Migrate the existing `states` batch insert. This is the hot path and must work before backfill or observability are layered on.
 
 **Delivers:** Working state ingestion via worker thread; `psycopg[binary]==3.3.3` in manifest; `deque(maxlen=10000)` buffer; drop-oldest with warning log; flush SQL migrated to psycopg3 syntax with `Jsonb()` wrappers.
 

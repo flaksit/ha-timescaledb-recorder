@@ -15,7 +15,7 @@ focus: quality
 - Test files: `test_<module>.py` — `test_ingester.py`, `test_syncer.py`, `test_schema.py`, `test_config_flow.py`
 
 **Classes:**
-- `PascalCase` — `StateIngester`, `MetadataSyncer`, `TimescaleDBConfigFlow`, `TimescaleDBOptionsFlow`, `HaTimescaleDBData`
+- `PascalCase` — `StateIngester`, `MetadataSyncer`, `TimescaledbConfigFlow`, `TimescaledbOptionsFlow`, `TimescaledbRecorderData`
 - HA integration class names are prefixed with the integration domain name where useful
 
 **Functions:**
@@ -34,7 +34,7 @@ focus: quality
 - SQL constants: `<VERB>_<TABLE>_SQL` pattern — `CREATE_TABLE_SQL`, `SCD2_CLOSE_ENTITY_SQL`, `INSERT_SQL`
 
 **Types/Dataclasses:**
-- HA type aliases use `PascalCase` — `HaTimescaleDBConfigEntry = ConfigEntry[HaTimescaleDBData]`
+- HA type aliases use `PascalCase` — `TimescaledbRecorderConfigEntry = ConfigEntry[TimescaledbRecorderData]`
 - `frozenset` for immutable key collections — `_ENTITY_TYPED_KEYS`, `_EXTRA_COMPARE_IGNORE`
 
 ## Code Style
@@ -177,13 +177,13 @@ _LOGGER = logging.getLogger(__name__)
 
 **No barrel files (`__init__.py` re-exports):**
 - `custom_components/__init__.py` is empty
-- `custom_components/ha_timescaledb_recorder/__init__.py` is the HA entry point (`async_setup_entry`, `async_unload_entry`), not a re-export barrel
+- `custom_components/timescaledb_recorder/__init__.py` is the HA entry point (`async_setup_entry`, `async_unload_entry`), not a re-export barrel
 
 **Constants isolation:**
 - All SQL strings and configuration keys live in `const.py`; no SQL literals appear in `ingester.py`, `schema.py`, or `syncer.py`
 
 **Dataclass for runtime state:**
-- Shared runtime data packaged in `@dataclass HaTimescaleDBData` and stored on `entry.runtime_data`
+- Shared runtime data packaged in `@dataclass TimescaledbRecorderData` and stored on `entry.runtime_data`
 
 ---
 

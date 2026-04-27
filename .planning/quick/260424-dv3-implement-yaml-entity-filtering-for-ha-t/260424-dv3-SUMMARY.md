@@ -13,7 +13,7 @@ tech_stack:
 key_files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/__init__.py
+    - custom_components/timescaledb_recorder/__init__.py
     - README.md
 decisions:
   - "Read filter from hass.data (set by async_setup) rather than entry.data — entry.data never carries a filter key"
@@ -68,7 +68,7 @@ No new network endpoints, auth paths, or file access patterns introduced. All us
 
 ## Self-Check: PASSED
 
-- `custom_components/ha_timescaledb_recorder/__init__.py` — modified and committed at 60f4d7b
+- `custom_components/timescaledb_recorder/__init__.py` — modified and committed at 60f4d7b
 - `README.md` — modified and committed at 2038b92
 - `uv run python` import check: `CONFIG_SCHEMA`, `async_setup`, `async_setup_entry` all importable
 - `grep "not yet implemented" README.md` — 0 matches

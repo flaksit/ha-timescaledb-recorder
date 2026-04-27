@@ -55,7 +55,7 @@ Five test files fully retargeted from Phase 1 API (DbWorker/MetaCommand/bind_que
 
 ### tests/test_worker.py
 - Removed: all DbWorker, MetaCommand, _STOP tests (9 tests deleted)
-- Added: StateRow-only tests — immutability, slots, from_ha_state copy semantics, "does not export DbWorker/MetaCommand/_STOP" assertion
+- Added: StateRow-only tests — immutability, slots, from_state copy semantics, "does not export DbWorker/MetaCommand/_STOP" assertion
 - Net: 5 tests replacing 9
 
 ### tests/test_ingester.py
@@ -76,10 +76,10 @@ Five test files fully retargeted from Phase 1 API (DbWorker/MetaCommand/bind_que
 - Retained: all change-detection helper tests (`_entity_row_changed`, `_device_row_changed`) — unchanged
 
 ### tests/test_init.py
-- Removed: all DbWorker/MetaCommand/bind_queue/HaTimescaleDBData(worker=...) Phase 1 tests
+- Removed: all DbWorker/MetaCommand/bind_queue/TimescaledbRecorderData(worker=...) Phase 1 tests
 - Added: `test_async_setup_entry_runs_d12_steps_in_order` — records side-effect sequence to verify steps 2-8 ordering
 - Added: `test_setup_entry_returns_true` — basic return value check
-- Added: `test_setup_entry_runtime_data_has_all_fields` — asserts all Phase 2 HaTimescaleDBData fields populated
+- Added: `test_setup_entry_runtime_data_has_all_fields` — asserts all Phase 2 TimescaledbRecorderData fields populated
 - Added: `test_async_unload_entry_runs_d13_sequence` — asserts stop_event/loop_stop_event/ingester/syncer/meta_queue/joins
 - Added: `test_async_unload_entry_returns_true` — basic return value check
 - Added: `test_partial_start_rollback_on_syncer_failure` — verifies worker joins on rollback

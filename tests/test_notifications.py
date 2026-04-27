@@ -7,7 +7,7 @@ Tests cover:
   - Both functions are plain def (not async, not @callback)
 
 Design note: persistent_notification.async_create is patched at the module
-level (custom_components.ha_timescaledb_recorder.notifications.persistent_notification)
+level (custom_components.timescaledb_recorder.notifications.persistent_notification)
 so the real HA component is never invoked.  hass is a MagicMock because these
 helpers only pass it through to async_create.
 """
@@ -19,12 +19,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.notifications import (
+from custom_components.timescaledb_recorder.notifications import (
     notify_backfill_gap,
     notify_watchdog_recovery,
 )
 
-_PATCH_TARGET = "custom_components.ha_timescaledb_recorder.notifications.persistent_notification"
+_PATCH_TARGET = "custom_components.timescaledb_recorder.notifications.persistent_notification"
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ def test_notify_watchdog_recovery_logs_full_traceback(caplog):
     import logging
 
     with patch(_PATCH_TARGET):
-        with caplog.at_level(logging.ERROR, logger="custom_components.ha_timescaledb_recorder.notifications"):
+        with caplog.at_level(logging.ERROR, logger="custom_components.timescaledb_recorder.notifications"):
             notify_watchdog_recovery(hass, "states_worker", exc)
 
     assert len(caplog.records) >= 1

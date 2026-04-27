@@ -9,13 +9,13 @@ dependency_graph:
     - notify_watchdog_recovery (notifications.py — Plan 02)
     - create_recorder_disabled_issue / clear_recorder_disabled_issue (issues.py — Plan 01)
     - backfill_orchestrator with threading_stop_event kwarg (backfill.py — Plan 05)
-    - HaTimescaleDBData (self — Phase 2)
+    - TimescaledbRecorderData (self — Phase 2)
   provides:
-    - HaTimescaleDBData.watchdog_task (asyncio.Task | None)
-    - HaTimescaleDBData.dsn (str)
-    - HaTimescaleDBData.chunk_interval_days (int)
-    - HaTimescaleDBData.compress_after_hours (int)
-    - HaTimescaleDBData.entity_filter (Callable[[str], bool])
+    - TimescaledbRecorderData.watchdog_task (asyncio.Task | None)
+    - TimescaledbRecorderData.dsn (str)
+    - TimescaledbRecorderData.chunk_interval_days (int)
+    - TimescaledbRecorderData.compress_after_hours (int)
+    - TimescaledbRecorderData.entity_filter (Callable[[str], bool])
     - _make_orchestrator_done_callback (module-level closure factory)
     - _wait_for_recorder_and_clear (module-level async coroutine)
     - watchdog task spawned in async_setup_entry
@@ -35,7 +35,7 @@ tech_stack:
 key_files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/__init__.py
+    - custom_components/timescaledb_recorder/__init__.py
     - tests/test_init.py
 decisions:
   - "async_wait_recorder chosen over async_track_state_change_event — HA 2026.3.4 has async_wait_recorder; hasattr guard added for forward-compat with future HA versions that might remove it"
@@ -61,9 +61,9 @@ metrics:
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
 | 1 (RED) | Failing tests for Phase 3 __init__.py wiring | d50c0c8 | tests/test_init.py |
-| 1 (GREEN) | Wire watchdog + done_callback + recorder_disabled + factories | 5b6d135 | custom_components/ha_timescaledb_recorder/__init__.py, tests/test_init.py |
+| 1 (GREEN) | Wire watchdog + done_callback + recorder_disabled + factories | 5b6d135 | custom_components/timescaledb_recorder/__init__.py, tests/test_init.py |
 
-## Final HaTimescaleDBData Field List
+## Final TimescaledbRecorderData Field List
 
 | Field | Type | Phase | Purpose |
 |-------|------|-------|---------|
@@ -218,7 +218,7 @@ None — all wiring is fully implemented. `_wait_for_recorder_and_clear` has a `
 ## Self-Check: PASSED
 
 Files exist:
-- `custom_components/ha_timescaledb_recorder/__init__.py` — FOUND
+- `custom_components/timescaledb_recorder/__init__.py` — FOUND
 - `tests/test_init.py` — FOUND (27 test functions)
 
 Acceptance criteria verified:

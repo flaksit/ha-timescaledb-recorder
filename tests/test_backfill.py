@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.backfill import (
+from custom_components.timescaledb_recorder.backfill import (
     BACKFILL_DONE,
     _LATE_ARRIVAL_GRACE,
     _fetch_slice_raw,
@@ -34,7 +34,7 @@ def test_fetch_slice_raw_uses_significant_states_batch():
     t_end = t_start + timedelta(minutes=5)
     expected = {"sensor.a": [MagicMock()], "sensor.b": [MagicMock()]}
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.get_significant_states",
+        "custom_components.timescaledb_recorder.backfill.recorder_history.get_significant_states",
         return_value=expected,
     ) as mock_gs:
         out = _fetch_slice_raw(hass, entities, t_start, t_end)
@@ -50,7 +50,7 @@ def test_fetch_slice_raw_uses_significant_states_batch():
 def test_fetch_slice_raw_empty_entities_returns_empty():
     hass = MagicMock()
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder_history.get_significant_states",
+        "custom_components.timescaledb_recorder.backfill.recorder_history.get_significant_states",
         return_value={},
     ):
         out = _fetch_slice_raw(hass, set(), datetime.now(), datetime.now())
@@ -66,7 +66,7 @@ async def test_orchestrator_exits_on_stop_event_set_before_trigger():
     backfill_request = asyncio.Event()
     backfill_request.set()
 
-    with patch("custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance"):
+    with patch("custom_components.timescaledb_recorder.backfill.recorder.get_instance"):
         await asyncio.wait_for(backfill_orchestrator(
             hass,
             live_queue=MagicMock(),
@@ -103,8 +103,8 @@ async def test_orchestrator_empty_hypertable_pushes_done_and_loops():
             except queue.Empty:
                 await asyncio.sleep(0.01)
 
-    with patch("custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance"), \
-         patch("custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"):
+    with patch("custom_components.timescaledb_recorder.backfill.recorder.get_instance"), \
+         patch("custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"):
         orch = asyncio.create_task(backfill_orchestrator(
             hass,
             live_queue=live_queue,
@@ -138,9 +138,9 @@ async def test_orchestrator_clears_buffer_dropping_on_recovery():
     backfill_request = asyncio.Event()
     backfill_request.set()
 
-    with patch("custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance"), \
+    with patch("custom_components.timescaledb_recorder.backfill.recorder.get_instance"), \
          patch(
-             "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+             "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
          ) as mock_clear_issue:
         async def stopper():
             await asyncio.sleep(0.2)
@@ -206,12 +206,12 @@ async def test_orchestrator_skips_gap_detection_when_oldest_ts_none(caplog):
     recorder_inst = _make_recorder_instance(oldest_ts=None)  # None = not ready
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance",
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance",
         return_value=recorder_inst,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+        "custom_components.timescaledb_recorder.backfill.notify_backfill_gap"
     ) as mock_notify, patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ):
         async def stopper():
             # Let one full cycle complete then stop.
@@ -220,7 +220,7 @@ async def test_orchestrator_skips_gap_detection_when_oldest_ts_none(caplog):
 
         asyncio.create_task(stopper())
         with caplog.at_level(logging.DEBUG,
-                             logger="custom_components.ha_timescaledb_recorder.backfill"):
+                             logger="custom_components.timescaledb_recorder.backfill"):
             try:
                 await asyncio.wait_for(
                     backfill_orchestrator(
@@ -272,12 +272,12 @@ async def test_orchestrator_fires_backfill_gap_when_oldest_ts_after_needed_from(
     recorder_inst = _make_recorder_instance(oldest_ts=oldest_ts_float)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance",
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance",
         return_value=recorder_inst,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+        "custom_components.timescaledb_recorder.backfill.notify_backfill_gap"
     ) as mock_notify, patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ):
         # Stop after the first cycle: set stop_event AND backfill_request so the
         # orchestrator can exit its backfill_request.wait() on the next iteration.
@@ -330,12 +330,12 @@ async def test_orchestrator_no_gap_notification_when_oldest_ts_before_needed_fro
     recorder_inst = _make_recorder_instance(oldest_ts=oldest_ts_float)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance",
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance",
         return_value=recorder_inst,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+        "custom_components.timescaledb_recorder.backfill.notify_backfill_gap"
     ) as mock_notify, patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ):
         # Stop after the first cycle completes.
         async def stopper():
@@ -399,16 +399,16 @@ async def test_orchestrator_adjusts_from_to_oldest_ts_after_gap():
     recorder_inst.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: {})
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance",
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance",
         return_value=recorder_inst,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+        "custom_components.timescaledb_recorder.backfill.notify_backfill_gap"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ):
         stop_event.set()  # single cycle only — stop_event checked in slice loop
         with patch(
-            "custom_components.ha_timescaledb_recorder.backfill._SLICE_WINDOW",
+            "custom_components.timescaledb_recorder.backfill._SLICE_WINDOW",
             timedelta(hours=2),
         ):
             await backfill_orchestrator(
@@ -461,12 +461,12 @@ async def test_fetch_slice_retry_wrapping_uses_on_transient_none():
     live_queue.clear_and_reset_overflow = MagicMock(return_value=0)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.retry_until_success",
+        "custom_components.timescaledb_recorder.backfill.retry_until_success",
         fake_retry,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance"
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ):
         await backfill_orchestrator(
             hass,
@@ -498,8 +498,8 @@ async def test_fetch_slice_retries_on_transient_error():
 
     Watermark is set 2 hours in the past so from_ < t_clear (slice loop executes).
     """
-    from custom_components.ha_timescaledb_recorder.retry import retry_until_success
-    from custom_components.ha_timescaledb_recorder.backfill import _LATE_ARRIVAL_GRACE
+    from custom_components.timescaledb_recorder.retry import retry_until_success
+    from custom_components.timescaledb_recorder.backfill import _LATE_ARRIVAL_GRACE
 
     hass = MagicMock()
     # wm must be in the past so that from_ = wm - _LATE_ARRIVAL_GRACE < t_clear = now()
@@ -536,17 +536,17 @@ async def test_fetch_slice_retries_on_transient_error():
         return decorator
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.retry_until_success",
+        "custom_components.timescaledb_recorder.backfill.retry_until_success",
         zero_backoff_retry,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance"
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance"
     ) as mock_get_inst, patch(
-        "custom_components.ha_timescaledb_recorder.backfill._fetch_slice_raw",
+        "custom_components.timescaledb_recorder.backfill._fetch_slice_raw",
         flaky_fetch_raw,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+        "custom_components.timescaledb_recorder.backfill.notify_backfill_gap"
     ):
         recorder_inst = MagicMock()
         recorder_inst.states_manager.oldest_ts = None
@@ -569,10 +569,10 @@ async def test_fetch_slice_retries_on_transient_error():
         asyncio.create_task(stopper())
 
         with patch(
-            "custom_components.ha_timescaledb_recorder.backfill._SLICE_WINDOW",
+            "custom_components.timescaledb_recorder.backfill._SLICE_WINDOW",
             timedelta(hours=2),
         ), patch(
-            "custom_components.ha_timescaledb_recorder.backfill._RECORDER_COMMIT_LAG",
+            "custom_components.timescaledb_recorder.backfill._RECORDER_COMMIT_LAG",
             timedelta(seconds=0),
         ):
             await asyncio.wait_for(
@@ -615,9 +615,9 @@ async def test_orchestrator_does_not_swallow_unhandled_exceptions():
     hass.async_add_executor_job = AsyncMock(side_effect=raise_after_wm)
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance"
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ):
         with pytest.raises(RuntimeError, match="unhandled-boom"):
             await backfill_orchestrator(
@@ -688,20 +688,20 @@ async def test_orchestrator_includes_non_registry_entities():
         backfill_request.set()
 
     with patch(
-        "custom_components.ha_timescaledb_recorder.backfill.recorder.get_instance",
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance",
         return_value=recorder_inst,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.notify_backfill_gap"
+        "custom_components.timescaledb_recorder.backfill.notify_backfill_gap"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill._fetch_slice_raw",
+        "custom_components.timescaledb_recorder.backfill._fetch_slice_raw",
         capture_fetch,
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill._SLICE_WINDOW",
+        "custom_components.timescaledb_recorder.backfill._SLICE_WINDOW",
         timedelta(hours=1),
     ), patch(
-        "custom_components.ha_timescaledb_recorder.backfill._RECORDER_COMMIT_LAG",
+        "custom_components.timescaledb_recorder.backfill._RECORDER_COMMIT_LAG",
         timedelta(seconds=0),
     ):
         asyncio.create_task(stopper())

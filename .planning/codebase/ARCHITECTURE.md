@@ -19,43 +19,43 @@ focus: arch
 
 **Integration Entrypoint:**
 - Purpose: HA lifecycle hooks — setup, teardown, options update
-- Location: `custom_components/ha_timescaledb_recorder/__init__.py`
-- Contains: `async_setup_entry`, `async_unload_entry`, `HaTimescaleDBData` dataclass, entity filter construction
+- Location: `custom_components/timescaledb_recorder/__init__.py`
+- Contains: `async_setup_entry`, `async_unload_entry`, `TimescaledbRecorderData` dataclass, entity filter construction
 - Depends on: `StateIngester`, `MetadataSyncer`, `async_setup_schema`, `asyncpg.Pool`
 - Used by: Home Assistant config entry machinery
 
 **Schema Layer:**
 - Purpose: Idempotent DDL execution — creates hypertable, compression policy, indexes, and all dimension tables on startup
-- Location: `custom_components/ha_timescaledb_recorder/schema.py`
+- Location: `custom_components/timescaledb_recorder/schema.py`
 - Contains: `async_setup_schema()` function
 - Depends on: SQL constants from `const.py`, `asyncpg.Pool`
 - Used by: `async_setup_entry` in `__init__.py`
 
 **State Ingester:**
-- Purpose: Buffered, batched writer for time-series state change data into `ha_states` hypertable
-- Location: `custom_components/ha_timescaledb_recorder/ingester.py`
+- Purpose: Buffered, batched writer for time-series state change data into `states` hypertable
+- Location: `custom_components/timescaledb_recorder/ingester.py`
 - Contains: `StateIngester` class with in-memory list buffer, HA event listener, periodic flush timer
 - Depends on: `asyncpg.Pool`, HA event bus (`EVENT_STATE_CHANGED`), `async_track_time_interval`
-- Used by: `__init__.py` (holds reference on `HaTimescaleDBData`)
+- Used by: `__init__.py` (holds reference on `TimescaledbRecorderData`)
 
 **Metadata Syncer:**
 - Purpose: SCD2 (Slowly Changing Dimension Type 2) writer for HA registry metadata into four dimension tables
-- Location: `custom_components/ha_timescaledb_recorder/syncer.py`
+- Location: `custom_components/timescaledb_recorder/syncer.py`
 - Contains: `MetadataSyncer` class — full snapshot on startup, incremental close-and-insert on registry events
 - Depends on: `asyncpg.Pool`, HA entity/device/area/label registries and their update events
-- Used by: `__init__.py` (holds reference on `HaTimescaleDBData`)
+- Used by: `__init__.py` (holds reference on `TimescaledbRecorderData`)
 
 **Configuration Layer:**
 - Purpose: HA config flow for initial DSN entry and options (batch size, flush interval, compression parameters)
-- Location: `custom_components/ha_timescaledb_recorder/config_flow.py`
-- Contains: `TimescaleDBConfigFlow` (initial setup), `TimescaleDBOptionsFlow` (runtime tuning)
+- Location: `custom_components/timescaledb_recorder/config_flow.py`
+- Contains: `TimescaledbConfigFlow` (initial setup), `TimescaledbOptionsFlow` (runtime tuning)
 - Depends on: `asyncpg` (connection test), `voluptuous` (schema validation)
 - Used by: HA config entry UI
 
 **Constants & SQL:**
 - Purpose: All SQL strings and configuration constants in one place; no inline SQL in business logic
-- Location: `custom_components/ha_timescaledb_recorder/const.py`
-- Contains: DDL for `ha_states` hypertable, four dimension tables (`dim_entities`, `dim_devices`, `dim_areas`, `dim_labels`), SCD2 SQL (snapshot, close, insert), index SQL, `INSERT_SQL` for state ingestion
+- Location: `custom_components/timescaledb_recorder/const.py`
+- Contains: DDL for `states` hypertable, four dimension tables (`entities`, `devices`, `areas`, `labels`), SCD2 SQL (snapshot, close, insert), index SQL, `INSERT_SQL` for state ingestion
 - Used by: all other modules
 
 ## Data Flow
@@ -66,7 +66,7 @@ focus: arch
 2. `StateIngester._handle_state_changed` (synchronous `@callback`) filters by entity filter and appends `(entity_id, state, attributes_json, last_updated, last_changed)` to `_buffer`
 3. If buffer reaches `batch_size`, `hass.async_create_task(_async_flush())` is scheduled
 4. Periodic timer (`flush_interval` seconds) triggers `_async_flush_timer` which flushes if buffer is non-empty
-5. `_async_flush` acquires a pool connection and calls `conn.executemany(INSERT_SQL, rows)` against `ha_states`
+5. `_async_flush` acquires a pool connection and calls `conn.executemany(INSERT_SQL, rows)` against `states`
 6. On `PostgresConnectionError`, rows are re-queued and pool connections expired; on other `PostgresError`, batch is dropped with error log
 
 **Metadata Sync Write Path (startup snapshot):**
@@ -97,10 +97,10 @@ focus: arch
 
 ## Key Abstractions
 
-**`HaTimescaleDBData` (dataclass):**
+**`TimescaledbRecorderData` (dataclass):**
 - Purpose: Runtime state attached to the config entry; holds references to both workers and the pool
-- Location: `custom_components/ha_timescaledb_recorder/__init__.py`
-- Pattern: HA `ConfigEntry[HaTimescaleDBData]` typed alias (`HaTimescaleDBConfigEntry`)
+- Location: `custom_components/timescaledb_recorder/__init__.py`
+- Pattern: HA `ConfigEntry[TimescaledbRecorderData]` typed alias (`TimescaledbRecorderConfigEntry`)
 
 **Entity Filter:**
 - Purpose: Declarative include/exclude filter deciding which `entity_id`s are recorded
@@ -120,17 +120,17 @@ focus: arch
 ## Entry Points
 
 **`async_setup_entry(hass, entry)`:**
-- Location: `custom_components/ha_timescaledb_recorder/__init__.py:59`
+- Location: `custom_components/timescaledb_recorder/__init__.py:59`
 - Triggers: HA loading the integration (on startup or after config flow)
 - Responsibilities: create asyncpg pool, run schema setup, build entity filter, instantiate and start `StateIngester` and `MetadataSyncer`, attach `runtime_data`, register options listener
 
 **`async_unload_entry(hass, entry)`:**
-- Location: `custom_components/ha_timescaledb_recorder/__init__.py:108`
+- Location: `custom_components/timescaledb_recorder/__init__.py:108`
 - Triggers: HA unloading the integration (shutdown, reload, or user removal)
 - Responsibilities: stop ingester (final flush), stop syncer (cancel listeners), close pool
 
-**`TimescaleDBConfigFlow.async_step_user`:**
-- Location: `custom_components/ha_timescaledb_recorder/config_flow.py:26`
+**`TimescaledbConfigFlow.async_step_user`:**
+- Location: `custom_components/timescaledb_recorder/config_flow.py:26`
 - Triggers: User adds the integration via HA UI
 - Responsibilities: validate DSN by opening a test connection, persist `{dsn}` to `entry.data`
 

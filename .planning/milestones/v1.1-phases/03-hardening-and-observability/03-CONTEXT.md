@@ -82,7 +82,7 @@ Out of scope / DROPPED / deferred: SQLERR-03 (per-row fallback loop) — dropped
 - **D-06-a:** Both `TimescaledbStateRecorderThread.run` and `TimescaledbMetaRecorderThread.run` wrap their main loop in an outer `try/except Exception as err:` block.
 - **D-06-b:** On exception: `_LOGGER.error('%s died with unhandled exception', self.name, exc_info=True)`; record the exception on `self._last_exception = err`; record the last known state (mode, retry counter, last op) on `self._last_context: dict`. Then fall through `run()` naturally — thread exits, `is_alive()` becomes False, watchdog picks up on the next tick.
 - **D-06-c:** Watchdog reads `self._last_exception` and `self._last_context` off the dead thread object when composing the recovery notification.
-- **D-06-d:** Expected exceptions (base `Exception` caught inside retry decorator) do NOT trigger this path — only unhandled exceptions outside the retry scope (e.g., bug in worker state-machine logic, uncaught `AttributeError` in `StateRow.from_ha_state`, failure in schema setup without retry wrapping). The retry loop itself handles persistent DB errors via stall notification (D-02, D-03).
+- **D-06-d:** Expected exceptions (base `Exception` caught inside retry decorator) do NOT trigger this path — only unhandled exceptions outside the retry scope (e.g., bug in worker state-machine logic, uncaught `AttributeError` in `StateRow.from_state`, failure in schema setup without retry wrapping). The retry loop itself handles persistent DB errors via stall notification (D-02, D-03).
 
 ### D-07 Unified watchdog-recovery notification
 
@@ -214,17 +214,17 @@ Delivered partially by D-02 (worker_stalled). Remaining items marked Claude's Di
 
 ### Existing implementation
 
-- `custom_components/ha_timescaledb_recorder/retry.py` — retry decorator. Phase 3 D-03 extends signature (`on_recovery`, optional `on_transient`).
-- `custom_components/ha_timescaledb_recorder/states_worker.py` — `run()` gains D-06 outer try/except + `_last_exception` / `_last_context` fields; `_stall_hook` stays, `_recovery_hook` added.
-- `custom_components/ha_timescaledb_recorder/meta_worker.py` — same D-06 + D-02 additions as states_worker.
-- `custom_components/ha_timescaledb_recorder/backfill.py` — orchestrator body wrapped in outer try/except logging + re-raise to fire `add_done_callback` path (D-04); `read_watermark` decorated with retry (D-03-c); `_fetch_slice_raw` decorated with retry `on_transient=None` (D-03-c); D-08 gap detection inserted at top of each cycle.
-- `custom_components/ha_timescaledb_recorder/issues.py` — extended with D-02 worker_stalled helpers + D-11 db_unreachable + recorder_disabled helpers (Claude's Discretion).
-- `custom_components/ha_timescaledb_recorder/notifications.py` — NEW module per D-07.
-- `custom_components/ha_timescaledb_recorder/watchdog.py` — NEW module per D-05.
-- `custom_components/ha_timescaledb_recorder/strings.json` — `"issues"` section extended per D-10.
-- `custom_components/ha_timescaledb_recorder/const.py` — add `STALL_THRESHOLD`, watchdog cadence constant, `DB_UNREACHABLE_THRESHOLD_SECONDS=300`.
-- `custom_components/ha_timescaledb_recorder/__init__.py` — `async_setup_entry` spawns watchdog task and wires orchestrator `add_done_callback`; `async_unload_entry` cancels watchdog before joining threads; `runtime_data` gains `watchdog_task` field.
-- `custom_components/ha_timescaledb_recorder/manifest.json` — unchanged.
+- `custom_components/timescaledb_recorder/retry.py` — retry decorator. Phase 3 D-03 extends signature (`on_recovery`, optional `on_transient`).
+- `custom_components/timescaledb_recorder/states_worker.py` — `run()` gains D-06 outer try/except + `_last_exception` / `_last_context` fields; `_stall_hook` stays, `_recovery_hook` added.
+- `custom_components/timescaledb_recorder/meta_worker.py` — same D-06 + D-02 additions as states_worker.
+- `custom_components/timescaledb_recorder/backfill.py` — orchestrator body wrapped in outer try/except logging + re-raise to fire `add_done_callback` path (D-04); `read_watermark` decorated with retry (D-03-c); `_fetch_slice_raw` decorated with retry `on_transient=None` (D-03-c); D-08 gap detection inserted at top of each cycle.
+- `custom_components/timescaledb_recorder/issues.py` — extended with D-02 worker_stalled helpers + D-11 db_unreachable + recorder_disabled helpers (Claude's Discretion).
+- `custom_components/timescaledb_recorder/notifications.py` — NEW module per D-07.
+- `custom_components/timescaledb_recorder/watchdog.py` — NEW module per D-05.
+- `custom_components/timescaledb_recorder/strings.json` — `"issues"` section extended per D-10.
+- `custom_components/timescaledb_recorder/const.py` — add `STALL_THRESHOLD`, watchdog cadence constant, `DB_UNREACHABLE_THRESHOLD_SECONDS=300`.
+- `custom_components/timescaledb_recorder/__init__.py` — `async_setup_entry` spawns watchdog task and wires orchestrator `add_done_callback`; `async_unload_entry` cancels watchdog before joining threads; `runtime_data` gains `watchdog_task` field.
+- `custom_components/timescaledb_recorder/manifest.json` — unchanged.
 
 ### HA platform API references (to confirm during research)
 
@@ -250,7 +250,7 @@ Delivered partially by D-02 (worker_stalled). Remaining items marked Claude's Di
 ### Established patterns
 
 - `hass.async_add_executor_job(sync_fn, ...)` for crossing into recorder pool from event loop — reused for `_fetch_slice_raw` retry-wrapped calls and for the `_fetch_oldest_recorder_ts` gap-detection call (D-08-a step 2).
-- `entry.runtime_data` with `HaTimescaleDBData` dataclass — extended with `watchdog_task: asyncio.Task | None` field.
+- `entry.runtime_data` with `TimescaledbRecorderData` dataclass — extended with `watchdog_task: asyncio.Task | None` field.
 - `entry.async_on_unload` for cleanup registration — reused for watchdog task cancellation.
 - `@callback` decorator / `asyncio.Event` / `stop_event: threading.Event` sharing across components — reused unchanged.
 - `_LOGGER.error(..., exc_info=True)` convention for exceptions — reused in D-06 and D-07-b.

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from custom_components.ha_timescaledb_recorder.overflow_queue import OverflowQueue
+from custom_components.timescaledb_recorder.overflow_queue import OverflowQueue
 
 
 def test_init_not_overflowed():
@@ -31,7 +31,7 @@ def test_put_nowait_drops_newest_on_full_without_raising(caplog):
     q.put_nowait("a")
     q.put_nowait("b")
     with caplog.at_level(logging.WARNING,
-                         logger="custom_components.ha_timescaledb_recorder.overflow_queue"):
+                         logger="custom_components.timescaledb_recorder.overflow_queue"):
         q.put_nowait("c")  # must not raise
     assert q.overflowed is True
     # Existing items untouched — we dropped the newest
@@ -48,7 +48,7 @@ def test_put_nowait_subsequent_overflow_does_not_log(caplog):
     q = OverflowQueue(maxsize=1)
     q.put_nowait("a")
     with caplog.at_level(logging.WARNING,
-                         logger="custom_components.ha_timescaledb_recorder.overflow_queue"):
+                         logger="custom_components.timescaledb_recorder.overflow_queue"):
         q.put_nowait("b")  # first drop → logs
         q.put_nowait("c")  # second drop → no log (D-11-b)
         q.put_nowait("d")  # third drop → no log

@@ -5,7 +5,7 @@ subsystem: states-worker
 tags: [worker, state-machine, retry, psycopg3, backfill, thread]
 dependency_graph:
   requires: [02-01, 02-03, 02-04]
-  provides: [states_worker.TimescaledbStateRecorderThread, worker.StateRow.from_ha_state]
+  provides: [states_worker.TimescaledbStateRecorderThread, worker.StateRow.from_state]
   affects: [ingester.py, __init__.py]
 tech_stack:
   added: []
@@ -16,11 +16,11 @@ tech_stack:
     - adaptive queue.get(timeout=remaining) for flush cadence
 key_files:
   created:
-    - custom_components/ha_timescaledb_recorder/states_worker.py
+    - custom_components/timescaledb_recorder/states_worker.py
   modified:
-    - custom_components/ha_timescaledb_recorder/worker.py
+    - custom_components/timescaledb_recorder/worker.py
 decisions:
-  - StateRow.from_ha_state copies HA attributes dict to plain dict, breaking MappingProxyType reference before Jsonb wrapping downstream
+  - StateRow.from_state copies HA attributes dict to plain dict, breaking MappingProxyType reference before Jsonb wrapping downstream
   - _insert_chunk wrapped at __init__ not class-body time; retry hooks must bind to live self instance
   - asyncio.Event.set crossed via hass.loop.call_soon_threadsafe, never called directly from worker thread
   - Full import of states_worker deferred until plan 08 delivers backfill.py (BACKFILL_DONE forward dependency)
@@ -39,7 +39,7 @@ Three-mode state machine (MODE_INIT → MODE_BACKFILL → MODE_LIVE) with retry-
 
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
-| 1 | Gut worker.py — keep only StateRow + from_ha_state | 8b8aede | worker.py |
+| 1 | Gut worker.py — keep only StateRow + from_state | 8b8aede | worker.py |
 | 2 | Create states_worker.py with TimescaledbStateRecorderThread | 003d199 | states_worker.py |
 
 ## What Was Built
@@ -48,7 +48,7 @@ Three-mode state machine (MODE_INIT → MODE_BACKFILL → MODE_LIVE) with retry-
 
 `worker.py` was reduced from 392 lines to 50 lines. `DbWorker`, `MetaCommand`, and `_STOP` are removed. `StateRow` is retained with its original frozen/slots schema and gains one new classmethod:
 
-- `StateRow.from_ha_state(state)` — converts any HA `State`-compatible object to a `StateRow`, copying `attributes` from `MappingProxyType`/`ReadOnlyDict` into a plain dict (required before `Jsonb()` wrapping in the worker).
+- `StateRow.from_state(state)` — converts any HA `State`-compatible object to a `StateRow`, copying `attributes` from `MappingProxyType`/`ReadOnlyDict` into a plain dict (required before `Jsonb()` wrapping in the worker).
 
 Existing consumers importing `from .worker import StateRow` continue to work unchanged. Consumers importing `DbWorker` or `MetaCommand` will fail until plans 09/10 fix their import sites — this is expected and documented in the plan.
 
@@ -94,8 +94,8 @@ None. No new network endpoints, auth paths, or trust boundaries introduced. The 
 
 | Item | Status |
 |------|--------|
-| custom_components/ha_timescaledb_recorder/worker.py | FOUND |
-| custom_components/ha_timescaledb_recorder/states_worker.py | FOUND |
+| custom_components/timescaledb_recorder/worker.py | FOUND |
+| custom_components/timescaledb_recorder/states_worker.py | FOUND |
 | .planning/phases/02-durability-story/02-06-SUMMARY.md | FOUND |
 | Commit 8b8aede (Task 1) | FOUND |
 | Commit 003d199 (Task 2) | FOUND |

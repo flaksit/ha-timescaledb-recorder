@@ -31,7 +31,7 @@ tech-stack:
 
 key-files:
   created:
-    - custom_components/ha_timescaledb_recorder/backfill.py
+    - custom_components/timescaledb_recorder/backfill.py
   modified: []
 
 key-decisions:
@@ -78,7 +78,7 @@ completed: 2026-04-22
 
 ## Files Created/Modified
 
-- `/home/janfr/dev/home-assistant/ha-timescaledb-recorder/.claude/worktrees/agent-a7049cfa/custom_components/ha_timescaledb_recorder/backfill.py` - Event-loop backfill orchestrator: BACKFILL_DONE sentinel, _fetch_slice_raw per-entity fetcher, backfill_orchestrator coroutine
+- `/home/janfr/dev/home-assistant/ha-timescaledb-recorder/.claude/worktrees/agent-a7049cfa/custom_components/timescaledb_recorder/backfill.py` - Event-loop backfill orchestrator: BACKFILL_DONE sentinel, _fetch_slice_raw per-entity fetcher, backfill_orchestrator coroutine
 
 ## Decisions Made
 
@@ -104,7 +104,7 @@ completed: 2026-04-22
 
 ## Issues Encountered
 
-**Pre-existing breakage in syncer.py (out of scope):** The acceptance criteria require `import custom_components.ha_timescaledb_recorder.states_worker` to succeed, but the package `__init__.py` triggers `syncer.py` which imports `MetaCommand` from `worker.py`. `MetaCommand` was removed in plan 02-06 (`feat(02-06): retire DbWorker and MetaCommand`). This breaks the transitive import. This is a pre-existing wave 2 issue that will be resolved by the plan that updates `syncer.py` to drop the `MetaCommand` import (likely plan 02-10 or 02-11). It is NOT caused by `backfill.py` and is out of scope per deviation rule scope boundary.
+**Pre-existing breakage in syncer.py (out of scope):** The acceptance criteria require `import custom_components.timescaledb_recorder.states_worker` to succeed, but the package `__init__.py` triggers `syncer.py` which imports `MetaCommand` from `worker.py`. `MetaCommand` was removed in plan 02-06 (`feat(02-06): retire DbWorker and MetaCommand`). This breaks the transitive import. This is a pre-existing wave 2 issue that will be resolved by the plan that updates `syncer.py` to drop the `MetaCommand` import (likely plan 02-10 or 02-11). It is NOT caused by `backfill.py` and is out of scope per deviation rule scope boundary.
 
 All grep-based acceptance criteria pass. The `backfill.py` file itself parses and is structurally complete.
 

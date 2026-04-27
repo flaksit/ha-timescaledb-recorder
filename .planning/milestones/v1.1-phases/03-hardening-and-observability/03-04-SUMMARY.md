@@ -35,8 +35,8 @@ tech_stack:
 key_files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/states_worker.py
-    - custom_components/ha_timescaledb_recorder/meta_worker.py
+    - custom_components/timescaledb_recorder/states_worker.py
+    - custom_components/timescaledb_recorder/meta_worker.py
     - tests/test_states_worker.py
     - tests/test_meta_worker.py
 decisions:
@@ -65,9 +65,9 @@ Both worker threads are now wired to the extended retry decorator and carry post
 | Task | Name | Commit | Files |
 |------|------|--------|-------|
 | 1 (RED) | states_worker failing tests | 3016126 | tests/test_states_worker.py |
-| 1 (GREEN) | states_worker Phase 3 hooks + _last_* context | f014b02 | custom_components/ha_timescaledb_recorder/states_worker.py, tests/test_states_worker.py |
+| 1 (GREEN) | states_worker Phase 3 hooks + _last_* context | f014b02 | custom_components/timescaledb_recorder/states_worker.py, tests/test_states_worker.py |
 | 2 (RED) | meta_worker failing tests | 32e59c9 | tests/test_meta_worker.py |
-| 2 (GREEN) | meta_worker Phase 3 hooks + _last_* context | adab7ee | custom_components/ha_timescaledb_recorder/meta_worker.py, tests/test_meta_worker.py |
+| 2 (GREEN) | meta_worker Phase 3 hooks + _last_* context | adab7ee | custom_components/timescaledb_recorder/meta_worker.py, tests/test_meta_worker.py |
 
 ## Watchdog-Readable Attributes
 
@@ -188,8 +188,8 @@ None — all hook methods are fully wired to real `hass.add_job` calls with the 
 ## Self-Check: PASSED
 
 Files exist:
-- custom_components/ha_timescaledb_recorder/states_worker.py — FOUND (_stall_hook, _recovery_hook, _sustained_fail_hook, _last_exception, _run_main_loop, finally:)
-- custom_components/ha_timescaledb_recorder/meta_worker.py — FOUND (same set of attributes and methods)
+- custom_components/timescaledb_recorder/states_worker.py — FOUND (_stall_hook, _recovery_hook, _sustained_fail_hook, _last_exception, _run_main_loop, finally:)
+- custom_components/timescaledb_recorder/meta_worker.py — FOUND (same set of attributes and methods)
 - tests/test_states_worker.py — FOUND (20 test functions)
 - tests/test_meta_worker.py — FOUND (21 test functions)
 

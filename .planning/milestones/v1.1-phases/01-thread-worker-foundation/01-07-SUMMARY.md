@@ -60,7 +60,7 @@ Appended `mock_psycopg_conn` fixture returning `(conn, cur)` — a mock psycopg3
 | `test_connect_failure_worker_enters_loop` | D-03: `OperationalError` on connect does not kill thread |
 | `test_bad_meta_command_does_not_kill_loop` | Per-item exception boundary: `RuntimeError` skipped, next item processed |
 | `test_graceful_shutdown_awaits_join` | `async_stop()` calls `async_add_executor_job` (not `run_coroutine_threadsafe`) |
-| `test_process_entity_create_executes_snapshot_sql` | `_process_entity_command("create")` executes against `dim_entities` |
+| `test_process_entity_create_executes_snapshot_sql` | `_process_entity_command("create")` executes against `entities` |
 | `test_process_entity_remove_executes_close_sql` | `_process_entity_command("remove")` executes `SET valid_to` close |
 
 ## Deviations from Plan

@@ -8,12 +8,12 @@
 
 | New/Modified File | Role | Data Flow | Closest Analog | Match Quality |
 |---|---|---|---|---|
-| `custom_components/ha_timescaledb_recorder/worker.py` | service | event-driven + batch | `custom_components/ha_timescaledb_recorder/ingester.py` | role-match (owns flush loop; different execution model) |
-| `custom_components/ha_timescaledb_recorder/ingester.py` | event-relay | event-driven | `custom_components/ha_timescaledb_recorder/ingester.py` (self) | exact — thin version of existing class |
-| `custom_components/ha_timescaledb_recorder/syncer.py` | event-relay + helper | event-driven | `custom_components/ha_timescaledb_recorder/syncer.py` (self) | exact — thin version of existing class |
-| `custom_components/ha_timescaledb_recorder/__init__.py` | config | request-response | `custom_components/ha_timescaledb_recorder/__init__.py` (self) | exact — same lifecycle skeleton |
-| `custom_components/ha_timescaledb_recorder/const.py` | config | transform | `custom_components/ha_timescaledb_recorder/const.py` (self) | exact — placeholder syntax migration only |
-| `custom_components/ha_timescaledb_recorder/schema.py` | utility | CRUD | `custom_components/ha_timescaledb_recorder/schema.py` (self) | exact — sync conversion of existing function |
+| `custom_components/timescaledb_recorder/worker.py` | service | event-driven + batch | `custom_components/timescaledb_recorder/ingester.py` | role-match (owns flush loop; different execution model) |
+| `custom_components/timescaledb_recorder/ingester.py` | event-relay | event-driven | `custom_components/timescaledb_recorder/ingester.py` (self) | exact — thin version of existing class |
+| `custom_components/timescaledb_recorder/syncer.py` | event-relay + helper | event-driven | `custom_components/timescaledb_recorder/syncer.py` (self) | exact — thin version of existing class |
+| `custom_components/timescaledb_recorder/__init__.py` | config | request-response | `custom_components/timescaledb_recorder/__init__.py` (self) | exact — same lifecycle skeleton |
+| `custom_components/timescaledb_recorder/const.py` | config | transform | `custom_components/timescaledb_recorder/const.py` (self) | exact — placeholder syntax migration only |
+| `custom_components/timescaledb_recorder/schema.py` | utility | CRUD | `custom_components/timescaledb_recorder/schema.py` (self) | exact — sync conversion of existing function |
 
 ## Pattern Assignments
 
@@ -95,7 +95,7 @@ class DbWorker:
         self._queue: queue.Queue = queue.Queue()
         # daemon=True: if HA exits without calling async_stop(), thread dies immediately.
         # The in-memory buffer is lost in this case — accepted trade-off documented in CONTEXT D-19.
-        self._thread = threading.Thread(target=self.run, daemon=True, name="ha_timescaledb_worker")
+        self._thread = threading.Thread(target=self.run, daemon=True, name="timescaledb_worker")
         self._conn: psycopg.Connection | None = None
 ```
 
@@ -313,7 +313,7 @@ async def _entity_row_changed(self, conn, entity_id: str, new_params: tuple) -> 
     row = await conn.fetchrow(
         "SELECT name, platform, device_id, area_id, labels, device_class,"
         " unit_of_measurement, disabled_by, extra"
-        " FROM dim_entities WHERE entity_id = $1 AND valid_to IS NULL",
+        " FROM entities WHERE entity_id = $1 AND valid_to IS NULL",
         entity_id,
     )
 ```
@@ -383,19 +383,19 @@ async def async_stop(self) -> None:
 
 **Analog:** `__init__.py` (self, lines 32-114)
 
-**`HaTimescaleDBData` dataclass** — drop `pool: asyncpg.Pool`, add `worker: DbWorker` (lines 32-38):
+**`TimescaledbRecorderData` dataclass** — drop `pool: asyncpg.Pool`, add `worker: DbWorker` (lines 32-38):
 
 ```python
 # CURRENT (lines 32-38):
 @dataclass
-class HaTimescaleDBData:
+class TimescaledbRecorderData:
     ingester: StateIngester
     syncer: MetadataSyncer
     pool: asyncpg.Pool
 
 # NEW:
 @dataclass
-class HaTimescaleDBData:
+class TimescaledbRecorderData:
     worker: DbWorker
     ingester: StateIngester
     syncer: MetadataSyncer
@@ -407,7 +407,7 @@ class HaTimescaleDBData:
 # CURRENT: creates pool, calls async_setup_schema, then starts ingester/syncer
 # NEW: creates queue + worker, starts worker thread, then starts ingester/syncer
 
-async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: TimescaledbRecorderConfigEntry) -> bool:
     dsn = entry.data[CONF_DSN]
     options = entry.options
     chunk_interval_days = options.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS)
@@ -429,7 +429,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
     ingester.async_start()          # registers STATE_CHANGED listener
     await syncer.async_start()      # enqueues snapshot, registers 4 registry listeners
 
-    entry.runtime_data = HaTimescaleDBData(worker=worker, ingester=ingester, syncer=syncer)
+    entry.runtime_data = TimescaledbRecorderData(worker=worker, ingester=ingester, syncer=syncer)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 ```
@@ -440,8 +440,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry
 # CURRENT: cancels timers, closes pool
 # NEW: cancel event listeners, put _STOP, await thread.join
 
-async def async_unload_entry(hass: HomeAssistant, entry: HaTimescaleDBConfigEntry) -> bool:
-    data: HaTimescaleDBData = entry.runtime_data
+async def async_unload_entry(hass: HomeAssistant, entry: TimescaledbRecorderConfigEntry) -> bool:
+    data: TimescaledbRecorderData = entry.runtime_data
     # Stop event listeners first so no new items are enqueued during shutdown
     ingester.async_stop()           # sync: just cancels listener (no final flush needed)
     await data.syncer.async_stop()  # cancels 4 registry listeners
@@ -488,20 +488,20 @@ VALUES (%s, %s, %s, %s, %s)
 SELECT_ENTITY_CURRENT_SQL = (
     "SELECT name, platform, device_id, area_id, labels, device_class,"
     " unit_of_measurement, disabled_by, extra"
-    " FROM dim_entities WHERE entity_id = %s AND valid_to IS NULL"
+    " FROM entities WHERE entity_id = %s AND valid_to IS NULL"
 )
 
 SELECT_DEVICE_CURRENT_SQL = (
     "SELECT name, manufacturer, model, area_id, labels, extra"
-    " FROM dim_devices WHERE device_id = %s AND valid_to IS NULL"
+    " FROM devices WHERE device_id = %s AND valid_to IS NULL"
 )
 
 SELECT_AREA_CURRENT_SQL = (
-    "SELECT name, extra FROM dim_areas WHERE area_id = %s AND valid_to IS NULL"
+    "SELECT name, extra FROM areas WHERE area_id = %s AND valid_to IS NULL"
 )
 
 SELECT_LABEL_CURRENT_SQL = (
-    "SELECT name, color, extra FROM dim_labels WHERE label_id = %s AND valid_to IS NULL"
+    "SELECT name, color, extra FROM labels WHERE label_id = %s AND valid_to IS NULL"
 )
 ```
 
@@ -745,6 +745,6 @@ def mock_psycopg_conn():
 
 ## Metadata
 
-**Analog search scope:** `custom_components/ha_timescaledb_recorder/` (all 5 existing source files), `tests/` (4 test files + conftest)
+**Analog search scope:** `custom_components/timescaledb_recorder/` (all 5 existing source files), `tests/` (4 test files + conftest)
 **Files scanned:** 9
 **Pattern extraction date:** 2026-04-19

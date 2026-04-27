@@ -26,7 +26,7 @@ tech-stack:
 key-files:
   created: []
   modified:
-    - custom_components/ha_timescaledb_recorder/schema.py
+    - custom_components/timescaledb_recorder/schema.py
 
 key-decisions:
   - "Single cursor for all 14 DDL statements — no rows returned so cursor reuse is safe and minimises diff"
@@ -67,7 +67,7 @@ completed: "2026-04-19"
 
 ## Files Created/Modified
 
-- `custom_components/ha_timescaledb_recorder/schema.py` - Converted from asyncpg async to psycopg3 sync; `async_setup_schema` → `sync_setup_schema`
+- `custom_components/timescaledb_recorder/schema.py` - Converted from asyncpg async to psycopg3 sync; `async_setup_schema` → `sync_setup_schema`
 
 ## Decisions Made
 
@@ -93,7 +93,7 @@ None - no external service configuration required.
 
 ## Self-Check
 
-- `custom_components/ha_timescaledb_recorder/schema.py` — file exists and verified via ast.parse
+- `custom_components/timescaledb_recorder/schema.py` — file exists and verified via ast.parse
 - Commit `eb9d48b` — present in git log
 - Zero `async` occurrences in schema.py confirmed by grep returning 0 matches
 

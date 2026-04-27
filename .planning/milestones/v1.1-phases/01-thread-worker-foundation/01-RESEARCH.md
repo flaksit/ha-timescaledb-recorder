@@ -35,7 +35,7 @@ One important correction to prior documentation: `hass.async_add_job` is depreca
 - D-09: New `worker.py` module containing `DbWorker` class. `DbWorker` owns: `threading.Thread`, `queue.Queue`, `psycopg.Connection`, schema setup at startup, flush loop, SCD2 dispatch logic.
 - D-10: `ingester.py` becomes a thin event relay: no async flush, no asyncpg.
 - D-11: `syncer.py` becomes a thin event relay: extracts params in `@callbacks`, enqueues `MetaCommand`. SCD2 DB ops move to `DbWorker`.
-- D-12: `HaTimescaleDBData` drops `pool: asyncpg.Pool`; holds `worker: DbWorker` instead.
+- D-12: `TimescaledbRecorderData` drops `pool: asyncpg.Pool`; holds `worker: DbWorker` instead.
 
 **MetadataSyncer Architecture**
 - D-13: MetadataSyncer retains field extraction helpers and change detection helpers — these become sync methods using a psycopg3 cursor passed in from the worker.
@@ -158,7 +158,7 @@ HA Event Loop Thread
           │
           └── [main loop] queue.get(timeout=5)
                 ├── StateRow  → accumulate in _buffer list
-                │              every 5 s (timeout) → executemany INSERT ha_states
+                │              every 5 s (timeout) → executemany INSERT states
                 ├── MetaCommand → _process_meta_command(cmd)
                 │                  ├── "create"/"update" → change detection read + SCD2 insert
                 │                  └── "remove" → SCD2 close
@@ -166,13 +166,13 @@ HA Event Loop Thread
                                 │
                                 ▼
         TimescaleDB
-          └── ha_states hypertable + dim_* SCD2 tables
+          └── states hypertable + dim_* SCD2 tables
 ```
 
 ### Recommended Project Structure
 
 ```
-custom_components/ha_timescaledb_recorder/
+custom_components/timescaledb_recorder/
 ├── __init__.py      # async_setup_entry, async_unload_entry (no DB ops)
 ├── worker.py        # DbWorker, StateRow, MetaCommand, _STOP
 ├── ingester.py      # StateIngester: thin @callback relay → queue
@@ -463,7 +463,7 @@ with conn.cursor() as cur:
     cur.execute(
         "SELECT name, platform, device_id, area_id, labels, "
         "device_class, unit_of_measurement, disabled_by, extra "
-        "FROM dim_entities WHERE entity_id = %s AND valid_to IS NULL",
+        "FROM entities WHERE entity_id = %s AND valid_to IS NULL",
         (entity_id,),
     )
     row = cur.fetchone()  # None if no open row exists
@@ -527,7 +527,7 @@ def run(self) -> None:
 |--------------|------------------|--------------|--------|
 | asyncpg + async write path | psycopg3 sync connection in worker thread | Phase 1 of v1.1 | Eliminates async-in-thread complexity entirely |
 | `async_track_time_interval` for flush timer | `queue.Queue.get(timeout=5)` inside worker | Phase 1 | Removes event-loop-side timer; simpler lifecycle |
-| `pool: asyncpg.Pool` in `HaTimescaleDBData` | `worker: DbWorker` in `HaTimescaleDBData` | Phase 1 | Pool replaced by single connection owned by worker |
+| `pool: asyncpg.Pool` in `TimescaledbRecorderData` | `worker: DbWorker` in `TimescaledbRecorderData` | Phase 1 | Pool replaced by single connection owned by worker |
 | `hass.async_create_task(self._async_flush())` | `queue.put_nowait(StateRow(...))` | Phase 1 | No async tasks for DB writes; no event loop dependency |
 | `async def _entity_row_changed(conn, ...)` | `def _entity_row_changed(cur: Cursor, ...)` | Phase 1 | Sync method; cursor passed from worker thread |
 
@@ -647,7 +647,7 @@ The following directives from `CLAUDE.md` apply to Phase 1 implementation:
 - `const.py` (codebase read) — complete inventory of all `$N` placeholder SQL constants
 - `syncer.py` (codebase read) — all 4 inline `fetchrow()` calls identified; full method signatures documented
 - `schema.py` (codebase read) — `async_setup_schema` identified for sync conversion
-- `__init__.py` (codebase read) — current lifecycle to replace; `HaTimescaleDBData` fields confirmed
+- `__init__.py` (codebase read) — current lifecycle to replace; `TimescaledbRecorderData` fields confirmed
 
 ### Secondary (MEDIUM confidence)
 

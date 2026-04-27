@@ -1,32 +1,23 @@
 # Deferred Items — 260427-lin
 
-Out-of-scope discoveries logged during execution per executor SCOPE BOUNDARY rule.
-NOT fixed by this plan. Track for a future cleanup task.
+All initially-deferred pre-existing test failures have been fixed in
+follow-up commit alongside this plan. Nothing remains deferred.
 
-## Pre-existing broken tests (unrelated to issue #11)
+## Resolved
 
-### tests/test_states_worker.py
+### tests/test_states_worker.py — fixed
 
-`ImportError: cannot import name 'SELECT_OPEN_ENTITIES_SQL' from
-'custom_components.timescaledb_recorder.const'`.
+`SELECT_OPEN_ENTITIES_SQL` constant was renamed to `SELECT_ALL_KNOWN_ENTITIES_SQL`
+in commit `566f8e6` (refactor: replace open-entity filter with full known-entity
+union). Test imports + assertion updated to track the rename. The
+`read_open_entities` test was renamed to `test_read_all_known_entities_returns_set_of_ids`
+and asserts against `SELECT_ALL_KNOWN_ENTITIES_SQL`.
 
-Stale reference to a constant removed when the codebase was renamed
-(commit `6411d6b rename: remove ha_ and dim_ prefix from code and tables`).
-The test module itself was not updated to track the const cleanup.
+### tests/test_config_flow.py::test_valid_dsn / test_invalid_dsn — fixed
 
-Action: rename / remove the obsolete test module, or rewrite it against
-the current `const.py` symbols.
-
-### tests/test_config_flow.py::test_valid_dsn
-
-`AssertionError: assert <FlowResultType.FORM: 'form'> == 'create_entry'`.
-
-Pre-existing assertion mismatch — test expects the config flow to land on
-`create_entry` after the DSN form, but the current flow returns `form`
-(probably an extra step was added without the test being updated).
-
-Action: align the test with the current config flow shape.
-
-Both failures reproduce on the clean tree (verified: `git stash` reported
-no local changes, fresh `pytest` run still fails identically) and predate
-this plan.
+The config flow was migrated from `asyncpg.connect` to
+`psycopg.AsyncConnection.connect` in commit `ef77e6e`. Tests still patched
+the old `asyncpg.connect` symbol, so the real `psycopg.AsyncConnection.connect`
+ran (or attempted to run) and returned an error path. Patches updated to
+target `psycopg.AsyncConnection.connect`. `mock_conn.close` is now awaited
+(`assert_awaited_once`) to match the async-connection lifecycle.

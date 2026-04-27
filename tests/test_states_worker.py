@@ -504,8 +504,6 @@ def test_setup_schema_retry_wiring_captures_on_transient():
             "on_sustained_fail": on_sustained_fail,
         })
         def decorator(fn):
-            # Tag which raw function was wrapped so we can verify by index.
-            decorator._wrapped_fn = fn
             all_calls[-1]["wrapped_fn"] = fn
             return fn
         return decorator

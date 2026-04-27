@@ -5,7 +5,7 @@ milestone_name: Robust Ingestion
 status: complete
 stopped_at: null
 last_updated: "2026-04-24T10:22:00Z"
-last_activity: 2026-04-27 -- Completed quick task 260427-lin: Fix #11 HA startup delay (batch registry backfill, async_at_started)
+last_activity: 2026-04-27 -- Completed quick task 260427-oi6: Fix #12 retry decorator everywhere DB used in states_worker
 progress:
   total_phases: 0
   completed_phases: 0
@@ -51,3 +51,4 @@ Summary: `.planning/MILESTONES.md`
 |---|-------------|------|--------|-----------|
 | 260424-l5k | Fix backfill entity set for non-registry entities (sun.sun, zone.home, conversation.*) | 2026-04-24 | 566f8e6 | [260424-l5k-fix-backfill-to-include-non-entity-regis](./quick/260424-l5k-fix-backfill-to-include-non-entity-regis/) |
 | 260427-lin | Fix #11: HA startup delay — batch registry backfill, defer orchestrator/meta_init via async_at_started | 2026-04-27 | 56216b3 | [260427-lin-fix-11-ha-startup-delay-batch-registry-b](./quick/260427-lin-fix-11-ha-startup-delay-batch-registry-b/) |
+| 260427-oi6 | Fix #12: retry decorator everywhere DB used in states_worker | 2026-04-27 | b65d0f1 | [260427-oi6-ensure-retry-decorator-used-everywhere-d](./quick/260427-oi6-ensure-retry-decorator-used-everywhere-d/) |

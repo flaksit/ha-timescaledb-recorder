@@ -1,10 +1,11 @@
 {
   "domain": "timescaledb_recorder",
   "name": "TimescaleDB Recorder",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "documentation": "https://github.com/flaksit/ha-timescaledb-recorder",
   "issue_tracker": "https://github.com/flaksit/ha-timescaledb-recorder/issues",
   "codeowners": ["@flaksit"],
+  "after_dependencies": ["recorder"],
   "requirements": ["psycopg[binary]==3.3.3"],
   "config_flow": true,
   "integration_type": "service",

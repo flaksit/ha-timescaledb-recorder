@@ -66,7 +66,7 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
     Steps recorded via side_effect callbacks that append to a shared sequence list.
     Expected order in async_setup_entry: meta_worker.start (step2), states_worker.start
     (step3), registry_listener.async_start (step6), state_listener.async_start (step7),
-    bus.async_listen_once registration (step8).
+    async_at_started registration (step8 — issue #11: replaces async_listen_once).
 
     Steps 4+5 (persistent queue drain + registry backfill) run inside _async_meta_init
     background task — not awaited in async_setup_entry, so not in this sequence.
@@ -93,7 +93,10 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
         "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
     ), patch(
         "custom_components.timescaledb_recorder.ha_recorder",
-    ) as mock_recorder:
+    ) as mock_recorder, patch(
+        "custom_components.timescaledb_recorder.async_at_started",
+        side_effect=lambda *a, **kw: sequence.append("step8"),
+    ):
         MockPQ.return_value
 
         mw = MagicMock()
@@ -114,18 +117,15 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
         state_listener = MockSL.return_value
         state_listener.async_start = MagicMock(side_effect=lambda: sequence.append("step7"))
 
-        # Step 8 is async_listen_once registration
-        hass.bus.async_listen_once = MagicMock(
-            side_effect=lambda *a, **kw: sequence.append("step8")
-        )
-
         recorder_instance = MagicMock()
         recorder_instance.enabled = True
         mock_recorder.get_instance.return_value = recorder_instance
 
         await async_setup_entry(hass, mock_entry)
 
-    assert sequence == ["step2", "step3", "step6", "step7", "step8"], (
+    # async_at_started is called TWICE in async_setup_entry — once to defer
+    # meta_init, once to defer the orchestrator. Both fire after step7.
+    assert sequence == ["step2", "step3", "step6", "step7", "step8", "step8"], (
         f"D-12 steps must fire in order. Got: {sequence}"
     )
 
@@ -519,8 +519,20 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
 # ---------------------------------------------------------------------------
 
 async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entry):
-    """backfill_orchestrator must be called with threading_stop_event=data.stop_event."""
+    """backfill_orchestrator must be called with threading_stop_event=data.stop_event.
+
+    Issue #11: orchestrator spawn now flows through async_at_started instead of
+    async_listen_once(EVENT_HOMEASSISTANT_STARTED). Trigger the registered
+    callback to simulate HA reaching RUNNING.
+    """
     captured_kwargs = {}
+
+    # Capture every async_at_started registration so we can fire the orchestrator one.
+    registered_callbacks: list = []
+
+    def _record_at_started(_hass, cb):
+        registered_callbacks.append(cb)
+        return MagicMock()  # CALLBACK_TYPE unsubscribe handle (unused)
 
     with patch(
         "custom_components.timescaledb_recorder.PersistentQueue"
@@ -550,6 +562,9 @@ async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entr
     ) as mock_recorder, patch(
         "custom_components.timescaledb_recorder._wait_for_recorder_and_clear",
         new=AsyncMock(),
+    ), patch(
+        "custom_components.timescaledb_recorder.async_at_started",
+        side_effect=_record_at_started,
     ):
         MockPQ.return_value.join = AsyncMock()
         MockRL.return_value.async_start = AsyncMock()  # registry_listener
@@ -571,10 +586,15 @@ async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entr
 
         await async_setup_entry(hass, mock_entry)
 
-        # Trigger _on_ha_started by calling the registered callback
-        assert hass.bus.async_listen_once.called
-        _event_type, _callback = hass.bus.async_listen_once.call_args[0]
-        _callback(MagicMock())  # simulate HA started event
+        # async_at_started was registered twice: once for meta_init, once for
+        # the orchestrator. Fire BOTH callbacks (order matches setup_entry).
+        # The orchestrator callback ultimately calls backfill_orchestrator.
+        assert len(registered_callbacks) == 2, (
+            f"Expected 2 async_at_started registrations (meta_init + orchestrator), "
+            f"got {len(registered_callbacks)}"
+        )
+        for cb in registered_callbacks:
+            cb(hass)  # simulate HA reaching RUNNING
 
     assert mock_orch.called, "backfill_orchestrator not called"
     _, call_kwargs = mock_orch.call_args

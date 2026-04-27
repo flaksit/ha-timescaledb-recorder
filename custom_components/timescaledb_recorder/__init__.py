@@ -31,7 +31,6 @@ import voluptuous as vol
 
 from homeassistant.components import recorder as ha_recorder
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import config_validation as cv
@@ -43,6 +42,7 @@ from homeassistant.helpers.entityfilter import (
     convert_include_exclude_filter,
 )
 from homeassistant.helpers.reload import async_integration_yaml_config
+from homeassistant.helpers.start import async_at_started
 
 from .backfill import backfill_orchestrator
 from .const import (
@@ -475,11 +475,23 @@ async def async_setup_entry(
         raise
 
     # D-12 steps 6+7: drain persisted queue + registry backfill + enable listeners.
-    # Background task does not block homeassistant_started (HA: "Will not block startup").
-    hass.async_create_background_task(
-        _async_meta_init(hass, meta_queue, registry_listener),
-        name="timescaledb_recorder_meta_init",
-    )
+    # Issue #11: defer until HA reaches RUNNING via async_at_started so the
+    # initial registry snapshot does not compete with HA bootstrap. The
+    # registry_listener was already registered above in DISCARD mode, so any
+    # registry events fired during bootstrap are dropped (and re-snapshotted
+    # by the backfill below); state events continue to buffer in live_queue
+    # via state_listener regardless of when meta_init runs.
+    @callback
+    def _start_meta_init(_hass: HomeAssistant) -> None:
+        # async_at_started invokes this synchronously when HA is already
+        # RUNNING (reload path), so the wrapper must NOT await — schedule the
+        # coroutine via async_create_background_task instead.
+        hass.async_create_background_task(
+            _async_meta_init(hass, meta_queue, registry_listener),
+            name="timescaledb_recorder_meta_init",
+        )
+
+    async_at_started(hass, _start_meta_init)
 
     # D-11: recorder_disabled detection — one-shot check at setup. Backfill
     # requires HA's sqlite recorder; if it's not loaded or disabled, raise a
@@ -534,20 +546,26 @@ async def async_setup_entry(
         data.orchestrator_task = task
 
     # D-12 step 8: defer orchestrator spawn until HA has fully started.
-    # On reload, EVENT_HOMEASSISTANT_STARTED has already fired and will not fire
-    # again — spawn the orchestrator directly.
+    # Issue #11: async_at_started handles BOTH the fresh-boot case (callback
+    # fires when state flips to RUNNING) and the reload case (callback fires
+    # immediately, synchronously, because state is already RUNNING). This
+    # replaces the prior `is_running`/`async_listen_once` split and removes
+    # the "EVENT_HOMEASSISTANT_STARTED already fired and will not fire again"
+    # foot-gun on reload.
+    #
     # Startup snapshot removed: backfill entity set already includes
     # state_machine_entities (hass.states.async_all()) so it covers the same
     # gap. Snapshotting hass.states first risks writing partial/transitional
     # attribute values that ON CONFLICT DO NOTHING then locks in permanently,
     # blocking the correct SQLite row from the subsequent backfill cycle.
-    if hass.is_running:
+    @callback
+    def _start_orchestrator(_hass: HomeAssistant) -> None:
+        # Sync wrapper — async_at_started may invoke it synchronously on
+        # reload (state already RUNNING). _spawn_orchestrator schedules the
+        # actual orchestrator coroutine via async_create_background_task.
         _spawn_orchestrator()
-    else:
-        hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STARTED,
-            callback(lambda _event: _spawn_orchestrator()),
-        )
+
+    async_at_started(hass, _start_orchestrator)
 
     entry.runtime_data = data
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))

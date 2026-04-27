@@ -19,18 +19,24 @@ async def test_valid_dsn():
     flow = TimescaledbConfigFlow()
     flow.hass = MagicMock()
     mock_conn = AsyncMock()
-    with patch("asyncpg.connect", return_value=mock_conn) as mock_connect:
+    with patch(
+        "psycopg.AsyncConnection.connect",
+        new=AsyncMock(return_value=mock_conn),
+    ):
         result = await flow.async_step_user({CONF_DSN: "postgresql://user:pass@localhost/db"})
     assert result["type"] == "create_entry"
     assert result["title"] == "TimescaleDB"
     assert result["data"][CONF_DSN] == "postgresql://user:pass@localhost/db"
-    mock_conn.close.assert_called_once()
+    mock_conn.close.assert_awaited_once()
 
 
 async def test_invalid_dsn():
     flow = TimescaledbConfigFlow()
     flow.hass = MagicMock()
-    with patch("asyncpg.connect", side_effect=Exception("connection refused")):
+    with patch(
+        "psycopg.AsyncConnection.connect",
+        new=AsyncMock(side_effect=Exception("connection refused")),
+    ):
         result = await flow.async_step_user({CONF_DSN: "postgresql://bad/db"})
     assert result["type"] == "form"
     assert result["errors"]["base"] == "cannot_connect"

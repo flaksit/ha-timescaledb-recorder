@@ -9,7 +9,7 @@ import pytest
 
 from custom_components.timescaledb_recorder.const import (
     INSERT_SQL,
-    SELECT_OPEN_ENTITIES_SQL,
+    SELECT_ALL_KNOWN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
 )
 from custom_components.timescaledb_recorder.overflow_queue import OverflowQueue
@@ -111,14 +111,14 @@ def test_read_watermark_returns_none_on_empty_hypertable(mock_psycopg_conn):
     assert t.read_watermark() is None
 
 
-def test_read_open_entities_returns_set_of_ids(mock_psycopg_conn):
+def test_read_all_known_entities_returns_set_of_ids(mock_psycopg_conn):
     conn, cur = mock_psycopg_conn
     cur.fetchall = MagicMock(return_value=[("sensor.a",), ("sensor.b",)])
     t = _make_thread()
     t._conn = conn
-    result = t.read_open_entities()
+    result = t.read_all_known_entities()
     assert result == {"sensor.a", "sensor.b"}
-    cur.execute.assert_called_with(SELECT_OPEN_ENTITIES_SQL)
+    cur.execute.assert_called_with(SELECT_ALL_KNOWN_ENTITIES_SQL)
 
 
 def test_reset_db_connection_drops_conn():

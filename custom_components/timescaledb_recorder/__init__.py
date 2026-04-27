@@ -189,6 +189,12 @@ async def _async_initial_registry_backfill(
     Iteration order per CONTEXT Claude's Discretion: area → label → entity → device.
     Rationale: loose FK-like dependency ordering — referenced area_id / label_id
     rows land before the referencing entity/device rows.
+
+    Issue #11: builds a single ordered list of create items and writes them
+    via meta_queue.put_many_async — exactly ONE fsync regardless of registry
+    size, instead of one fsync per entry. On a typical install with hundreds
+    of registry rows this collapses N synchronous fsyncs (each gating HA's
+    bootstrap) into one, removing the startup-delay symptom in the issue.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     area_reg = ar.async_get(hass)
@@ -204,9 +210,11 @@ async def _async_initial_registry_backfill(
     now = datetime.now(timezone.utc)
     listener_helper = RegistryListener(hass=hass, meta_queue=meta_queue)
 
+    items: list[dict] = []
+
     for entry in area_reg.async_list_areas():
         params = listener_helper._extract_area_params(entry, now)
-        await meta_queue.put_async({
+        items.append({
             "registry": "area",
             "action": "create",
             "registry_id": entry.id,
@@ -217,7 +225,7 @@ async def _async_initial_registry_backfill(
 
     for entry in label_reg.async_list_labels():
         params = listener_helper._extract_label_params(entry, now)
-        await meta_queue.put_async({
+        items.append({
             "registry": "label",
             "action": "create",
             "registry_id": entry.label_id,
@@ -228,7 +236,7 @@ async def _async_initial_registry_backfill(
 
     for entry in entity_reg.entities.values():
         params = listener_helper._extract_entity_params(entry, now)
-        await meta_queue.put_async({
+        items.append({
             "registry": "entity",
             "action": "create",
             "registry_id": entry.entity_id,
@@ -239,7 +247,7 @@ async def _async_initial_registry_backfill(
 
     for entry in device_reg.devices.values():
         params = listener_helper._extract_device_params(entry, now)
-        await meta_queue.put_async({
+        items.append({
             "registry": "device",
             "action": "create",
             "registry_id": entry.id,
@@ -247,6 +255,9 @@ async def _async_initial_registry_backfill(
             "params": _to_json_safe(params),
             "enqueued_at": now_iso,
         })
+
+    # Single batched write — one fsync, one notify_all (issue #11).
+    await meta_queue.put_many_async(items)
 
 
 async def _overflow_watcher(

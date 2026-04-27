@@ -138,6 +138,23 @@ class TimescaledbStateRecorderThread(threading.Thread):
             on_transient=self.reset_db_connection,
         )(self._read_watermark_raw)
 
+        # Schema setup: retry on transient DB failure at startup (Issue #12).
+        # No stall/recovery hooks — schema setup is a one-time startup op; a
+        # persistent failure stalls the thread until DB is available (acceptable:
+        # the thread cannot do useful work without schema anyway).
+        self._setup_schema = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+        )(self._setup_schema_raw)
+
+        # read_all_known_entities: called by orchestrator via executor job at backfill
+        # start; must retry on transient errors to avoid a bare DB failure escaping
+        # to the async caller (Issue #12). Same minimal shape as read_watermark.
+        self.read_all_known_entities = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+        )(self._read_all_known_entities_raw)
+
     # ------------------------------------------------------------------
     # Connection management (D-07-g)
     # ------------------------------------------------------------------
@@ -155,6 +172,8 @@ class TimescaledbStateRecorderThread(threading.Thread):
             try:
                 self._conn.close()
             except Exception:  # noqa: BLE001
+                # Connection may already be dead; close() can raise — swallow
+                # so reset always completes.
                 pass
         self._conn = None
 
@@ -222,6 +241,15 @@ class TimescaledbStateRecorderThread(threading.Thread):
     # Main loop (D-04)
     # ------------------------------------------------------------------
 
+    def _setup_schema_raw(self) -> None:
+        """Raw schema setup — wrapped by retry_until_success in __init__."""
+        conn = self.get_db_connection()
+        sync_setup_schema(
+            conn,
+            chunk_interval_days=self._chunk_interval_days,
+            compress_after_hours=self._compress_after_hours,
+        )
+
     def run(self) -> None:
         """Thread entry point.
 
@@ -265,25 +293,8 @@ class TimescaledbStateRecorderThread(threading.Thread):
     def _run_main_loop(self) -> None:
         """Inner main loop extracted from run() so the outer try/except/finally
         in run() can wrap it cleanly (MEDIUM-8 pattern)."""
-        # Ensure schema (idempotent; D-15-d carries Phase 1 behaviour). Retry
-        # via decorator would be overkill here — startup race with DB outage
-        # is handled by the main loop (continues without schema; next flush
-        # cycle retries writes, which will fail until DDL succeeds on
-        # reconnect). Log-and-continue preserves WATCH-02 non-blocking shape.
         self._last_op = "schema_setup"
-        try:
-            conn = self.get_db_connection()
-            sync_setup_schema(
-                conn,
-                chunk_interval_days=self._chunk_interval_days,
-                compress_after_hours=self._compress_after_hours,
-            )
-        except Exception as err:  # noqa: BLE001 — broad by design
-            _LOGGER.warning(
-                "Schema setup failed at states worker startup (will retry on next "
-                "flush): %s", err,
-            )
-            self.reset_db_connection()
+        self._setup_schema()
 
         mode = MODE_INIT
         self._last_mode = mode
@@ -416,8 +427,10 @@ class TimescaledbStateRecorderThread(threading.Thread):
             row = cur.fetchone()
         return row[0] if row and row[0] is not None else None
 
-    def read_all_known_entities(self) -> set[str]:
-        """Return every entity_id ever seen: entities ∪ states.
+    def _read_all_known_entities_raw(self) -> set[str]:
+        """Raw read — wrapped by retry_until_success in __init__.
+
+        Returns every entity_id ever seen: entities ∪ states.
 
         No valid_to filter on entities: removed entities still need
         backfilling for the period before removal.

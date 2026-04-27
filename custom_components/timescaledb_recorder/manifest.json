@@ -1,7 +1,7 @@
 {
   "domain": "timescaledb_recorder",
   "name": "TimescaleDB Recorder",
-  "version": "1.2.11",
+  "version": "2.0.0",
   "documentation": "https://github.com/flaksit/ha-timescaledb-recorder",
   "issue_tracker": "https://github.com/flaksit/ha-timescaledb-recorder/issues",
   "codeowners": ["@flaksit"],

@@ -99,6 +99,19 @@ VALUES (%s, %s, %s, %s, %s)
 ON CONFLICT (last_updated, entity_id) DO NOTHING
 """
 
+# Live-capture insert overwrites existing rows — live state_changed events carry
+# the full HA state-machine attributes, which are always more complete than what
+# the HA SQLite recorder stores (it filters certain attributes, e.g. automation
+# id/mode/current/last_triggered). Backfill still uses DO NOTHING so it never
+# overwrites a live-captured row.
+INSERT_LIVE_SQL = f"""
+INSERT INTO {TABLE_NAME} (entity_id, state, attributes, last_updated, last_changed)
+VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (last_updated, entity_id) DO UPDATE
+    SET state      = EXCLUDED.state,
+        attributes = EXCLUDED.attributes
+"""
+
 # Dimension table DDL — SCD2 temporal tracking for HA registry metadata.
 # All tables are idempotent (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS)
 # so they can safely execute on every integration startup (D-11).

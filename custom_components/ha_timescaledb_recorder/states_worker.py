@@ -33,6 +33,7 @@ from .const import (
     BATCH_FLUSH_SIZE,
     FLUSH_INTERVAL,
     INSERT_CHUNK_SIZE,
+    INSERT_LIVE_SQL,
     INSERT_SQL,
     SELECT_ALL_KNOWN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
@@ -370,16 +371,19 @@ class TimescaledbStateRecorderThread(threading.Thread):
     def _insert_chunk_raw(self, chunk: list[StateRow]) -> None:
         """Raw insert. Wrapped by retry_until_success in __init__ (D-06-b).
 
-        INSERT_SQL carries ON CONFLICT (last_updated, entity_id) DO NOTHING
-        per D-06-d (requires D-09-a unique index).
+        Live mode uses INSERT_LIVE_SQL (DO UPDATE) — live state_changed events
+        carry full HA state-machine attributes which may be richer than what the
+        HA SQLite recorder stored for the same (entity_id, last_updated).
+        Backfill mode uses INSERT_SQL (DO NOTHING) — never overwrites live rows.
         """
+        sql = INSERT_LIVE_SQL if self._last_mode == MODE_LIVE else INSERT_SQL
         params = [
             (r.entity_id, r.state, Jsonb(r.attributes, dumps=lambda v: json.dumps(v, default=_json_default)), r.last_updated, r.last_changed)
             for r in chunk
         ]
         conn = self.get_db_connection()
         with conn.cursor() as cur:
-            cur.executemany(INSERT_SQL, params)
+            cur.executemany(sql, params)
 
     def _slice_to_rows(self, slice_dict: dict) -> list[StateRow]:
         """Merge per-entity lists, sort by last_updated, convert to StateRow (D-04-d)."""

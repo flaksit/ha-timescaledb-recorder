@@ -45,10 +45,22 @@ class PersistentQueue:
         # still on disk (we never removed it); on clean task_done(), we rewrite
         # the file without the front line and clear this field.
         self._in_flight: Any = _NO_IN_FLIGHT
+        # Track approximate item count for len() queries. Initialised from the
+        # on-disk file at startup (no lock needed — consumer has not started yet).
+        self._size: int = self._count_lines()
 
     # ------------------------------------------------------------------
     # Producer paths (D-03-b, D-03-c)
     # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        """Return the approximate number of items currently in the queue.
+
+        Thread-safe (reads _size under no lock, but _size is only mutated
+        while _cond is held by producers/consumer — Python int reads/writes
+        are atomic under the GIL for values that fit in a machine word).
+        """
+        return self._size
 
     def put(self, item: dict) -> None:
         """Blocking producer path: append JSON line, fsync, notify consumer.
@@ -64,6 +76,7 @@ class PersistentQueue:
                 f.write(line)
                 f.flush()
                 os.fsync(f.fileno())
+            self._size += 1
             self._cond.notify_all()
 
     async def put_async(self, item: dict) -> None:
@@ -96,6 +109,7 @@ class PersistentQueue:
                 f.flush()
                 # ONE fsync for the whole batch — issue #11 fix.
                 os.fsync(f.fileno())
+            self._size += len(items)
             self._cond.notify_all()
 
     async def put_many_async(self, items: list[dict]) -> None:
@@ -172,6 +186,10 @@ class PersistentQueue:
         with self._cond:
             self._rewrite_without_front_line_locked()
             self._in_flight = _NO_IN_FLIGHT
+            # Guard against underflow in case of double task_done() — defensive
+            # since caller contract says task_done() once per get(), but safe.
+            if self._size > 0:
+                self._size -= 1
 
     def _rewrite_without_front_line_locked(self) -> None:
         """Drop the first line of the queue file via tempfile + os.replace.
@@ -232,3 +250,21 @@ class PersistentQueue:
             line = f.readline()
         # Strip trailing newline so json.loads gets clean input.
         return line.rstrip("\n") if line else None
+
+    def _count_lines(self) -> int:
+        """Count non-empty lines in the queue file. Called at __init__ before
+        the consumer thread starts — no lock required at that point.
+
+        A "non-empty" line is any line that has content after stripping
+        whitespace. This intentionally counts malformed JSON lines too so the
+        size estimate is not artificially low (malformed lines are dropped by
+        get() and task_done() is not called for them, so _size self-corrects).
+        """
+        if not self._path.exists():
+            return 0
+        count = 0
+        with open(self._path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+        return count

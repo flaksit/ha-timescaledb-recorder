@@ -29,8 +29,9 @@ from typing import TYPE_CHECKING
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import WATCHDOG_INTERVAL_S
+from .const import SIGNAL_WORKER_STATE_CHANGE, WATCHDOG_INTERVAL_S
 from .meta_worker import TimescaledbMetaRecorderThread
 from .notifications import notify_watchdog_recovery
 from .states_worker import TimescaledbStateRecorderThread
@@ -97,6 +98,9 @@ async def _watchdog_respawn(
         "Watchdog detected dead %s thread — respawning after 5s", component,
     )
     notify_watchdog_recovery(hass, component=component, exc=exc, context=ctx)
+    # Signal worker-dead state before the throttle sleep so push-updated
+    # binary sensors reflect the dead state immediately (not 5s later).
+    async_dispatcher_send(hass, SIGNAL_WORKER_STATE_CHANGE)
     # Throttle: wait before respawn to prevent tight crash/notify/restart loops.
     # Does not significantly impact recovery time (WATCHDOG_INTERVAL_S=10s).
     # (Cross-AI review 2026-04-23, concern MEDIUM-5.)
@@ -104,6 +108,8 @@ async def _watchdog_respawn(
     new_thread = spawn_fn(hass, runtime)
     setattr(runtime, component, new_thread)
     new_thread.start()
+    # Signal worker-alive state after respawn so binary sensors show recovery.
+    async_dispatcher_send(hass, SIGNAL_WORKER_STATE_CHANGE)
 
 
 async def watchdog_loop(

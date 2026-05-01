@@ -41,6 +41,7 @@ from homeassistant.helpers.entityfilter import (
     convert_filter,
     convert_include_exclude_filter,
 )
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.reload import async_integration_yaml_config
 from homeassistant.helpers.start import async_at_started
 
@@ -54,6 +55,8 @@ from .const import (
     DEFAULT_COMPRESS_AFTER_HOURS,
     DOMAIN,
     LIVE_QUEUE_MAXSIZE,
+    PLATFORMS,
+    SIGNAL_OVERFLOW_CHANGE,
 )
 from .state_listener import StateListener
 from .issues import (
@@ -281,8 +284,12 @@ async def _overflow_watcher(
         except asyncio.TimeoutError:
             pass
         now = live_queue.overflowed
-        if now and not last_seen:
-            create_buffer_dropping_issue(hass)
+        if now != last_seen:
+            # Dispatch on both False→True and True→False so push-updated
+            # binary sensors reflect the current state immediately.
+            if now:
+                create_buffer_dropping_issue(hass)
+            async_dispatcher_send(hass, SIGNAL_OVERFLOW_CHANGE)
         last_seen = now
 
 
@@ -569,6 +576,11 @@ async def async_setup_entry(
 
     entry.runtime_data = data
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
+    # Forward setup to sensor and binary_sensor platforms so HA creates the
+    # diagnostic health entities defined in sensor.py / binary_sensor.py.
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     return True
 
 
@@ -660,4 +672,8 @@ async def async_unload_entry(
 
     # D-13-b step 6: connections are closed inside each worker's run() loop
     # after its shutdown branch. No further action needed here.
+
+    # Unload sensor and binary_sensor platforms registered in async_setup_entry.
+    await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
     return True

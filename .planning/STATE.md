@@ -4,8 +4,8 @@ milestone: v1.1
 milestone_name: Robust Ingestion
 status: complete
 stopped_at: null
-last_updated: "2026-04-24T10:22:00Z"
-last_activity: 2026-04-27 -- Completed quick task 260427-oi6: Fix #12 retry decorator everywhere DB used in states_worker
+last_updated: "2026-05-01T12:20:00Z"
+last_activity: 2026-05-01 -- Completed quick task 260501-vds: SENSOR-01 health sensor entities (8 diagnostic entities)
 progress:
   total_phases: 0
   completed_phases: 0
@@ -41,8 +41,8 @@ Summary: `.planning/MILESTONES.md`
 |----------|------|--------|-------------|
 | v2 | Schema migration infrastructure (SCHEMA-01) | Deferred | 2026-04-19 |
 | v2 | SSL/TLS option (SSL-01) | Deferred | 2026-04-19 |
-| v2 | Sensor entity for health (SENSOR-01) | Deferred | 2026-04-19 |
-| v2 | Entity filter in options flow (FILTER-01) | Deferred | 2026-04-19 |
+| ~~v2~~ | ~~Sensor entity for health (SENSOR-01)~~ | **Done** — 8 diagnostic entities, 260501-vds | 2026-04-19 |
+| ~~v2~~ | ~~Entity filter in options flow (FILTER-01)~~ | **Done** — implemented via `configuration.yaml`; options UI intentionally out of scope | 2026-04-19 |
 | tech-debt | `hasattr(ha_recorder, "async_wait_recorder")` forward-compat guard — if HA removes API, recorder_disabled issue won't auto-clear | Acknowledged | 2026-04-23 |
 
 ### Quick Tasks Completed
@@ -52,3 +52,4 @@ Summary: `.planning/MILESTONES.md`
 | 260424-l5k | Fix backfill entity set for non-registry entities (sun.sun, zone.home, conversation.*) | 2026-04-24 | 566f8e6 | [260424-l5k-fix-backfill-to-include-non-entity-regis](./quick/260424-l5k-fix-backfill-to-include-non-entity-regis/) |
 | 260427-lin | Fix #11: HA startup delay — batch registry backfill, defer orchestrator/meta_init via async_at_started | 2026-04-27 | 56216b3 | [260427-lin-fix-11-ha-startup-delay-batch-registry-b](./quick/260427-lin-fix-11-ha-startup-delay-batch-registry-b/) |
 | 260427-oi6 | Fix #12: retry decorator everywhere DB used in states_worker | 2026-04-27 | b65d0f1 | [260427-oi6-ensure-retry-decorator-used-everywhere-d](./quick/260427-oi6-ensure-retry-decorator-used-everywhere-d/) |
+| 260501-vds | SENSOR-01: 8 diagnostic health sensor/binary_sensor entities | 2026-05-01 | 7fecb8b | [260501-vds-sensor-01-health-sensors](./quick/260501-vds-sensor-01-health-sensors/) |

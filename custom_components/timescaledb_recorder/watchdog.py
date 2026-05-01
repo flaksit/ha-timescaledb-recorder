@@ -156,13 +156,21 @@ async def watchdog_loop(
             # Entire poll body in try/except — a bug in one cycle must not kill
             # the watchdog task and leave the workers unsupervised. (MEDIUM-9)
             try:
-                if not runtime.states_worker.is_alive() and not runtime.stop_event.is_set():
+                if (
+                    runtime.states_worker is not None
+                    and not runtime.states_worker.is_alive()
+                    and not runtime.stop_event.is_set()
+                ):
                     await _watchdog_respawn(
                         hass, runtime, component="states_worker",
                         dead_thread=runtime.states_worker,
                         spawn_fn=spawn_states_worker,
                     )
-                if not runtime.meta_worker.is_alive() and not runtime.stop_event.is_set():
+                if (
+                    runtime.meta_worker is not None
+                    and not runtime.meta_worker.is_alive()
+                    and not runtime.stop_event.is_set()
+                ):
                     await _watchdog_respawn(
                         hass, runtime, component="meta_worker",
                         dead_thread=runtime.meta_worker,

@@ -53,6 +53,10 @@ def hass():
     h.async_create_background_task = MagicMock()
     h.config = MagicMock()
     h.config.path = MagicMock(return_value="/tmp/ha_tsdb_test/metadata_queue.jsonl")
+    # Platform setup/unload calls added by SENSOR-01 — must be awaitable.
+    h.config_entries = MagicMock()
+    h.config_entries.async_forward_entry_setups = AsyncMock(return_value=None)
+    h.config_entries.async_unload_platforms = AsyncMock(return_value=None)
     return h
 
 
@@ -1190,6 +1194,9 @@ async def test_unload_cancels_and_awaits_watchdog_before_orchestrator():
     mock_entry.runtime_data = data
     hass = MagicMock()
     hass.async_add_executor_job = AsyncMock(return_value=None)
+    # async_unload_platforms added by SENSOR-01 — must be awaitable.
+    hass.config_entries = MagicMock()
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=None)
 
     await async_unload_entry(hass, mock_entry)
 
@@ -1223,6 +1230,9 @@ async def test_unload_handles_none_watchdog_task_gracefully():
     mock_entry.runtime_data = data
     hass = MagicMock()
     hass.async_add_executor_job = AsyncMock(return_value=None)
+    # async_unload_platforms added by SENSOR-01 — must be awaitable.
+    hass.config_entries = MagicMock()
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=None)
 
     # Must not raise
     result = await async_unload_entry(hass, mock_entry)
@@ -1263,6 +1273,9 @@ async def test_unload_preserves_phase2_behaviour():
     mock_entry.runtime_data = data
     hass = MagicMock()
     hass.async_add_executor_job = AsyncMock(return_value=None)
+    # async_unload_platforms added by SENSOR-01 — must be awaitable.
+    hass.config_entries = MagicMock()
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=None)
 
     await async_unload_entry(hass, mock_entry)
 

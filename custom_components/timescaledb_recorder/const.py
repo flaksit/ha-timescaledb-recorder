@@ -2,6 +2,15 @@
 
 DOMAIN = "timescaledb_recorder"
 
+# Platform list — forwarded in async_setup_entry and unloaded in async_unload_entry.
+PLATFORMS: list[str] = ["sensor", "binary_sensor"]
+
+# HA dispatcher signals for push-updated sensor/binary_sensor entities.
+# Sent whenever the signalled state transitions (both directions) so that
+# subscribing entities can refresh without polling.
+SIGNAL_OVERFLOW_CHANGE = f"{DOMAIN}_overflow_change"
+SIGNAL_WORKER_STATE_CHANGE = f"{DOMAIN}_worker_state_change"
+
 # Defaults
 DEFAULT_BATCH_SIZE = 200
 DEFAULT_FLUSH_INTERVAL = 10  # seconds

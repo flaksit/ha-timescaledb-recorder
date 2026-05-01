@@ -34,6 +34,20 @@
       }
     }
   },
+  "entity": {
+    "sensor": {
+      "health": { "name": "Health" },
+      "db_status": { "name": "DB Status" },
+      "queue_depth_peak": { "name": "Queue Depth Peak" },
+      "events_dropped": { "name": "Events Dropped" },
+      "meta_queue_depth": { "name": "Meta Queue Depth" }
+    },
+    "binary_sensor": {
+      "buffer_overflow": { "name": "Buffer Overflow" },
+      "states_worker_alive": { "name": "States Worker" },
+      "meta_worker_alive": { "name": "Metadata Worker" }
+    }
+  },
   "issues": {
     "buffer_dropping": {
       "title": "TimescaleDB recorder buffer overflow",

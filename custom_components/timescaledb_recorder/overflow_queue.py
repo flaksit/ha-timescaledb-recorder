@@ -41,6 +41,12 @@ class OverflowQueue(queue.Queue):
         # Monotonic drop counter since last reset. Consumed by orchestrator
         # in clear_and_reset_overflow's return value (D-11-c).
         self._dropped: int = 0
+        # Peak queue depth since last get_and_reset_peak() call.
+        # Updated under _overflow_lock in put_nowait (same lock guards _dropped).
+        self._peak_size: int = 0
+        # Total drops across all outages since queue creation.
+        # Monotonically increasing — sensors track deltas externally.
+        self._total_dropped: int = 0
 
     def put_nowait(self, item) -> None:  # type: ignore[override]
         """Non-blocking enqueue. Drops the item silently on full.
@@ -50,6 +56,10 @@ class OverflowQueue(queue.Queue):
         """
         try:
             super().put(item, block=False)
+            # Track peak depth for the queue_depth_peak sensor. Must be under
+            # _overflow_lock to serialise against get_and_reset_peak() reads.
+            with self._overflow_lock:
+                self._peak_size = max(self._peak_size, self.qsize())
         except queue.Full:
             with self._overflow_lock:
                 if not self.overflowed:
@@ -59,6 +69,7 @@ class OverflowQueue(queue.Queue):
                     )
                 self.overflowed = True
                 self._dropped += 1
+                self._total_dropped += 1
 
     def clear_and_reset_overflow(self) -> int:
         """Drain internal deque under mutex, reset flag, return drop-count snapshot.
@@ -76,3 +87,18 @@ class OverflowQueue(queue.Queue):
             self._dropped = 0
             self.overflowed = False
             return dropped
+
+    def get_and_reset_peak(self) -> int:
+        """Return the peak queue depth since the last call, then reset the baseline.
+
+        The new baseline is set to qsize() (not 0) so a steady-state queue with
+        N items in it does not report 0 on the next poll — it preserves the
+        current depth as the new floor. Thread-safe: acquires _overflow_lock to
+        serialise against put_nowait's peak-update write.
+        """
+        with self._overflow_lock:
+            peak = self._peak_size
+            # Reset to current depth, not zero, so sensors report meaningful
+            # deltas rather than always seeing the queue drain to zero.
+            self._peak_size = self.qsize()
+            return peak

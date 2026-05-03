@@ -1,11 +1,15 @@
 """Diagnostic sensor entities for the TimescaleDB Recorder integration.
 
-Five polled SensorEntity subclasses exposing internal health state:
-- TimescaledbHealthSensor        — overall health rollup (ok/degraded/error), 5s
-- TimescaledbDbStatusSensor      — database connectivity (connected/disconnected/stalled), 5s
+Five SensorEntity subclasses exposing internal health state:
+- TimescaledbHealthSensor        — overall health rollup (ok/degraded/error), push
+- TimescaledbDbStatusSensor      — database connectivity (connected/disconnected/stalled), push
 - TimescaledbQueueDepthSensor    — peak live queue depth since last poll, 10s
 - TimescaledbEventsDroppedSensor — delta events dropped since last poll, 10s
 - TimescaledbMetaQueueDepthSensor — current metadata queue depth, 30s
+
+Health and db_status are push-updated via SIGNAL_HEALTH_CHANGE, which is dispatched
+by every create_*/clear_* issue helper in issues.py at the moment the issue state
+changes — no polling delay.
 """
 from __future__ import annotations
 
@@ -15,19 +19,17 @@ from typing import TYPE_CHECKING
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import issue_registry as ir
 
-from .const import DOMAIN
+from .const import DOMAIN, SIGNAL_HEALTH_CHANGE
 
 if TYPE_CHECKING:
     from . import TimescaledbRecorderConfigEntry
 
-# Polling intervals — issue_registry reads are cheap; queue reads are fast
-# attribute accesses so tighter intervals are fine.
-SCAN_INTERVAL_FAST = timedelta(seconds=5)
 SCAN_INTERVAL_METRICS = timedelta(seconds=10)
 SCAN_INTERVAL_META = timedelta(seconds=30)
 
@@ -82,13 +84,15 @@ class TimescaledbHealthSensor(SensorEntity):
     error: any error-level issue active, or either worker not alive.
     degraded: any degraded-level issue active (workers alive, DB reachable).
     ok: no active issues and both workers alive.
+
+    Push-updated: issues.py dispatches SIGNAL_HEALTH_CHANGE on every
+    create_*/clear_* call, so this entity reflects changes immediately.
     """
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Health"
     _attr_icon = "mdi:database-check"
-    _attr_scan_interval = SCAN_INTERVAL_FAST
 
     def __init__(self, hass: HomeAssistant, entry: "TimescaledbRecorderConfigEntry") -> None:
         self._hass = hass
@@ -96,8 +100,19 @@ class TimescaledbHealthSensor(SensorEntity):
         self._attr_unique_id = f"{entry.entry_id}_health"
         self._attr_device_info = _device_info(entry)
 
-    async def async_update(self) -> None:
-        """Poll issue_registry and worker liveness to compute health state."""
+    async def async_added_to_hass(self) -> None:
+        """Set initial state and subscribe to health change signal."""
+        self._update_state()
+        self.async_on_remove(
+            async_dispatcher_connect(self._hass, SIGNAL_HEALTH_CHANGE, self._handle_health_change)
+        )
+
+    @callback
+    def _handle_health_change(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    def _update_state(self) -> None:
         active = _all_domain_issue_ids(self._hass)
         data = self._entry.runtime_data
         self._attr_native_value = self._compute_state(active, data)
@@ -114,13 +129,16 @@ class TimescaledbHealthSensor(SensorEntity):
 
 
 class TimescaledbDbStatusSensor(SensorEntity):
-    """Database connectivity status: connected / disconnected / stalled."""
+    """Database connectivity status: connected / disconnected / stalled.
+
+    Push-updated via SIGNAL_HEALTH_CHANGE — same signal as health sensor
+    since both derive their state from the issue_registry.
+    """
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "DB Status"
     _attr_icon = "mdi:database-sync"
-    _attr_scan_interval = SCAN_INTERVAL_FAST
 
     def __init__(self, hass: HomeAssistant, entry: "TimescaledbRecorderConfigEntry") -> None:
         self._hass = hass
@@ -128,8 +146,19 @@ class TimescaledbDbStatusSensor(SensorEntity):
         self._attr_unique_id = f"{entry.entry_id}_db_status"
         self._attr_device_info = _device_info(entry)
 
-    async def async_update(self) -> None:
-        """Poll issue_registry to determine database connectivity status."""
+    async def async_added_to_hass(self) -> None:
+        """Set initial state and subscribe to health change signal."""
+        self._update_state()
+        self.async_on_remove(
+            async_dispatcher_connect(self._hass, SIGNAL_HEALTH_CHANGE, self._handle_health_change)
+        )
+
+    @callback
+    def _handle_health_change(self) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    def _update_state(self) -> None:
         active = _all_domain_issue_ids(self._hass)
         if "states_worker_stalled" in active:
             self._attr_native_value = "stalled"

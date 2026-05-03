@@ -5,8 +5,9 @@ import logging
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import DOMAIN
+from .const import DOMAIN, SIGNAL_HEALTH_CHANGE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ def create_buffer_dropping_issue(hass: HomeAssistant) -> None:
         severity=ir.IssueSeverity.WARNING,
         translation_key=_BUFFER_DROPPING_ISSUE_ID,
     )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -47,6 +49,7 @@ def clear_buffer_dropping_issue(hass: HomeAssistant) -> None:
     (D-10-c).
     """
     ir.async_delete_issue(hass, DOMAIN, _BUFFER_DROPPING_ISSUE_ID)
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,7 @@ def create_states_worker_stalled_issue(hass: HomeAssistant) -> None:
         severity=ir.IssueSeverity.ERROR,
         translation_key=_STATES_WORKER_STALLED_ID,
     )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -81,6 +85,7 @@ def clear_states_worker_stalled_issue(hass: HomeAssistant) -> None:
     Fired by retry decorator's on_recovery hook on first success after stall.
     """
     ir.async_delete_issue(hass, DOMAIN, _STATES_WORKER_STALLED_ID)
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -98,6 +103,7 @@ def create_meta_worker_stalled_issue(hass: HomeAssistant) -> None:
         severity=ir.IssueSeverity.ERROR,
         translation_key=_META_WORKER_STALLED_ID,
     )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -107,6 +113,7 @@ def clear_meta_worker_stalled_issue(hass: HomeAssistant) -> None:
     Fired by retry decorator's on_recovery hook on first success after stall.
     """
     ir.async_delete_issue(hass, DOMAIN, _META_WORKER_STALLED_ID)
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -124,6 +131,7 @@ def create_db_unreachable_issue(hass: HomeAssistant) -> None:
         severity=ir.IssueSeverity.ERROR,
         translation_key=_DB_UNREACHABLE_ID,
     )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -133,6 +141,7 @@ def clear_db_unreachable_issue(hass: HomeAssistant) -> None:
     Fired on first successful write after sustained failure period ends.
     """
     ir.async_delete_issue(hass, DOMAIN, _DB_UNREACHABLE_ID)
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -151,6 +160,7 @@ def create_recorder_disabled_issue(hass: HomeAssistant) -> None:
         severity=ir.IssueSeverity.WARNING,
         translation_key=_RECORDER_DISABLED_ID,
     )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
 
 
 @callback
@@ -160,3 +170,4 @@ def clear_recorder_disabled_issue(hass: HomeAssistant) -> None:
     Called if a subsequent startup check finds the recorder available again.
     """
     ir.async_delete_issue(hass, DOMAIN, _RECORDER_DISABLED_ID)
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)

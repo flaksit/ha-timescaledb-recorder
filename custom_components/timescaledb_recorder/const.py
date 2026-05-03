@@ -10,6 +10,9 @@ PLATFORMS: list[str] = ["sensor", "binary_sensor"]
 # subscribing entities can refresh without polling.
 SIGNAL_OVERFLOW_CHANGE = f"{DOMAIN}_overflow_change"
 SIGNAL_WORKER_STATE_CHANGE = f"{DOMAIN}_worker_state_change"
+# Sent by every create_*/clear_* issue helper so health/db_status sensors
+# update immediately rather than waiting for their poll interval.
+SIGNAL_HEALTH_CHANGE = f"{DOMAIN}_health_change"
 
 # Defaults
 DEFAULT_BATCH_SIZE = 200

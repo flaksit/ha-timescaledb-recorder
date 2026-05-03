@@ -1,7 +1,8 @@
 """Unit tests for sensor.py health sensor entities.
 
 Tests use mocked config entries and runtime_data so no HA instance is needed.
-All async_update() calls are awaited via pytest-asyncio.
+Health/db_status sensors are push-updated — tests call _update_state() directly.
+Metric sensors are polled — tests call async_update() and await the result.
 """
 from __future__ import annotations
 
@@ -83,8 +84,7 @@ def _make_hass(active_issue_ids: set[str] | None = None) -> MagicMock:
 # TimescaledbHealthSensor
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_health_sensor_ok():
+def test_health_sensor_ok():
     """No active issues and both workers alive → state 'ok'."""
     hass = _make_hass()
     entry = _make_entry()
@@ -94,13 +94,12 @@ async def test_health_sensor_ok():
         return_value=hass._mock_issue_registry,
     ):
         sensor = TimescaledbHealthSensor(hass, entry)
-        await sensor.async_update()
+        sensor._update_state()
 
     assert sensor._attr_native_value == "ok"
 
 
-@pytest.mark.asyncio
-async def test_health_sensor_degraded():
+def test_health_sensor_degraded():
     """buffer_dropping issue active → state 'degraded'."""
     hass = _make_hass(active_issue_ids={"buffer_dropping"})
     entry = _make_entry()
@@ -110,13 +109,12 @@ async def test_health_sensor_degraded():
         return_value=hass._mock_issue_registry,
     ):
         sensor = TimescaledbHealthSensor(hass, entry)
-        await sensor.async_update()
+        sensor._update_state()
 
     assert sensor._attr_native_value == "degraded"
 
 
-@pytest.mark.asyncio
-async def test_health_sensor_error_issue():
+def test_health_sensor_error_issue():
     """db_unreachable issue active → state 'error'."""
     hass = _make_hass(active_issue_ids={"db_unreachable"})
     entry = _make_entry()
@@ -126,13 +124,12 @@ async def test_health_sensor_error_issue():
         return_value=hass._mock_issue_registry,
     ):
         sensor = TimescaledbHealthSensor(hass, entry)
-        await sensor.async_update()
+        sensor._update_state()
 
     assert sensor._attr_native_value == "error"
 
 
-@pytest.mark.asyncio
-async def test_health_sensor_error_worker_dead():
+def test_health_sensor_error_worker_dead():
     """states_worker not alive (no issues) → state 'error'."""
     hass = _make_hass()
     entry = _make_entry(states_alive=False)
@@ -142,7 +139,7 @@ async def test_health_sensor_error_worker_dead():
         return_value=hass._mock_issue_registry,
     ):
         sensor = TimescaledbHealthSensor(hass, entry)
-        await sensor.async_update()
+        sensor._update_state()
 
     assert sensor._attr_native_value == "error"
 
@@ -151,8 +148,7 @@ async def test_health_sensor_error_worker_dead():
 # TimescaledbDbStatusSensor
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_db_status_connected():
+def test_db_status_connected():
     """No active issues → 'connected'."""
     hass = _make_hass()
     entry = _make_entry()
@@ -162,13 +158,12 @@ async def test_db_status_connected():
         return_value=hass._mock_issue_registry,
     ):
         sensor = TimescaledbDbStatusSensor(hass, entry)
-        await sensor.async_update()
+        sensor._update_state()
 
     assert sensor._attr_native_value == "connected"
 
 
-@pytest.mark.asyncio
-async def test_db_status_disconnected():
+def test_db_status_disconnected():
     """db_unreachable issue active → 'disconnected'."""
     hass = _make_hass(active_issue_ids={"db_unreachable"})
     entry = _make_entry()
@@ -178,13 +173,12 @@ async def test_db_status_disconnected():
         return_value=hass._mock_issue_registry,
     ):
         sensor = TimescaledbDbStatusSensor(hass, entry)
-        await sensor.async_update()
+        sensor._update_state()
 
     assert sensor._attr_native_value == "disconnected"
 
 
-@pytest.mark.asyncio
-async def test_db_status_stalled():
+def test_db_status_stalled():
     """states_worker_stalled issue active → 'stalled'."""
     hass = _make_hass(active_issue_ids={"states_worker_stalled"})
     entry = _make_entry()
@@ -194,7 +188,7 @@ async def test_db_status_stalled():
         return_value=hass._mock_issue_registry,
     ):
         sensor = TimescaledbDbStatusSensor(hass, entry)
-        await sensor.async_update()
+        sensor._update_state()
 
     assert sensor._attr_native_value == "stalled"
 

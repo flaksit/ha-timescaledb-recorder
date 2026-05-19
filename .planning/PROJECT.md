@@ -34,6 +34,7 @@ These capabilities were confirmed shipped in v1.1:
 - ✓ Observability: 5 repair issues (db_unreachable, buffer_dropping, recorder_disabled, states_worker_stalled, meta_worker_stalled); all auto-clear — v1.1
 - ✓ `persistent_notification` for one-shot events: worker crash+restart, orchestrator crash, backfill gap — v1.1
 - ✓ `strings.json` "issues" section with title+description for all 5 repair issue translation_keys — v1.1
+- ✓ Entity filter (include/exclude by entity_id) configurable via `configuration.yaml` without re-adding integration (FILTER-01) — post-v1.1 quick task
 
 ### Active
 
@@ -42,7 +43,6 @@ Next milestone requirements (to be defined in `/gsd-new-milestone`):
 - [ ] Schema migration infrastructure (SCHEMA-01): schema_version table + migration registry for future ALTER TABLE
 - [ ] SSL/TLS option for TimescaleDB connection (SSL-01)
 - [ ] Sensor entity for integration health: sensor.timescaledb_recorder_status (SENSOR-01)
-- [ ] Entity filter configurable via HA options UI without re-adding integration (FILTER-01)
 
 ### Out of Scope
 

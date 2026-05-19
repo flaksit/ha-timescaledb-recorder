@@ -292,8 +292,7 @@ If you installed the integration after HA had already been running for a while, 
 From the HA host terminal (SSH addon):
 
 ```bash
-docker exec homeassistant python3 \
-    /config/custom_components/timescaledb_recorder/backfill_gaps.py
+docker exec homeassistant python3 /config/custom_components/timescaledb_recorder/backfill_gaps.py
 ```
 
 No arguments needed. The script auto-detects the SQLite database path and reads the TimescaleDB DSN from the integration config. `psycopg[binary]` is already present in the HA container once the integration is installed.

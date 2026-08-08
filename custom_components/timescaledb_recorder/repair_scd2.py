@@ -327,7 +327,32 @@ def parse_args() -> argparse.Namespace:
                         "the repair reaches the invariant without deleting anything.")
     p.add_argument("--no-constraints", action="store_true",
                    help="Repair but do not add the exclusion constraints.")
+    p.add_argument("--yes", action="store_true",
+                   help="Skip the --apply confirmation prompt (for scripted runs).")
     return p.parse_args()
+
+
+def confirm_apply(target: str, args) -> bool:
+    """Make the operator confirm the target before the first mutation.
+
+    This repairs irreplaceable history in place, and the usual failure is not a
+    bug in the SQL — it is running it against the wrong database, or before
+    restarting HA onto the corrected write path, which lets the damage
+    reappear immediately and wedges the metadata queue against the new
+    constraints.
+    """
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        print("\nRefusing to --apply without a terminal to confirm on. "
+              "Re-run with --yes if this is intentional.")
+        return False
+    print(f"\nAbout to repair {target} in place.")
+    print("Confirm you have already updated the integration and restarted HA, so the "
+          "corrected write path is live. Repairing under the old code lets the damage "
+          "return immediately.")
+    print("A full copy of each table is written to <table>_prerepair_<timestamp> first.")
+    return input("Type 'yes' to proceed: ").strip().lower() == "yes"
 
 
 def main() -> int:
@@ -374,15 +399,20 @@ def main() -> int:
 
         if clean:
             print("\nNothing to repair.")
-        else:
-            print("\nWould change" if not apply_changes else "\nRepairing")
-            if not apply_changes:
-                preview(conn)
-                print("\nDry run — nothing was modified. Re-run with --apply to repair.")
-                return 1
+        elif not apply_changes:
+            print("\nWould change")
+            preview(conn)
+            print("\nDry run — nothing was modified. Re-run with --apply to repair.")
+            return 1
 
         if not apply_changes:
             return 0
+
+        # Confirm before announcing any work, so the operator is never told
+        # "Repairing" for a run they then decline.
+        if not clean and not confirm_apply(_redact(dsn), args):
+            print("Aborted. Nothing was modified.")
+            return 1
 
         with conn.cursor() as cur:
             cur.execute(SCD2_QUARANTINE_DDL_SQL)

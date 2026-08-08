@@ -388,6 +388,9 @@ docker exec homeassistant python3 \
 | `--verify-only` | off | Check the invariant and exit; never mutates |
 | `--collapse-duplicates` | off | Also delete rows byte-identical to a row that stays |
 | `--no-constraints` | off | Repair without adding the exclusion constraints |
+| `--yes` | off | Skip the `--apply` confirmation. Required when there is no terminal |
+
+`--apply` asks for confirmation before its first write, and refuses to run unattended without `--yes`. The exit code is 0 when the invariant holds, 1 when it does not or when anything is left unresolved, and 2 when `valid_from` itself looks unsound — the one case where you should stop and investigate rather than repair.
 
 ### What it does, and what it will not do
 

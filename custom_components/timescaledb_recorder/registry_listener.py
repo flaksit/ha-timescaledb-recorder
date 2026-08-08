@@ -166,6 +166,9 @@ class RegistryListener:
         self._buffer: list[dict] = []
         self._buffer_ready = asyncio.Event()
         self._drain_task: asyncio.Task | None = None
+        # (append task, its batch) while an enqueue is in flight, so a cancelled
+        # flush can be settled rather than guessed at.
+        self._inflight: tuple[asyncio.Task, list[dict]] | None = None
 
     def bind_meta_queue(self, q: PersistentQueue) -> None:
         """Wire the PersistentQueue after construction. Used by __init__.py
@@ -226,18 +229,49 @@ class RegistryListener:
         self._buffer_ready.clear()
         if not batch:
             return
+
+        # Shielded, and tracked: cancelling the awaiter does not stop an append
+        # already running in the executor. Requeuing on cancellation would then
+        # append the same items twice. Instead the in-flight append is recorded
+        # so async_stop can await its real outcome and requeue only if it failed.
+        append = asyncio.ensure_future(self._meta_queue.put_many_async(batch))
+        self._inflight = (append, batch)
         try:
-            await self._meta_queue.put_many_async(batch)
+            await asyncio.shield(append)
+        except asyncio.CancelledError:
+            # Normal shutdown, not a failure — async_stop settles this batch.
+            raise
         except BaseException:
-            # BaseException, not Exception: a CancelledError raised while awaiting
-            # the executor would otherwise strand this batch in a local variable,
-            # belonging to neither the buffer nor the queue. Put it back in front
-            # so ordering holds and async_stop's final flush can still see it.
-            self._buffer = batch + self._buffer
-            self._buffer_ready.set()
+            self._requeue(batch)
             _LOGGER.exception(
                 "Failed to enqueue %d registry item(s); retrying", len(batch))
             raise
+        else:
+            self._inflight = None
+
+    def _requeue(self, batch: list[dict]) -> None:
+        """Put an unpersisted batch back at the front, preserving order."""
+        self._buffer = batch + self._buffer
+        self._buffer_ready.set()
+
+    async def _settle_inflight(self) -> None:
+        """Await an append left running by a cancelled flush.
+
+        Only the append itself can say whether the items reached disk, so the
+        decision to requeue waits for it. Without this, shutdown either loses the
+        batch or writes it twice.
+        """
+        inflight = self._inflight
+        self._inflight = None
+        if inflight is None:
+            return
+        append, batch = inflight
+        try:
+            await append
+        except Exception:  # noqa: BLE001
+            self._requeue(batch)
+            _LOGGER.exception(
+                "Enqueue of %d registry item(s) failed during shutdown", len(batch))
 
     async def async_start(self) -> None:
         """Cache registry references and register event listeners in DISCARD mode.
@@ -610,6 +644,11 @@ class RegistryListener:
             except asyncio.CancelledError:
                 pass
             self._drain_task = None
+
+        # Cancelling the drainer does not stop an append already running in the
+        # executor. Settle it first: requeue only if it genuinely failed, so the
+        # final flush below cannot write the same items a second time.
+        await self._settle_inflight()
 
         try:
             await self._flush_buffer()

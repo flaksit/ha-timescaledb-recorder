@@ -380,6 +380,7 @@ docker exec homeassistant python3 \
 # 3. repair, verify, and enforce
 docker exec homeassistant python3 \
     /config/custom_components/timescaledb_recorder/repair_scd2.py --apply
+# 4. restart HA again — required, see "Read the fidelity report" below
 ```
 
 **Update and restart first.** Under the old code the constraints the script installs reject every metadata write, and because the old writer retried indefinitely on any error, the metadata queue wedges and stops recording registry changes entirely. If you skip the constraints (`--no-constraints`), the repaired history simply re-corrupts instead. Restart HA again after the repair, so the startup snapshot re-creates a current version for anything the repair left without one.
@@ -409,7 +410,9 @@ Before touching anything it copies each table to `<table>_prerepair_<utc timesta
 Passing the invariant checks means the intervals are consistent, not that they are true. The script reports two kinds of doubt it cannot resolve for you:
 
 - **Gaps the `states` table contradicts.** A version closed with no successor for a while is only a real removal if the entity was really absent. If it kept recording states throughout, an insert was lost and the gap is an artefact. The repair preserves the gap anyway — inventing metadata continuity would be a worse lie than admitting the hole — and `states_flat` is unaffected either way, because it derives eras from `valid_from` and ignores `valid_to`.
-- **Ids left with no current version.** Where the newest version is already closed while an older one is open, the rebuild closes the older one and does not reopen anything. That is right if the thing really was removed and wrong if it still exists. Restart HA after the repair: the startup snapshot re-creates an open row for anything that still exists.
+- **Ids left with no current version.** Where the newest version is already closed while an older one is open, the rebuild closes the older one and does not reopen anything. That is right if the thing really was removed and wrong if it still exists. The script cannot tell the difference — it never reads the live registries.
+
+**Restarting HA after `--apply` is required, not optional.** That restart is what resolves the second case: the startup snapshot reads the live registries and re-creates an open row for everything that still exists. Until it runs, those ids have no current version and disappear from `valid_to IS NULL` queries.
 
 Where history is genuinely ambiguous — two versions recorded at the identical `valid_from` with different contents — nothing in the data says which one owned the era. Both rows are kept, one ends up with an empty interval, and the group is reported rather than silently resolved.
 

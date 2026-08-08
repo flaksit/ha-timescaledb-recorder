@@ -441,14 +441,14 @@ async def test_drain_loop_survives_an_enqueue_failure(enabled_listener, mock_met
     assert enabled_listener._buffer == []
 
 
-async def test_cancellation_during_flush_returns_the_batch(enabled_listener,
-                                                           mock_meta_queue,
-                                                           mock_entity_registry):
-    """Cancelling mid-flush must not strand the batch.
+async def test_cancellation_then_failed_append_returns_the_batch(enabled_listener,
+                                                                 mock_meta_queue,
+                                                                 mock_entity_registry):
+    """Cancelled mid-flush and the append then fails: the items must come back.
 
-    The buffer is swapped out before awaiting the executor, so a CancelledError
-    raised during that await would otherwise leave the items in a local variable
-    belonging to neither the buffer nor the queue.
+    The buffer is swapped out before awaiting the executor, so without settling
+    the in-flight append these items would belong to neither the buffer nor the
+    queue — silently lost.
     """
     enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
     event = MagicMock()
@@ -457,11 +457,12 @@ async def test_cancellation_during_flush_returns_the_batch(enabled_listener,
 
     started = asyncio.Event()
 
-    async def hang(_batch):
+    async def slow_failure(_batch):
         started.set()
-        await asyncio.sleep(60)
+        await asyncio.sleep(0.05)
+        raise OSError("disk full")
 
-    mock_meta_queue.put_many_async = AsyncMock(side_effect=hang)
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=slow_failure)
 
     flush = asyncio.get_running_loop().create_task(enabled_listener._flush_buffer())
     await started.wait()
@@ -469,7 +470,47 @@ async def test_cancellation_during_flush_returns_the_batch(enabled_listener,
     with pytest.raises(asyncio.CancelledError):
         await flush
 
+    # Shielded, so still in flight: neither lost nor yet known to have succeeded.
+    assert enabled_listener._inflight is not None
+    await enabled_listener._settle_inflight()
     assert len(enabled_listener._buffer) == 1, "batch was lost on cancellation"
+
+
+async def test_cancellation_does_not_append_twice(enabled_listener, mock_meta_queue,
+                                                  mock_entity_registry):
+    """Cancelling the awaiter does not stop an append already in the executor.
+
+    Requeuing unconditionally would then write the same items a second time. The
+    batch must be requeued only if the append actually failed.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    appended = []
+    started = asyncio.Event()
+
+    async def slow_but_successful(batch):
+        started.set()
+        await asyncio.sleep(0.05)
+        appended.extend(batch)      # succeeds despite the awaiter being cancelled
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=slow_but_successful)
+
+    flush = asyncio.get_running_loop().create_task(enabled_listener._flush_buffer())
+    await started.wait()
+    flush.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flush
+
+    await enabled_listener._settle_inflight()
+
+    assert len(appended) == 1, "the shielded append should have completed"
+    assert enabled_listener._buffer == [], "a successful append must not be requeued"
+
+    await enabled_listener._flush_buffer()
+    assert len(appended) == 1, "the batch was appended twice"
 
 
 async def test_stop_flushes_remaining_buffer(enabled_listener, mock_meta_queue,

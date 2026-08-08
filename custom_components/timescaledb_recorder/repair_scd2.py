@@ -248,9 +248,11 @@ def report_fidelity(conn: psycopg.Connection) -> int:
         total = sum(row[3] for row in gaps)
         print(f"  {len(gaps)} gap(s) where the entity kept recording states "
               f"({total} state rows fall inside a period the dimension calls absent). "
-              "These are lost inserts, not removals. The repair preserves the gap "
-              "rather than inventing continuity — states_flat is unaffected, since "
-              "it derives eras from valid_from and ignores valid_to.")
+              "Something existed and was producing data, so the gap does not "
+              "reflect a real absence — though the data does not say which write "
+              "was lost. The repair preserves it rather than inventing continuity; "
+              "states_flat is unaffected either way, since it derives eras from "
+              "valid_from and ignores valid_to.")
         for entity_id, start, end, n in gaps[:5]:
             print(f"    {entity_id}: {start} -> {end} ({n} states)")
         if len(gaps) > 5:
@@ -522,6 +524,16 @@ def main() -> int:
             # the undo path, and naming tables that do not exist is worse than
             # saying nothing.
             print(f"Backups: <table>_prerepair_{stamp} — drop them once satisfied.")
+            # Not optional. The rebuild closes non-final open rows and never
+            # reopens anything, so ids whose newest version was already closed
+            # come out with no current version. This script does not read the
+            # live registries; the integration's startup snapshot does, and it
+            # re-creates an open row for whatever still exists.
+            print("\nNEXT STEP — RESTART HOME ASSISTANT.")
+            print("The repair cannot tell which ids still exist; the startup "
+                  "snapshot can, and restores a current version for them. Until "
+                  "you restart, anything listed under Fidelity above has no "
+                  "current row and will be missing from `valid_to IS NULL` queries.")
         return 0 if clean_now else 1
 
 

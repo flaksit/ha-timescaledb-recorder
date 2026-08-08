@@ -864,16 +864,26 @@ SCD2_VERIFY_CHECKS = (
 # is TRUE — and two classes of doubt are measurable, so they get reported rather
 # than passed over in silence.
 
-# A gap (a version closed well before its successor starts) is only legitimate if
-# the entity really was absent. If it kept recording states throughout, it did
-# not: an insert was lost and the gap is an artefact. The repair still preserves
-# the gap — inventing metadata continuity would be a worse lie than admitting the
-# hole — but the operator gets to see it. Entities only: the other dimensions
-# have no fact table to check against.
+# A gap — a version closed before its successor starts — is only a real absence
+# if the entity really was gone. States recorded inside the gap prove it was not:
+# something existed and was producing data while the dimension says nothing was.
+# That is evidence the gap is an artefact, though not proof of any one cause.
+# The repair preserves the gap regardless — inventing metadata continuity would
+# be a worse lie than admitting the hole — but the operator gets to see it.
+# Entities only: the other dimensions have no fact table to check against.
+#
+# greatest(valid_to, valid_from) applies the clamp's semantics here, so an
+# inverted interval cannot report a gap starting before its own version does.
+# The window tiebreak matches _SCD2_REPAIR_PLAN_SQL exactly; ordering by
+# valid_from alone leaves ties arbitrary and makes the answer nondeterministic
+# on rows sharing a timestamp.
 SCD2_SUSPICIOUS_GAPS_SQL = f"""
 WITH g AS (
-    SELECT entity_id, valid_to AS gap_start,
-           lead(valid_from) OVER (PARTITION BY entity_id ORDER BY valid_from) AS gap_end
+    SELECT entity_id,
+           greatest(valid_to, valid_from) AS gap_start,
+           lead(valid_from) OVER (
+               PARTITION BY entity_id
+               ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid) AS gap_end
     FROM entities),
 gaps AS (
     SELECT * FROM g
@@ -894,10 +904,17 @@ SELECT gaps.entity_id, gaps.gap_start, gaps.gap_end, s.n AS states_inside
 # these end up with no current version at all — correct if the thing really was
 # removed, wrong if it still exists in HA. The invariant checks and the
 # constraint both pass either way, which is exactly why this needs saying.
+#
+# "Newest" must mean the row the rebuild treats as final, so this ordering is
+# _SCD2_REPAIR_PLAN_SQL's reversed in every term. Ordering on valid_from alone
+# picks an arbitrary row out of a tied group and can name the wrong id.
 _SCD2_NO_CURRENT_VERSION_SQL = """
 WITH ranked AS (
     SELECT {key}::text AS id_value, valid_from, valid_to,
-           row_number() OVER (PARTITION BY {key} ORDER BY valid_from DESC) AS rn,
+           row_number() OVER (
+               PARTITION BY {key}
+               ORDER BY valid_from DESC, (valid_to IS NULL) DESC,
+                        valid_to DESC, ctid DESC) AS rn,
            count(*) FILTER (WHERE valid_to IS NULL) OVER (PARTITION BY {key}) AS open_rows
       FROM {table})
 SELECT id_value, valid_from AS newest_from, valid_to AS newest_to

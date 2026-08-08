@@ -308,7 +308,8 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         else:
             _LOGGER.warning("Unknown registry type in metadata item: %s", registry)
 
-    def _note_version_skipped(self, cur, registry: str, registry_id: str) -> None:
+    def _note_version_skipped(self, cur, registry: str, registry_id: str,
+                          close_ts: datetime) -> None:
         """Warn when a close+insert pair wrote nothing.
 
         The close carries a `valid_from < new_valid_from` guard and the insert is
@@ -321,11 +322,13 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         if cur.rowcount:
             return
         self.out_of_order_skips += 1
-        _LOGGER.warning(
+        # ERROR, with the item: this drops a real registry change, exactly like
+        # an integrity drop, and the two should be equally findable in the log.
+        _LOGGER.error(
             "%s: %s %s arrived after a newer version and was skipped to keep the "
             "SCD2 intervals consistent (total skipped: %d). Queue ordering should "
-            "make this impossible.",
-            self.name, registry, registry_id, self.out_of_order_skips,
+            "make this impossible. Change was stamped %s.",
+            self.name, registry, registry_id, self.out_of_order_skips, close_ts,
         )
 
     @staticmethod
@@ -414,7 +417,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                     with conn.transaction():
                         cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, old_id, close_ts))
                         cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "entity", registry_id)
+                        self._note_version_skipped(cur, "entity", registry_id, close_ts)
                 else:
                     # Field-change path. The change-detection read runs inside the
                     # transaction so it and the close+insert see one snapshot.
@@ -428,7 +431,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                                 SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts)
                             )
                             cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                            self._note_version_skipped(cur, "entity", registry_id)
+                            self._note_version_skipped(cur, "entity", registry_id, close_ts)
 
     # ------------------------------------------------------------------
     # Per-registry dispatch — device/area/label (D-05-c). Mechanical copies
@@ -468,7 +471,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                             SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts)
                         )
                         cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "device", registry_id)
+                        self._note_version_skipped(cur, "device", registry_id, close_ts)
 
     def _process_area(
         self,
@@ -502,7 +505,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                             SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts)
                         )
                         cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "area", registry_id)
+                        self._note_version_skipped(cur, "area", registry_id, close_ts)
 
     def _process_label(
         self,
@@ -536,4 +539,4 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                             SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts)
                         )
                         cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "label", registry_id)
+                        self._note_version_skipped(cur, "label", registry_id, close_ts)

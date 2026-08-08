@@ -340,35 +340,55 @@ LEFT JOIN dev d ON d.device_id = e.device_id
 # Convention: separate constants per table (not a .format() template) to keep
 # SQL strings explicit, grep-able, and safe from accidental table injection.
 
-# Close (expire) the currently-open row for an entity.
-# %s = valid_to timestamp, %s = entity_id.
+# Close (expire) the currently-open row.
+#
+# The close timestamp MUST be the replacement row's valid_from, so the two
+# intervals abut exactly: [old_vf, new_vf) then [new_vf, infinity). Using a
+# separately-read worker clock instead — which is what issue #17 found — makes
+# the closed interval overrun its successor's start, producing one overlap per
+# metadata change. For "remove" there is no replacement, so the worker clock is
+# the correct close time.
+#
+# `valid_from < %s` is an ordering guard: an item applied out of order can then
+# never close a version that begins at or after it. Without it, a late-arriving
+# event writes valid_to < valid_from, and an inverted range makes tstzrange()
+# raise — which would break the exclusion constraint and every later insert.
+#
+# %s = valid_to timestamp, %s = id, %s = the same timestamp again (guard).
 SCD2_CLOSE_ENTITY_SQL = """
 UPDATE entities
 SET valid_to = %s
-WHERE entity_id = %s AND valid_to IS NULL;
+WHERE entity_id = %s AND valid_to IS NULL AND valid_from < %s;
 """
 
 SCD2_CLOSE_DEVICE_SQL = """
 UPDATE devices
 SET valid_to = %s
-WHERE device_id = %s AND valid_to IS NULL;
+WHERE device_id = %s AND valid_to IS NULL AND valid_from < %s;
 """
 
 SCD2_CLOSE_AREA_SQL = """
 UPDATE areas
 SET valid_to = %s
-WHERE area_id = %s AND valid_to IS NULL;
+WHERE area_id = %s AND valid_to IS NULL AND valid_from < %s;
 """
 
 SCD2_CLOSE_LABEL_SQL = """
 UPDATE labels
 SET valid_to = %s
-WHERE label_id = %s AND valid_to IS NULL;
+WHERE label_id = %s AND valid_to IS NULL AND valid_from < %s;
 """
 
-# Idempotent snapshot inserts (Pitfall 3 mitigation).
-# Uses WHERE NOT EXISTS so re-running on HA restart does not create duplicate
-# open rows for entities already present in the dimension table.
+# Idempotent guarded inserts — the ONLY insert path for all four dimensions.
+#
+# WHERE NOT EXISTS(open row) serves two purposes. On the "create" path it means
+# re-running the startup snapshot does not duplicate rows for entities already
+# present. On the "update" paths it makes the close+insert pair replay-safe:
+# task_done() runs only after the write (meta_worker), so a crash between commit
+# and task_done replays the item. On replay the close matches nothing (its
+# valid_from < guard excludes the row just inserted) and this insert sees that
+# open row and does nothing. Issue #17: the rename path previously used an
+# unguarded INSERT, so a replay added a second open row.
 # %s=entity_id, %s=ha_entity_uuid, %s=name, %s=domain, %s=platform,
 # %s=device_id, %s=area_id, %s=labels, %s=device_class,
 # %s=unit_of_measurement, %s=disabled_by, %s=valid_from, %s=extra
@@ -417,33 +437,9 @@ WHERE NOT EXISTS (
 );
 """
 
-# Plain inserts used for the new-row step of the SCD2 close-and-insert cycle
-# (incremental updates after snapshot; the close step runs first).
-# Parameters match snapshot SQL but without the WHERE NOT EXISTS guard.
-SCD2_INSERT_ENTITY_SQL = """
-INSERT INTO entities
-    (entity_id, ha_entity_uuid, name, domain, platform, device_id, area_id,
-     labels, device_class, unit_of_measurement, disabled_by, valid_from, valid_to, extra)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s);
-"""
-
-SCD2_INSERT_DEVICE_SQL = """
-INSERT INTO devices
-    (device_id, name, manufacturer, model, area_id, labels, valid_from, valid_to, extra)
-VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s);
-"""
-
-SCD2_INSERT_AREA_SQL = """
-INSERT INTO areas
-    (area_id, name, valid_from, valid_to, extra)
-VALUES (%s, %s, %s, NULL, %s);
-"""
-
-SCD2_INSERT_LABEL_SQL = """
-INSERT INTO labels
-    (label_id, name, color, valid_from, valid_to, extra)
-VALUES (%s, %s, %s, %s, NULL, %s);
-"""
+# The former SCD2_INSERT_* constants (unguarded VALUES inserts) are deliberately
+# gone. They were the new-row step of the close-and-insert cycle and had no
+# replay protection; the SCD2_SNAPSHOT_* statements above now serve every insert.
 
 # D-08-d step 4: watermark read (orchestrator → states worker connection).
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
@@ -461,22 +457,402 @@ SELECT_ALL_KNOWN_ENTITIES_SQL = (
 
 # Change-detection SELECT constants — read the current open row for each registry type.
 # Moved from inline strings in syncer.py per project convention (all SQL in const.py).
+#
+# ORDER BY valid_from DESC LIMIT 1 is required, not cosmetic. These are consumed
+# with fetchone(); on a table that already holds several open rows for one id, an
+# unordered read picks an arbitrary one, so the gate compares against a random
+# predecessor and the damage can never heal. Pinning it to the newest open row
+# makes the comparison deterministic and lets a corrupt table converge (issue #17).
+#
 # %s = the registry ID (entity_id / device_id / area_id / label_id).
 SELECT_ENTITY_CURRENT_SQL = (
     "SELECT name, platform, device_id, area_id, labels, device_class,"
     " unit_of_measurement, disabled_by, extra"
     " FROM entities WHERE entity_id = %s AND valid_to IS NULL"
+    " ORDER BY valid_from DESC LIMIT 1"
 )
 
 SELECT_DEVICE_CURRENT_SQL = (
     "SELECT name, manufacturer, model, area_id, labels, extra"
     " FROM devices WHERE device_id = %s AND valid_to IS NULL"
+    " ORDER BY valid_from DESC LIMIT 1"
 )
 
 SELECT_AREA_CURRENT_SQL = (
     "SELECT name, extra FROM areas WHERE area_id = %s AND valid_to IS NULL"
+    " ORDER BY valid_from DESC LIMIT 1"
 )
 
 SELECT_LABEL_CURRENT_SQL = (
     "SELECT name, color, extra FROM labels WHERE label_id = %s AND valid_to IS NULL"
+    " ORDER BY valid_from DESC LIMIT 1"
+)
+
+
+# ----------------------------------------------------------------------------
+# SCD2 invariant enforcement (issue #17)
+# ----------------------------------------------------------------------------
+#
+# The invariant: for a given id, version intervals never overlap, and at most one
+# version is open. Nothing enforced this before, which is why the corruption ran
+# silently for months — row counts stayed plausible while every join on
+# `valid_to IS NULL` doubled the fact rows for affected ids.
+#
+# An exclusion constraint is used rather than a partial unique index on open rows.
+# Two open rows are both [valid_from, infinity) and therefore always overlap, so
+# the exclusion constraint strictly subsumes the unique index, and it additionally
+# catches overlaps between *closed* versions — which is the bulk of the observed
+# damage (322 of 327 cases) and which a unique index cannot see.
+#
+# '[)' bounds are load-bearing: a version handing over to its successor produces
+# [old_vf, new_vf) and [new_vf, infinity), which touch but do not overlap. With
+# '[]' every legitimate handover would violate the constraint.
+#
+# COALESCE(valid_to, 'infinity') maps the open row into the range. 'infinity' is
+# an immutable literal, so it is legal in an index expression (unlike 'now').
+SCD2_BTREE_GIST_SQL = "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+
+# ALTER TABLE ... ADD CONSTRAINT has no IF NOT EXISTS, so guard on pg_constraint
+# to keep startup DDL idempotent. {table}/{key} are formatted from the hard-coded
+# SCD2_DIMENSIONS tuple below, never from user input.
+_SCD2_EXCLUDE_CONSTRAINT_SQL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'excl_{table}_period'
+          AND conrelid = '{table}'::regclass
+    ) THEN
+        ALTER TABLE {table} ADD CONSTRAINT excl_{table}_period
+            EXCLUDE USING gist (
+                {key} WITH =,
+                tstzrange(valid_from, COALESCE(valid_to, 'infinity'::timestamptz), '[)') WITH &&
+            );
+    END IF;
+END $$;
+"""
+
+# Fallback when btree_gist cannot be installed (no CREATE privilege on the
+# database). Catches only the multiple-open-rows half of the invariant; the
+# verification queries remain the safety net for overlapping closed versions.
+_SCD2_OPEN_UNIQUE_IDX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_{table}_open
+    ON {table} ({key}) WHERE valid_to IS NULL;
+"""
+
+# (table, id column) for every SCD2 dimension. Single source of truth for schema
+# setup, the repair script, and the verification queries.
+SCD2_DIMENSIONS = (
+    ("entities", "entity_id"),
+    ("devices", "device_id"),
+    ("areas", "area_id"),
+    ("labels", "label_id"),
+)
+
+SCD2_EXCLUDE_CONSTRAINT_SQL = {
+    table: _SCD2_EXCLUDE_CONSTRAINT_SQL.format(table=table, key=key)
+    for table, key in SCD2_DIMENSIONS
+}
+
+SCD2_OPEN_UNIQUE_IDX_SQL = {
+    table: _SCD2_OPEN_UNIQUE_IDX_SQL.format(table=table, key=key)
+    for table, key in SCD2_DIMENSIONS
+}
+
+
+# ----------------------------------------------------------------------------
+# SCD2 repair SQL (issue #17) — consumed by repair_scd2.py
+# ----------------------------------------------------------------------------
+#
+# Anchor principle: TRUST valid_from, NEVER WRITE IT.
+#
+# valid_from is stamped in the event loop at event time and is the one field both
+# defects leave intact — the close-timestamp bug corrupts only valid_to, and the
+# enqueue-ordering bug corrupts only arrival order, not the timestamp already
+# baked into the queued payload. So the repair reconstructs every interval from
+# valid_from ordering alone and writes valid_to only. It never invents, shifts,
+# or nudges a timestamp, and by default it never deletes a row.
+#
+# Why that converges, which matters because this runs once against real history:
+# after the rebuild, row i's valid_to is <= row i+1's valid_from (it is either
+# already earlier, or it is set to exactly that value), so consecutive ranges
+# cannot overlap. Rows sharing a valid_from collapse to empty ranges, and an
+# empty range overlaps nothing. The final row per id is never touched, so an open
+# version stays open and a version closed by a "remove" keeps its recorded close
+# time. Inverted rows are then clamped to empty, which is required because
+# tstzrange() raises on an inverted range and one such row would make the
+# exclusion constraint uncreatable.
+
+# Rebuild plan. The window tiebreak is load-bearing: within one valid_from,
+# closed rows sort before the open one ((valid_to IS NULL) is FALSE < TRUE), so
+# the open row is last and inherits the real successor interval while its twins
+# collapse. ctid makes the order total. ctid is a safe row identity here because
+# plan and UPDATE are one statement over one snapshot under a table lock.
+_SCD2_REPAIR_PLAN_SQL = """
+    SELECT ctid AS rid,
+           lead(valid_from) OVER (
+               PARTITION BY {key}
+               ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid
+           ) AS next_from
+    FROM {table}
+"""
+
+# Shrink-only: `valid_to > next_from` never *extends* a close time. Strict
+# equality would erase genuine remove-then-recreate gaps, where a version was
+# legitimately closed long before the entity reappeared.
+_SCD2_REPAIR_REBUILD_SQL = """
+WITH plan AS (
+""" + _SCD2_REPAIR_PLAN_SQL + """
+)
+UPDATE {table} t
+   SET valid_to = p.next_from
+  FROM plan p
+ WHERE t.ctid = p.rid
+   AND p.next_from IS NOT NULL
+   AND (t.valid_to IS NULL OR t.valid_to > p.next_from);
+"""
+
+# Dry-run counterpart: how many rows the rebuild would touch, changing nothing.
+_SCD2_REPAIR_REBUILD_PREVIEW_SQL = """
+WITH plan AS (
+""" + _SCD2_REPAIR_PLAN_SQL + """
+)
+SELECT count(*)
+  FROM plan p
+  JOIN {table} t ON t.ctid = p.rid
+ WHERE p.next_from IS NOT NULL
+   AND (t.valid_to IS NULL OR t.valid_to > p.next_from);
+"""
+
+# Clamp inverted intervals to empty. Applies to every row, not just the last:
+# a non-final row whose valid_to already precedes its valid_from is left alone by
+# the shrink-only rebuild and would still poison the constraint.
+_SCD2_REPAIR_CLAMP_SQL = """
+UPDATE {table}
+   SET valid_to = valid_from
+ WHERE valid_to IS NOT NULL AND valid_to < valid_from;
+"""
+
+_SCD2_REPAIR_CLAMP_PREVIEW_SQL = """
+SELECT count(*) FROM {table}
+ WHERE valid_to IS NOT NULL AND valid_to < valid_from;
+"""
+
+# Full row snapshots of everything the clamp will rewrite — the recorded close
+# time is discarded, so it is captured before the fact rather than lost.
+_SCD2_REPAIR_CLAMP_ROWS_SQL = """
+SELECT to_jsonb(t) AS row_data FROM {table} t
+ WHERE t.valid_to IS NOT NULL AND t.valid_to < t.valid_from;
+"""
+
+# Backup of the whole table before any mutation. {backup} is built in Python from
+# a fixed prefix plus a UTC timestamp, never from user input.
+SCD2_REPAIR_BACKUP_SQL = "CREATE TABLE {backup} AS SELECT * FROM {table};"
+
+SCD2_REGCLASS_EXISTS_SQL = "SELECT to_regclass(%s) IS NOT NULL;"
+
+# Table lock for the repair transaction. meta_worker writes on its own connection
+# and a concurrent UPDATE would move a row's ctid out from under the plan.
+# SHARE ROW EXCLUSIVE blocks writers but not readers.
+SCD2_REPAIR_LOCK_SQL = "LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE;"
+SCD2_REPAIR_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '10s';"
+
+# ---- Ambiguity reporting -----------------------------------------------------
+#
+# Rows sharing (id, valid_from) with DIFFERENT payloads are genuinely ambiguous:
+# that is the enqueue-reordering defect's signature, and nothing in the data says
+# which version owned the era. The repair keeps every row and lets all but one
+# collapse to an empty interval, so no payload is destroyed — but the collapsed
+# versions label no state rows, so they are reported rather than passed over.
+_SCD2_REPAIR_AMBIGUOUS_SQL = """
+SELECT {key}::text AS id_value, valid_from, count(*) AS versions
+  FROM {table}
+ GROUP BY 1, 2
+HAVING count(*) > 1
+ ORDER BY 1, 2;
+"""
+
+# Byte-identical twins at the same (id, valid_from) — artefacts, not history.
+# Reported always; deleted only under --collapse-duplicates.
+_SCD2_REPAIR_IDENTICAL_DUPES_SQL = """
+WITH grouped AS (
+    SELECT {key}::text AS id_value, valid_from,
+           count(*) AS versions,
+           count(DISTINCT (to_jsonb(t) - 'valid_from' - 'valid_to')::text) AS payloads
+      FROM {table} t
+     GROUP BY 1, 2
+)
+SELECT id_value, valid_from, versions FROM grouped
+ WHERE versions > 1 AND payloads = 1
+ ORDER BY 1, 2;
+"""
+
+# Opt-in duplicate collapse. Keeps the row the states_flat view would pick
+# (DISTINCT ON ... ORDER BY valid_to DESC NULLS FIRST -> the open twin), archives
+# the losers with their full payload, and deletes only rows proven byte-identical
+# to the survivor.
+# "All payloads in this group are equal" is expressed as min = max over the
+# partition, not count(DISTINCT ...) OVER (...): PostgreSQL rejects DISTINCT in a
+# window function ("DISTINCT is not implemented for window functions").
+_SCD2_REPAIR_COLLAPSE_SQL = """
+WITH ranked AS (
+    SELECT t.ctid AS rid, t.{key}::text AS id_value, t.valid_from,
+           to_jsonb(t) AS row_data,
+           row_number() OVER w AS rn,
+           count(*) OVER w AS versions,
+           min((to_jsonb(t) - 'valid_from' - 'valid_to')::text) OVER w
+             = max((to_jsonb(t) - 'valid_from' - 'valid_to')::text) OVER w
+             AS payload_uniform
+      FROM {table} t
+    WINDOW w AS (PARTITION BY t.{key}, t.valid_from
+                 ORDER BY t.valid_to DESC NULLS FIRST, t.ctid
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+),
+losers AS (
+    SELECT * FROM ranked WHERE versions > 1 AND payload_uniform AND rn > 1
+),
+archived AS (
+    INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
+    SELECT %s, '{table}', id_value, 'duplicate_identical_payload', row_data FROM losers
+)
+DELETE FROM {table} d USING losers l WHERE d.ctid = l.rid;
+"""
+
+# Append-only audit of every row the repair deleted, rewrote, or flagged as
+# ambiguous. row_data is the complete original row, so a human can adjudicate or
+# re-insert without reaching for the backup table. Never pruned: run_id
+# distinguishes re-runs, so repeated runs accumulate rather than overwrite, and
+# "surface ambiguity rather than discard it" holds across runs too.
+SCD2_QUARANTINE_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS scd2_repair_quarantine (
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    run_id      TEXT        NOT NULL,
+    table_name  TEXT        NOT NULL,
+    id_value    TEXT        NOT NULL,
+    reason      TEXT        NOT NULL,
+    row_data    JSONB       NOT NULL
+);
+"""
+
+SCD2_QUARANTINE_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_scd2_repair_quarantine
+    ON scd2_repair_quarantine (table_name, id_value);
+"""
+
+SCD2_QUARANTINE_INSERT_SQL = """
+INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
+VALUES (%s, %s, %s, %s, %s);
+"""
+
+SCD2_QUARANTINE_SUMMARY_SQL = """
+SELECT table_name, reason, count(*) AS rows
+  FROM scd2_repair_quarantine WHERE run_id = %s
+ GROUP BY 1, 2 ORDER BY 1, 2;
+"""
+
+# Undo helper for a quarantined row, documented in the repair script's --help.
+_SCD2_QUARANTINE_RESTORE_SQL = """
+INSERT INTO {table}
+SELECT (jsonb_populate_record(NULL::{table}, row_data)).*
+  FROM scd2_repair_quarantine
+ WHERE table_name = '{table}' AND id_value = %s;
+"""
+
+# ---- Verification ------------------------------------------------------------
+#
+# All checks must return zero rows for the invariant to hold. INVERTED runs
+# first: it guards RANGE below, which raises on an inverted tstzrange rather than
+# returning a row.
+
+_SCD2_VERIFY_INVERTED_SQL = """
+SELECT {key}::text AS id_value, valid_from, valid_to
+  FROM {table} WHERE valid_to IS NOT NULL AND valid_to < valid_from;
+"""
+
+# The assumption the whole repair rests on. A hit here means stop and
+# re-diagnose rather than repair.
+_SCD2_VERIFY_VALID_FROM_SQL = """
+SELECT {key}::text AS id_value, valid_from
+  FROM {table}
+ WHERE valid_from IS NULL OR valid_from > now() + interval '1 day';
+"""
+
+_SCD2_VERIFY_MULTI_OPEN_SQL = """
+SELECT {key}::text AS id_value, count(*) AS open_rows
+  FROM {table} WHERE valid_to IS NULL
+ GROUP BY 1 HAVING count(*) > 1;
+"""
+
+# Cheap window gate: catches an interval overrunning its successor and any open
+# row that is not the newest version.
+#
+# The window ORDER BY must match the rebuild's tiebreak exactly. Ordering by
+# valid_from alone leaves ties broken arbitrarily, so when several versions share
+# a valid_from the open one can sort first and get flagged for having a
+# successor — even though the rows it "precedes" are empty ranges that overlap
+# nothing. That is a different question from the one the constraint asks, and it
+# made this check disagree with _SCD2_VERIFY_RANGE_SQL on correctly repaired data.
+_SCD2_VERIFY_SEQUENCE_SQL = """
+SELECT id_value, valid_from, valid_to, next_from FROM (
+    SELECT {key}::text AS id_value, valid_from, valid_to,
+           lead(valid_from) OVER (
+               PARTITION BY {key}
+               ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid
+           ) AS next_from
+      FROM {table}
+) s
+WHERE next_from IS NOT NULL AND (valid_to IS NULL OR valid_to > next_from);
+"""
+
+# Ground truth, derived differently from SEQUENCE on purpose: this is literally
+# what the exclusion constraint enforces. The redundancy is the point — if the
+# two ever disagree, the reconstruction is wrong.
+_SCD2_VERIFY_RANGE_SQL = """
+SELECT a.{key}::text AS id_value,
+       a.valid_from AS a_from, a.valid_to AS a_to,
+       b.valid_from AS b_from, b.valid_to AS b_to
+  FROM {table} a
+  JOIN {table} b ON a.{key} = b.{key} AND a.ctid < b.ctid
+   AND tstzrange(a.valid_from, COALESCE(a.valid_to, 'infinity'::timestamptz), '[)')
+    && tstzrange(b.valid_from, COALESCE(b.valid_to, 'infinity'::timestamptz), '[)');
+"""
+
+# Informational only: entities that produced states but have no dimension row at
+# all. A coverage gap, not this issue's corruption — the repair has no metadata
+# to invent, and the next HA start re-creates an open row for any that still
+# exist. Never drives a mutation.
+SCD2_STATES_WITHOUT_DIM_SQL = f"""
+SELECT count(*) FROM (
+    SELECT DISTINCT entity_id FROM {TABLE_NAME}
+    EXCEPT
+    SELECT DISTINCT entity_id FROM entities
+) x;
+"""
+
+
+def _per_dimension(template: str) -> dict:
+    """Bind a {table}/{key} template to every SCD2 dimension."""
+    return {
+        table: template.format(table=table, key=key)
+        for table, key in SCD2_DIMENSIONS
+    }
+
+
+SCD2_REPAIR_REBUILD_SQL = _per_dimension(_SCD2_REPAIR_REBUILD_SQL)
+SCD2_REPAIR_REBUILD_PREVIEW_SQL = _per_dimension(_SCD2_REPAIR_REBUILD_PREVIEW_SQL)
+SCD2_REPAIR_CLAMP_SQL = _per_dimension(_SCD2_REPAIR_CLAMP_SQL)
+SCD2_REPAIR_CLAMP_PREVIEW_SQL = _per_dimension(_SCD2_REPAIR_CLAMP_PREVIEW_SQL)
+SCD2_REPAIR_CLAMP_ROWS_SQL = _per_dimension(_SCD2_REPAIR_CLAMP_ROWS_SQL)
+SCD2_REPAIR_AMBIGUOUS_SQL = _per_dimension(_SCD2_REPAIR_AMBIGUOUS_SQL)
+SCD2_REPAIR_IDENTICAL_DUPES_SQL = _per_dimension(_SCD2_REPAIR_IDENTICAL_DUPES_SQL)
+SCD2_REPAIR_COLLAPSE_SQL = _per_dimension(_SCD2_REPAIR_COLLAPSE_SQL)
+SCD2_QUARANTINE_RESTORE_SQL = _per_dimension(_SCD2_QUARANTINE_RESTORE_SQL)
+
+# Verification checks in mandatory execution order — INVERTED first (see above).
+SCD2_VERIFY_CHECKS = (
+    ("inverted", _per_dimension(_SCD2_VERIFY_INVERTED_SQL)),
+    ("valid_from_sanity", _per_dimension(_SCD2_VERIFY_VALID_FROM_SQL)),
+    ("multi_open", _per_dimension(_SCD2_VERIFY_MULTI_OPEN_SQL)),
+    ("sequence", _per_dimension(_SCD2_VERIFY_SEQUENCE_SQL)),
+    ("range_overlap", _per_dimension(_SCD2_VERIFY_RANGE_SQL)),
 )

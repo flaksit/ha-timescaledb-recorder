@@ -5,7 +5,7 @@ from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 18 SQL statements.
+    """sync_setup_schema must execute exactly 23 SQL statements.
 
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
@@ -13,13 +13,14 @@ def test_create_schema_executes_all_statements(mock_psycopg_conn):
     + 5 dimension table indexes (entities compound, entities current-row,
       devices, areas, labels)
     + 2 convenience views (states_numeric, states_flat)
-    = 18 total
+    + 1 btree_gist extension + 4 SCD2 exclusion constraints (issue #17)
+    = 23 total
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 18
+    assert cur.execute.call_count == 23
 
 
 def test_create_schema_order(mock_psycopg_conn):
@@ -46,10 +47,50 @@ def test_create_schema_order(mock_psycopg_conn):
     assert "devices" in calls[8]
     assert "areas" in calls[9]
     assert "labels" in calls[10]
-    # Views come last — states_flat joins the dimension tables, so they
-    # must already exist.
+    # Views come last of the main block — states_flat joins the dimension
+    # tables, so they must already exist.
     assert "CREATE OR REPLACE VIEW states_numeric" in calls[16]
     assert "CREATE OR REPLACE VIEW states_flat" in calls[17]
+    # Invariant enforcement follows the tables it constrains (issue #17).
+    assert "btree_gist" in calls[18]
+    for offset, table in enumerate(("entities", "devices", "areas", "labels")):
+        assert f"excl_{table}_period" in calls[19 + offset]
+
+
+def test_constraint_failure_does_not_abort_schema_setup(mock_psycopg_conn):
+    """A damaged install cannot create the constraints, and that must not stop
+    schema setup — states ingestion is never held hostage to dimension repair.
+    """
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "excl_" in sql or "btree_gist" in sql:
+            raise psycopg.errors.InsufficientPrivilege("nope")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)  # must not raise
+
+
+def test_falls_back_to_unique_index_without_btree_gist(mock_psycopg_conn):
+    """Without btree_gist the weaker guarantee still gets installed."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "btree_gist" in sql:
+            raise psycopg.errors.InsufficientPrivilege("no CREATE on database")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)
+
+    calls = [c.args[0] for c in cur.execute.call_args_list]
+    assert any("ux_entities_open" in c for c in calls)
+    assert not any("excl_entities_period" in c for c in calls)
 
 
 def test_custom_chunk_interval(mock_psycopg_conn):

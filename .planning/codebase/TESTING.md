@@ -234,6 +234,21 @@ async def test_connection_error_requeues(ingester, mock_conn, mock_pool):
   )
   ```
 
+## Database-backed tests
+
+`tests/test_scd2_invariant_db.py` needs a real PostgreSQL/TimescaleDB and is skipped unless `SCD2_TEST_DSN` is set. It covers the SCD2 invariant (issue #17), which no mock can express: the defects were an ordering property of the real executor plus SQL semantics (window frames, `tstzrange`, exclusion constraints) only a server can answer.
+
+```bash
+docker run -d --name scd2-test -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=hatest \
+    -p 127.0.0.1:5599:5432 timescale/timescaledb:latest-pg16
+SCD2_TEST_DSN=postgresql://postgres:pw@127.0.0.1:5599/hatest uv run pytest \
+    tests/test_scd2_invariant_db.py
+```
+
+The fixture builds its damage from issue #17's verbatim evidence rows plus every other shape (overlap, inverted interval, remove-then-recreate gap, identical twins, ambiguous same-timestamp versions, already-correct history). Assertions are written to hold for any history, so restoring a copy of real dimension tables into that database and re-running is a valid exercise.
+
+`pytest-socket` blocks sockets by default, so the module carries `pytest.mark.enable_socket`.
+
 ## CI/CD Integration
 
 - No CI configuration file detected (no `.github/workflows/`, no `Makefile`, no `tox.ini`)

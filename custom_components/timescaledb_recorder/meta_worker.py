@@ -34,10 +34,6 @@ from .const import (
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
     SCD2_CLOSE_LABEL_SQL,
-    SCD2_INSERT_AREA_SQL,
-    SCD2_INSERT_DEVICE_SQL,
-    SCD2_INSERT_ENTITY_SQL,
-    SCD2_INSERT_LABEL_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
     SCD2_SNAPSHOT_DEVICE_SQL,
     SCD2_SNAPSHOT_ENTITY_SQL,
@@ -103,6 +99,13 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         # Updated before each major operation so watchdog context is meaningful.
         self._last_op: str = "unknown"
         self._last_retry_attempt: int | None = None
+        # Count of items dropped because they violated the SCD2 invariant. Any
+        # non-zero value means metadata history has a hole and warrants a look.
+        self.integrity_drops: int = 0
+        # Count of updates that landed out of order and were therefore skipped
+        # rather than spliced into history. Should stay 0: the registry listener
+        # guarantees queue order. Non-zero means that guarantee broke.
+        self.out_of_order_skips: int = 0
 
         # retry_until_success is applied to the bound method at __init__ time so
         # on_transient / notify_stall can reference self. D-07 wiring.
@@ -263,28 +266,84 @@ class TimescaledbMetaRecorderThread(threading.Thread):
     # ------------------------------------------------------------------
 
     def _write_item_raw(self, item: dict) -> None:
-        """Dispatch one item to the appropriate SCD2 path.
+        """Dispatch one item, dropping items the SCD2 invariant refuses.
 
         Raises on any DB error — retry_until_success handles transient failure.
         Called as self._write_item (the retry-wrapped version) from run().
+
+        Integrity violations are the exception: they are not transient, so
+        retrying replays the same conflicting row forever. retry_until_success
+        never gives up, so one bad item would wedge every later metadata write
+        and silently stop the dimension tables from tracking anything. Dropping
+        it keeps ingestion alive; the constraint has already done its job by
+        refusing the write, and the ERROR log carries the item for diagnosis.
         """
+        try:
+            self._dispatch_item(item)
+        except (psycopg.errors.ExclusionViolation, psycopg.errors.UniqueViolation):
+            self.integrity_drops += 1
+            _LOGGER.error(
+                "%s: SCD2 invariant rejected a metadata write; dropping the item to "
+                "keep the queue moving (total dropped: %d). Item: %r",
+                self.name, self.integrity_drops, item, exc_info=True,
+            )
+
+    def _dispatch_item(self, item: dict) -> None:
+        """Route one item to the per-registry SCD2 path."""
         registry = item["registry"]
         action = item["action"]
         registry_id = item["registry_id"]
         old_id = item.get("old_id")
         params = self._rehydrate_params(registry, item.get("params"))
-        now = datetime.now(timezone.utc)
+        close_ts = self._close_timestamp(registry, params)
 
         if registry == "entity":
-            self._process_entity(action, registry_id, old_id, params, now)
+            self._process_entity(action, registry_id, old_id, params, close_ts)
         elif registry == "device":
-            self._process_device(action, registry_id, params, now)
+            self._process_device(action, registry_id, params, close_ts)
         elif registry == "area":
-            self._process_area(action, registry_id, params, now)
+            self._process_area(action, registry_id, params, close_ts)
         elif registry == "label":
-            self._process_label(action, registry_id, params, now)
+            self._process_label(action, registry_id, params, close_ts)
         else:
             _LOGGER.warning("Unknown registry type in metadata item: %s", registry)
+
+    def _note_version_skipped(self, cur, registry: str, registry_id: str) -> None:
+        """Warn when a close+insert pair wrote nothing.
+
+        The close carries a `valid_from < new_valid_from` guard and the insert is
+        guarded on there being no open row, so an update that arrives after a
+        newer version already landed matches neither and is skipped. That is the
+        right trade — splicing it in blind is how the intervals got corrupted —
+        but a silent skip loses a registry change, and silence is exactly what let
+        issue #17 run undetected. Surface it instead.
+        """
+        if cur.rowcount:
+            return
+        self.out_of_order_skips += 1
+        _LOGGER.warning(
+            "%s: %s %s arrived after a newer version and was skipped to keep the "
+            "SCD2 intervals consistent (total skipped: %d). Queue ordering should "
+            "make this impossible.",
+            self.name, registry, registry_id, self.out_of_order_skips,
+        )
+
+    @staticmethod
+    def _close_timestamp(registry: str, params: tuple | None) -> datetime:
+        """Timestamp used to expire the outgoing version.
+
+        For a close+insert pair this MUST be the incoming row's valid_from, so the
+        two intervals abut exactly and the exclusion constraint's '[)' bounds are
+        satisfied. Reading a fresh clock here instead — which is what this worker
+        used to do — puts the close after the successor's start and produces one
+        overlapping interval per metadata change (issue #17).
+
+        "remove" carries no params and has no replacement row, so the time the
+        worker learned of the removal is the correct close time.
+        """
+        if params is None:
+            return datetime.now(timezone.utc)
+        return params[_VALID_FROM_INDEX[registry]]
 
     def _rehydrate_params(self, registry: str, params: list | None) -> tuple | None:
         """Convert JSON-safe params list back to a tuple with datetime in the
@@ -314,7 +373,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         registry_id: str,
         old_id: str | None,
         params: tuple | None,
-        now: datetime,
+        close_ts: datetime,
     ) -> None:
         """Execute SCD2 write for an entity registry change.
 
@@ -322,6 +381,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         "remove": close the open row; no new row (entry already gone).
         "update" rename (old_id is not None): close old entity_id + insert new, atomically.
         "update" field change (old_id is None): change-detection gate, then close+insert.
+
+        Both update paths close with the incoming valid_from and insert through the
+        guarded snapshot statement, which together make a replayed item a no-op.
         """
         conn = self.get_db_connection()
         with conn.cursor() as cur:
@@ -329,23 +391,28 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 # params[0] = entity_id; appears twice per SCD2_SNAPSHOT_ENTITY_SQL.
                 cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
             elif action == "remove":
-                cur.execute(SCD2_CLOSE_ENTITY_SQL, (now, registry_id))
+                cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts))
             elif action == "update":
                 if old_id is not None:
-                    # Rename path — atomic close+insert.
+                    # Rename path — atomic close of the old id + insert under the new.
                     with conn.transaction():
-                        cur.execute(SCD2_CLOSE_ENTITY_SQL, (now, old_id))
-                        cur.execute(SCD2_INSERT_ENTITY_SQL, (*params,))
+                        cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, old_id, close_ts))
+                        cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
+                        self._note_version_skipped(cur, "entity", registry_id)
                 else:
-                    # Field-change path — change-detection gate via syncer helper.
-                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._registry_listener._entity_row_changed(
-                            dict_cur, registry_id, params
-                        )
-                    if changed:
-                        with conn.transaction():
-                            cur.execute(SCD2_CLOSE_ENTITY_SQL, (now, registry_id))
-                            cur.execute(SCD2_INSERT_ENTITY_SQL, (*params,))
+                    # Field-change path. The change-detection read runs inside the
+                    # transaction so it and the close+insert see one snapshot.
+                    with conn.transaction():
+                        with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                            changed = self._registry_listener._entity_row_changed(
+                                dict_cur, registry_id, params
+                            )
+                        if changed:
+                            cur.execute(
+                                SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts)
+                            )
+                            cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
+                            self._note_version_skipped(cur, "entity", registry_id)
 
     # ------------------------------------------------------------------
     # Per-registry dispatch — device/area/label (D-05-c). Mechanical copies
@@ -358,7 +425,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         action: str,
         registry_id: str,
         params: tuple | None,
-        now: datetime,
+        close_ts: datetime,
     ) -> None:
         """Execute SCD2 write for a device registry change.
 
@@ -373,23 +440,26 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 # params[0] = device_id; appears twice per SCD2_SNAPSHOT_DEVICE_SQL.
                 cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
             elif action == "remove":
-                cur.execute(SCD2_CLOSE_DEVICE_SQL, (now, registry_id))
+                cur.execute(SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts))
             elif action == "update":
-                with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                    changed = self._registry_listener._device_row_changed(
-                        dict_cur, registry_id, params
-                    )
-                if changed:
-                    with conn.transaction():
-                        cur.execute(SCD2_CLOSE_DEVICE_SQL, (now, registry_id))
-                        cur.execute(SCD2_INSERT_DEVICE_SQL, (*params,))
+                with conn.transaction():
+                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                        changed = self._registry_listener._device_row_changed(
+                            dict_cur, registry_id, params
+                        )
+                    if changed:
+                        cur.execute(
+                            SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts)
+                        )
+                        cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
+                        self._note_version_skipped(cur, "device", registry_id)
 
     def _process_area(
         self,
         action: str,
         registry_id: str,
         params: tuple | None,
-        now: datetime,
+        close_ts: datetime,
     ) -> None:
         """Execute SCD2 write for an area registry change.
 
@@ -404,23 +474,26 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 # params[0] = area_id; appears twice per SCD2_SNAPSHOT_AREA_SQL.
                 cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
             elif action == "remove":
-                cur.execute(SCD2_CLOSE_AREA_SQL, (now, registry_id))
+                cur.execute(SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts))
             elif action == "update":
-                with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                    changed = self._registry_listener._area_row_changed(
-                        dict_cur, registry_id, params
-                    )
-                if changed:
-                    with conn.transaction():
-                        cur.execute(SCD2_CLOSE_AREA_SQL, (now, registry_id))
-                        cur.execute(SCD2_INSERT_AREA_SQL, (*params,))
+                with conn.transaction():
+                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                        changed = self._registry_listener._area_row_changed(
+                            dict_cur, registry_id, params
+                        )
+                    if changed:
+                        cur.execute(
+                            SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts)
+                        )
+                        cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
+                        self._note_version_skipped(cur, "area", registry_id)
 
     def _process_label(
         self,
         action: str,
         registry_id: str,
         params: tuple | None,
-        now: datetime,
+        close_ts: datetime,
     ) -> None:
         """Execute SCD2 write for a label registry change.
 
@@ -435,13 +508,16 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 # params[0] = label_id; appears twice per SCD2_SNAPSHOT_LABEL_SQL.
                 cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
             elif action == "remove":
-                cur.execute(SCD2_CLOSE_LABEL_SQL, (now, registry_id))
+                cur.execute(SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts))
             elif action == "update":
-                with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                    changed = self._registry_listener._label_row_changed(
-                        dict_cur, registry_id, params
-                    )
-                if changed:
-                    with conn.transaction():
-                        cur.execute(SCD2_CLOSE_LABEL_SQL, (now, registry_id))
-                        cur.execute(SCD2_INSERT_LABEL_SQL, (*params,))
+                with conn.transaction():
+                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                        changed = self._registry_listener._label_row_changed(
+                            dict_cur, registry_id, params
+                        )
+                    if changed:
+                        cur.execute(
+                            SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts)
+                        )
+                        cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
+                        self._note_version_skipped(cur, "label", registry_id)

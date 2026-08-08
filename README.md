@@ -276,27 +276,35 @@ After the snapshot, the integration subscribes to four HA registry events:
 - `EVENT_AREA_REGISTRY_UPDATED`
 - `EVENT_LABEL_REGISTRY_UPDATED`
 
-Each event triggers the SCD2 close-and-insert cycle: the current open row is closed (`valid_to = now()`), and a new row is inserted with the updated fields (`valid_from = now()`). Entity renames (entity_id changes) are handled the same way — the old entity_id row closes and a new one opens under the new entity_id.
+Each event triggers the SCD2 close-and-insert cycle: the current open row is closed and a new row is inserted with the updated fields. Both halves use one timestamp — the moment the registry event fired — so a version's interval ends exactly where its successor's begins. Entity renames (entity_id changes) are handled the same way: the old entity_id row closes and a new one opens under the new entity_id.
+
+Registry events are buffered in arrival order and handed to the writer in batches, so the order versions are written always matches the order the changes happened.
 
 The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates.
 
+### The invariant
+
+For any id, version intervals never overlap and at most one version is open (`valid_to IS NULL`). This is enforced by the database, not by convention — each dimension carries an exclusion constraint over `(id, tstzrange(valid_from, COALESCE(valid_to, 'infinity'), '[)'))`, installed automatically on startup and requiring the `btree_gist` extension.
+
+Without it, a duplicated open row silently multiplies every fact row joined through it while row counts still look plausible. If the extension cannot be installed, the integration falls back to a unique index on open rows and logs the degradation; that still prevents duplicate open versions but cannot see overlaps between closed ones.
+
+Databases written by a version before 2.4.0 may already violate the invariant. The constraints will fail to apply on those until the history is repaired — see [Repairing SCD2 history](#repairing-scd2-history).
+
 ### Example query: point-in-time metadata join
 
+Use `states_flat`, which already labels every state row with the metadata that was current when it was recorded:
+
 ```sql
-SELECT s.entity_id, s.state, e.name, e.area_id, a.name AS area_name
-FROM states s
-JOIN entities e ON e.entity_id = s.entity_id
-  AND s.last_updated >= e.valid_from
-  AND (e.valid_to IS NULL OR s.last_updated < e.valid_to)
-LEFT JOIN areas a ON a.area_id = e.area_id
-  AND s.last_updated >= a.valid_from
-  AND (a.valid_to IS NULL OR s.last_updated < a.valid_to)
-WHERE s.entity_id = 'sensor.living_room_temperature'
-ORDER BY s.last_updated DESC
+SELECT last_updated, state, value, entity_name, area_name
+FROM states_flat
+WHERE entity_id = 'sensor.living_room_temperature'
+ORDER BY last_updated DESC
 LIMIT 10;
 ```
 
-The join conditions (`>= valid_from AND (valid_to IS NULL OR < valid_to)`) ensure you get the metadata row that was current at the time each state was recorded — not necessarily the current metadata. This is what makes the join historically correct.
+Joining the dimensions directly also works, and with the invariant enforced it can no longer duplicate rows. It is still lossier than the view: an inner join on `valid_from`/`valid_to` drops every state row recorded before the entity's first registry version — including everything imported by `backfill_gaps.py` — and anything falling in a gap between a removal and a re-creation. `states_flat` avoids both by extending the first version back to `-infinity` and running each version until the next one starts.
+
+`valid_to IS NULL` on its own is fine for "what is this entity called now", but it is not a point-in-time join: it labels historical rows with today's metadata, and it drops entities that have since been removed from HA.
 
 ## Differences from the built-in recorder
 
@@ -351,3 +359,44 @@ Optional arguments:
 The script is safe to run while HA is active — SQLite is opened read-only and re-running is idempotent. Each bucket does a cheap `COUNT(*)` comparison first; buckets already in sync are skipped with no row fetches.
 
 **`--end` precision snapping:** `--end 2026-04-10` includes the full day; `--end 2026-04-10T14:30` includes the full minute, and so on.
+
+## Repairing SCD2 history
+
+Databases written before 2.4.0 can hold overlapping dimension versions and entities with more than one open version. The symptom is silent: any query joining a dimension on `valid_to IS NULL` returns duplicated fact rows for affected ids, so sums and counts come out too high while row counts still look plausible. `states_flat` was never affected.
+
+Two things were wrong, both fixed in 2.4.0. The close half of each close-and-insert used a separate, later clock read than the insert, so every metadata change left the outgoing version overrunning its successor. And registry events were handed to the queue through the default multi-threaded executor, so they could be written in a different order than they happened.
+
+Fixing the code stops new damage but does not undo the old. Run the repair script once:
+
+```bash
+# 1. update the integration and restart HA, so the corrected write path is live
+# 2. inspect — mutates nothing
+docker exec homeassistant python3 \
+    /config/custom_components/timescaledb_recorder/repair_scd2.py --dry-run
+# 3. repair, verify, and enforce
+docker exec homeassistant python3 \
+    /config/custom_components/timescaledb_recorder/repair_scd2.py --apply
+```
+
+**Update and restart first.** With the old code still running, the repaired history re-corrupts immediately, and the constraints the script installs would reject every metadata write.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dsn DSN` | read from integration config | PostgreSQL connection string |
+| `--dry-run` | default | Report the damage and what would change; mutates nothing |
+| `--apply` | off | Back up, repair, verify, and add the constraints |
+| `--verify-only` | off | Check the invariant and exit; never mutates |
+| `--collapse-duplicates` | off | Also delete rows byte-identical to a row that stays |
+| `--no-constraints` | off | Repair without adding the exclusion constraints |
+
+### What it does, and what it will not do
+
+History is reconstructed from `valid_from` ordering alone: each version's `valid_to` is set to the next version's `valid_from`. `valid_from` is stamped in the event loop when the registry event fires and is the one field neither defect corrupts, so it is the only trustworthy anchor.
+
+The script therefore **writes `valid_to` only**. It never writes `valid_from`, and by default it never deletes a row. The rebuild only ever shrinks a close time, so a version legitimately closed long before its successor — an entity removed and later re-created — keeps its recorded gap. The last version of each id is never touched, so an open version stays open and a removal stays closed.
+
+Before touching anything it copies each table to `<table>_prerepair_<utc timestamp>`. That is the undo path; drop those tables once you are satisfied. Every row it deletes, rewrites, or flags is archived with its complete original payload in `scd2_repair_quarantine`, tagged with the run id.
+
+Where history is genuinely ambiguous — two versions recorded at the identical `valid_from` with different contents, which is the reordering defect's signature — nothing in the data says which one owned the era. Both rows are kept, one ends up with an empty interval, and the group is reported rather than silently resolved.
+
+Re-running is safe and converges: a second `--apply` changes zero rows. The script exits non-zero if anything is left unresolved.

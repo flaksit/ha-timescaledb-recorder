@@ -1,4 +1,5 @@
 """RegistryListener: thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker."""
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from homeassistant.helpers.area_registry import EVENT_AREA_REGISTRY_UPDATED
 from homeassistant.helpers.label_registry import EVENT_LABEL_REGISTRY_UPDATED
 
 from .const import (
+    DOMAIN,
     SELECT_ENTITY_CURRENT_SQL,
     SELECT_DEVICE_CURRENT_SQL,
     SELECT_AREA_CURRENT_SQL,
@@ -122,6 +124,18 @@ class RegistryListener:
     processed before the snapshot row exists, causing the SCD2 close/insert to target
     a non-existent row. DISCARD mode eliminates this ordering hazard. The backfill
     captures the registry state at snapshot time; changes after enable() flow normally.
+
+    Event ordering (issue #17): handlers append to an in-memory buffer synchronously
+    and a single drain task moves the buffer to the PersistentQueue. Each handler
+    previously did hass.async_create_task(queue.put_async(item)), and put_async
+    offloads the append with run_in_executor(None, ...) onto the default
+    multi-threaded executor — so concurrent appends raced for the queue lock and
+    landed in arbitrary order. valid_from is stamped here at event time, so an
+    out-of-order append made the worker apply versions in the wrong sequence and
+    corrupted the SCD2 intervals. A list append in a @callback cannot be reordered
+    (it never awaits), and one drainer means one writer, so queue order is now
+    event order. Draining through put_many_async also keeps the single-fsync
+    property that issue #11 introduced.
     """
 
     def __init__(
@@ -140,6 +154,12 @@ class RegistryListener:
         # DISCARD mode: events are dropped until enable() is called. Prevents
         # out-of-order SCD2 writes during the initial drain+backfill window.
         self._enabled: bool = False
+        # Ordered hand-off to the meta queue (issue #17). Handlers append here
+        # synchronously; _drain_loop is the only reader and the only writer to
+        # the PersistentQueue, so event order survives all the way to the worker.
+        self._buffer: list[dict] = []
+        self._buffer_ready = asyncio.Event()
+        self._drain_task: asyncio.Task | None = None
 
     def bind_meta_queue(self, q: PersistentQueue) -> None:
         """Wire the PersistentQueue after construction. Used by __init__.py
@@ -154,6 +174,51 @@ class RegistryListener:
         """
         self._enabled = True
 
+    @callback
+    def _enqueue(self, item: dict) -> None:
+        """Append one item to the ordered buffer and wake the drain task.
+
+        Must stay synchronous. The moment this awaits, two events can interleave
+        and the buffer stops recording event order — which is the whole point of
+        it existing (see the ordering note in the class docstring).
+        """
+        self._buffer.append(item)
+        self._buffer_ready.set()
+
+    async def _drain_loop(self) -> None:
+        """Move buffered items to the PersistentQueue, preserving order.
+
+        Sole writer to the queue from this listener. Takes the whole buffer each
+        pass so a burst becomes one put_many_async — one fsync — rather than one
+        per event.
+        """
+        try:
+            while True:
+                await self._buffer_ready.wait()
+                await self._flush_buffer()
+        except asyncio.CancelledError:
+            # async_stop cancels us; it flushes whatever is left afterwards.
+            raise
+
+    async def _flush_buffer(self) -> None:
+        """Hand the current buffer contents to the queue in one batch."""
+        # Swap before awaiting: put_many_async yields, and events arriving during
+        # that window must land in the next batch, not be dropped with this one.
+        batch = self._buffer
+        self._buffer = []
+        self._buffer_ready.clear()
+        if not batch:
+            return
+        try:
+            await self._meta_queue.put_many_async(batch)
+        except Exception:  # noqa: BLE001
+            # Re-queue at the front so ordering survives a transient write error;
+            # losing these items would leave permanent gaps in SCD2 history.
+            self._buffer = batch + self._buffer
+            self._buffer_ready.set()
+            _LOGGER.exception("Failed to enqueue %d registry item(s); will retry", len(batch))
+            raise
+
     async def async_start(self) -> None:
         """Cache registry references and register event listeners in DISCARD mode.
 
@@ -165,6 +230,12 @@ class RegistryListener:
         self._device_reg = dr.async_get(self._hass)
         self._area_reg = ar.async_get(self._hass)
         self._label_reg = lr.async_get(self._hass)
+
+        # Start the drainer before subscribing, so no event can be buffered
+        # without something running to move it to the queue.
+        self._drain_task = self._hass.async_create_background_task(
+            self._drain_loop(), f"{DOMAIN}_registry_drain"
+        )
 
         self._cancel_listeners.append(
             self._hass.bus.async_listen(
@@ -376,7 +447,7 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Device registry event handling
@@ -412,7 +483,7 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Area registry event handling
@@ -458,7 +529,7 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Label registry event handling
@@ -494,18 +565,36 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def async_stop(self) -> None:
-        """Cancel all registry event subscriptions.
+        """Cancel subscriptions, then flush anything still buffered.
 
-        No write buffer to flush — events are processed immediately by the meta worker,
-        so no final flush is needed on shutdown.
+        Order matters: unsubscribe first so no new events arrive, then stop the
+        drainer, then flush what is left. Skipping the final flush would silently
+        drop registry changes that arrived in the last drain interval, leaving
+        permanent gaps in SCD2 history.
         """
         for cancel in self._cancel_listeners:
             cancel()
         self._cancel_listeners.clear()
+
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            try:
+                await self._drain_task
+            except asyncio.CancelledError:
+                pass
+            self._drain_task = None
+
+        try:
+            await self._flush_buffer()
+        except Exception:  # noqa: BLE001
+            # Already logged in _flush_buffer. Unload must not fail on this —
+            # the items stay in the buffer and are lost with the listener, which
+            # is strictly better than blocking HA shutdown.
+            _LOGGER.error("Dropped %d buffered registry item(s) on shutdown", len(self._buffer))

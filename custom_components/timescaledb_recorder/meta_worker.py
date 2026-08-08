@@ -295,7 +295,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         registry_id = item["registry_id"]
         old_id = item.get("old_id")
         params = self._rehydrate_params(registry, item.get("params"))
-        close_ts = self._close_timestamp(registry, params)
+        close_ts = self._close_timestamp(registry, params, item.get("enqueued_at"))
 
         if registry == "entity":
             self._process_entity(action, registry_id, old_id, params, close_ts)
@@ -329,8 +329,10 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         )
 
     @staticmethod
-    def _close_timestamp(registry: str, params: tuple | None) -> datetime:
-        """Timestamp used to expire the outgoing version.
+    def _close_timestamp(
+        registry: str, params: tuple | None, enqueued_at: str | None = None
+    ) -> datetime:
+        """Timestamp used to expire the outgoing version — always event time.
 
         For a close+insert pair this MUST be the incoming row's valid_from, so the
         two intervals abut exactly and the exclusion constraint's '[)' bounds are
@@ -338,12 +340,26 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         used to do — puts the close after the successor's start and produces one
         overlapping interval per metadata change (issue #17).
 
-        "remove" carries no params and has no replacement row, so the time the
-        worker learned of the removal is the correct close time.
+        "remove" carries no params, but it does carry `enqueued_at` from the
+        callback, and that is when the entity actually disappeared. Dequeue time
+        breaks as soon as the queue is delayed: with the database unreachable from
+        10:00 to 12:00, a removal at 10:00 followed by a re-creation at 10:05 would
+        close the old version at 12:00, which then overlaps the re-created version.
+        The constraint rejects that insert and the entity stays marked removed.
+
+        Falls back to the current clock only for an item with no usable event time.
         """
-        if params is None:
-            return datetime.now(timezone.utc)
-        return params[_VALID_FROM_INDEX[registry]]
+        if params is not None:
+            return params[_VALID_FROM_INDEX[registry]]
+        if enqueued_at:
+            try:
+                return datetime.fromisoformat(enqueued_at)
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "%s: unparseable enqueued_at %r; closing at the current time",
+                    registry, enqueued_at,
+                )
+        return datetime.now(timezone.utc)
 
     def _rehydrate_params(self, registry: str, params: list | None) -> tuple | None:
         """Convert JSON-safe params list back to a tuple with datetime in the

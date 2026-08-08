@@ -1,9 +1,11 @@
 """Unit tests for RegistryListener (registry relay + SCD2 change-detection helpers)."""
+import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from custom_components.timescaledb_recorder import registry_listener as registry_listener_module
 from custom_components.timescaledb_recorder.registry_listener import RegistryListener, _to_json_safe
 from custom_components.timescaledb_recorder.persistent_queue import PersistentQueue
 
@@ -396,6 +398,78 @@ async def test_flush_requeues_batch_on_failure(enabled_listener, mock_meta_queue
         await enabled_listener._flush_buffer()
 
     assert len(enabled_listener._buffer) == 1
+
+
+async def test_drain_loop_survives_an_enqueue_failure(enabled_listener, mock_meta_queue,
+                                                     mock_entity_registry):
+    """The drainer is the only path from callback to disk.
+
+    If it exits on the first error, every later registry change accumulates in
+    memory unpersisted while nothing reports a problem. It must retry instead.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    calls = []
+
+    async def flaky(batch):
+        calls.append(list(batch))
+        if len(calls) == 1:
+            raise OSError("disk full")
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=flaky)
+
+    with patch.object(registry_listener_module, "_DRAIN_RETRY_MIN_S", 0.01), \
+         patch.object(registry_listener_module, "_DRAIN_RETRY_MAX_S", 0.01):
+        task = asyncio.get_running_loop().create_task(enabled_listener._drain_loop())
+        event = MagicMock()
+        event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+        enabled_listener._handle_entity_registry_updated(event)
+
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(calls) >= 2:
+                break
+
+        assert not task.done(), "drain loop died on the first enqueue error"
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(calls) >= 2, "the failed batch was never retried"
+    assert calls[1][0]["registry_id"] == "sensor.x", "retry lost the item"
+    assert enabled_listener._buffer == []
+
+
+async def test_cancellation_during_flush_returns_the_batch(enabled_listener,
+                                                           mock_meta_queue,
+                                                           mock_entity_registry):
+    """Cancelling mid-flush must not strand the batch.
+
+    The buffer is swapped out before awaiting the executor, so a CancelledError
+    raised during that await would otherwise leave the items in a local variable
+    belonging to neither the buffer nor the queue.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    started = asyncio.Event()
+
+    async def hang(_batch):
+        started.set()
+        await asyncio.sleep(60)
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=hang)
+
+    flush = asyncio.get_running_loop().create_task(enabled_listener._flush_buffer())
+    await started.wait()
+    flush.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flush
+
+    assert len(enabled_listener._buffer) == 1, "batch was lost on cancellation"
 
 
 async def test_stop_flushes_remaining_buffer(enabled_listener, mock_meta_queue,

@@ -20,8 +20,7 @@ What it does
 ------------
 Reconstructs each dimension's version intervals from `valid_from` ordering alone,
 and writes `valid_to` only. It never writes `valid_from`, and by default it never
-deletes a row: `valid_from` is stamped in the HA event loop at event time and is
-the one field both defects leave intact, so it is the only trustworthy anchor.
+deletes a row.
 
 Per table, in one all-or-nothing transaction under SHARE ROW EXCLUSIVE:
 
@@ -29,16 +28,30 @@ Per table, in one all-or-nothing transaction under SHARE ROW EXCLUSIVE:
            -> rebuild valid_to -> clamp inverted intervals
 
 then verify, then add the exclusion constraint if and only if verification is
-clean. A partially-completed run is never worse than not running: every mutation
-either shrinks a `valid_to` or removes a row proven byte-identical to one that
-stays, and nothing widens an interval or reopens a closed final version.
+clean. Atomicity is per table, not per run: an interrupted run leaves earlier
+tables committed and the rest untouched, and re-running converges.
+
+What it does NOT do
+-------------------
+`valid_from` is the best available anchor, not a proven one. It is the field the
+known defects leave alone, but earlier versions of this integration processed
+registry events concurrently and read both the clock and the registry entry at
+processing time rather than event time. So a `valid_from` can be later than the
+change it records, and a version that was overwritten before it was ever written
+is simply absent. This script normalises intervals; it cannot recover history
+that was never persisted, and it does not consult the live HA registries.
+
+The `Fidelity` section of its output reports what it cannot decide: gaps the
+`states` table contradicts, and ids left with no current version. Read it.
 
 Safety
 ------
 - A full copy of each table is written to `<table>_prerepair_<utc timestamp>`
-  before anything is modified. That is the undo path; drop them once satisfied.
-- Every row deleted, rewritten, or flagged is archived with its complete original
-  payload in `scd2_repair_quarantine`, tagged with this run's id.
+  before anything is modified. That is the undo path, and the only complete
+  record of the pre-repair `valid_to` values; drop them once satisfied.
+- `scd2_repair_quarantine` holds the rows that were deleted or clamped, with
+  their full payload. Rebuilt `valid_to` values are not archived there — the
+  backup tables carry those.
 - Re-running is safe and converges: a second --apply changes zero rows.
 - The DSN password is visible in the process list. Prefer PGPASSWORD or .pgpass.
 """
@@ -75,6 +88,8 @@ try:
         SCD2_REPAIR_REBUILD_PREVIEW_SQL,
         SCD2_REPAIR_REBUILD_SQL,
         SCD2_STATES_WITHOUT_DIM_SQL,
+        SCD2_SUSPICIOUS_GAPS_SQL,
+        SCD2_NO_CURRENT_VERSION_SQL,
         SCD2_VERIFY_CHECKS,
     )
 except ImportError:
@@ -103,6 +118,8 @@ except ImportError:
         SCD2_REPAIR_REBUILD_PREVIEW_SQL,
         SCD2_REPAIR_REBUILD_SQL,
         SCD2_STATES_WITHOUT_DIM_SQL,
+        SCD2_SUSPICIOUS_GAPS_SQL,
+        SCD2_NO_CURRENT_VERSION_SQL,
         SCD2_VERIFY_CHECKS,
     )
 
@@ -212,6 +229,51 @@ def report_ambiguity(conn: psycopg.Connection) -> dict[str, int]:
                 f"{len(identical)} byte-identical, {differing} with differing payloads"
             )
     return counts
+
+
+def report_fidelity(conn: psycopg.Connection) -> int:
+    """Report what the repair cannot decide. Read-only; returns the doubt count.
+
+    Passing the invariant checks means the intervals are consistent. It does not
+    mean they are true. Two kinds of doubt are measurable, and staying quiet about
+    them would repeat the failure that made issue #17 invisible for months.
+    """
+    doubts = 0
+
+    with conn.cursor() as cur:
+        cur.execute(SCD2_SUSPICIOUS_GAPS_SQL)
+        gaps = cur.fetchall()
+    if gaps:
+        doubts += len(gaps)
+        total = sum(row[3] for row in gaps)
+        print(f"  {len(gaps)} gap(s) where the entity kept recording states "
+              f"({total} state rows fall inside a period the dimension calls absent). "
+              "These are lost inserts, not removals. The repair preserves the gap "
+              "rather than inventing continuity — states_flat is unaffected, since "
+              "it derives eras from valid_from and ignores valid_to.")
+        for entity_id, start, end, n in gaps[:5]:
+            print(f"    {entity_id}: {start} -> {end} ({n} states)")
+        if len(gaps) > 5:
+            print(f"    ... and {len(gaps) - 5} more")
+
+    for table, _key in SCD2_DIMENSIONS:
+        with conn.cursor() as cur:
+            cur.execute(SCD2_NO_CURRENT_VERSION_SQL[table])
+            rows = cur.fetchall()
+        if rows:
+            doubts += len(rows)
+            print(f"  {table}: {len(rows)} id(s) whose newest version is already "
+                  "closed while an older one is open. After repair they have no "
+                  "current version. Restart HA afterwards — the startup snapshot "
+                  "re-creates an open row for anything that still exists.")
+            for id_value, newest_from, newest_to in rows[:5]:
+                print(f"    {id_value}: newest [{newest_from} -> {newest_to})")
+            if len(rows) > 5:
+                print(f"    ... and {len(rows) - 5} more")
+
+    if not doubts:
+        print("  none")
+    return doubts
 
 
 def preview(conn: psycopg.Connection) -> None:
@@ -386,6 +448,9 @@ def main() -> int:
         ambiguous = report_ambiguity(conn)
         if not any(ambiguous.values()):
             print("  none")
+
+        print("\nFidelity — what the repair cannot decide")
+        report_fidelity(conn)
 
         with conn.cursor() as cur:
             orphans = _scalar(cur, SCD2_STATES_WITHOUT_DIM_SQL)

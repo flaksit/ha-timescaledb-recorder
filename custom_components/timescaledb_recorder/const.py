@@ -856,3 +856,54 @@ SCD2_VERIFY_CHECKS = (
     ("sequence", _per_dimension(_SCD2_VERIFY_SEQUENCE_SQL)),
     ("range_overlap", _per_dimension(_SCD2_VERIFY_RANGE_SQL)),
 )
+
+
+# ---- Fidelity reporting (issue #17) ------------------------------------------
+#
+# The repair normalises intervals. It cannot tell whether the resulting history
+# is TRUE — and two classes of doubt are measurable, so they get reported rather
+# than passed over in silence.
+
+# A gap (a version closed well before its successor starts) is only legitimate if
+# the entity really was absent. If it kept recording states throughout, it did
+# not: an insert was lost and the gap is an artefact. The repair still preserves
+# the gap — inventing metadata continuity would be a worse lie than admitting the
+# hole — but the operator gets to see it. Entities only: the other dimensions
+# have no fact table to check against.
+SCD2_SUSPICIOUS_GAPS_SQL = f"""
+WITH g AS (
+    SELECT entity_id, valid_to AS gap_start,
+           lead(valid_from) OVER (PARTITION BY entity_id ORDER BY valid_from) AS gap_end
+    FROM entities),
+gaps AS (
+    SELECT * FROM g
+     WHERE gap_end IS NOT NULL AND gap_start IS NOT NULL AND gap_start < gap_end)
+SELECT gaps.entity_id, gaps.gap_start, gaps.gap_end, s.n AS states_inside
+  FROM gaps
+  CROSS JOIN LATERAL (
+      SELECT count(*) AS n FROM {TABLE_NAME} st
+       WHERE st.entity_id = gaps.entity_id
+         AND st.last_updated >= gaps.gap_start
+         AND st.last_updated <  gaps.gap_end) s
+ WHERE s.n > 0
+ ORDER BY s.n DESC;
+"""
+
+# Ids whose newest version is closed while an older one is still open. The
+# rebuild closes every non-final open row and never reopens the final one, so
+# these end up with no current version at all — correct if the thing really was
+# removed, wrong if it still exists in HA. The invariant checks and the
+# constraint both pass either way, which is exactly why this needs saying.
+_SCD2_NO_CURRENT_VERSION_SQL = """
+WITH ranked AS (
+    SELECT {key}::text AS id_value, valid_from, valid_to,
+           row_number() OVER (PARTITION BY {key} ORDER BY valid_from DESC) AS rn,
+           count(*) FILTER (WHERE valid_to IS NULL) OVER (PARTITION BY {key}) AS open_rows
+      FROM {table})
+SELECT id_value, valid_from AS newest_from, valid_to AS newest_to
+  FROM ranked
+ WHERE rn = 1 AND valid_to IS NOT NULL AND open_rows > 0
+ ORDER BY 1;
+"""
+
+SCD2_NO_CURRENT_VERSION_SQL = _per_dimension(_SCD2_NO_CURRENT_VERSION_SQL)

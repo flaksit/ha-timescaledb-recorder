@@ -91,10 +91,51 @@ def test_write_item_entity_remove_uses_close_sql(mock_psycopg_conn):
     sql, params = call_args.args
     assert sql == SCD2_CLOSE_ENTITY_SQL
     assert params[1] == "sensor.x"
-    # remove carries no params, so the close time is the worker clock, and the
-    # ordering guard gets the same value.
+    # A removal closes at the time the event fired, not the time the worker got
+    # round to it — see test_remove_closes_at_event_time_not_dequeue_time.
+    assert params[0] == datetime.fromisoformat("2026-04-21T12:00:00+00:00")
     assert params[0] == params[2]
+
+
+def test_remove_closes_at_event_time_not_dequeue_time(mock_psycopg_conn):
+    """A delayed queue must not push a removal's close time forward.
+
+    With the database unreachable for hours, dequeue time is hours after the
+    entity actually vanished. Closing at dequeue time can then overlap a
+    re-creation that happened in between, and the constraint rejects it — leaving
+    the entity permanently marked removed.
+    """
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    removed_at = "2026-04-21T10:00:00+00:00"
+    item = {
+        "registry": "entity", "action": "remove",
+        "registry_id": "sensor.x", "old_id": None, "params": None,
+        "enqueued_at": removed_at,
+    }
+    w._write_item_raw(item)
+
+    params = cur.execute.call_args.args[1]
+    assert params[0] == datetime.fromisoformat(removed_at)
+    assert params[2] == datetime.fromisoformat(removed_at)
+
+
+def test_remove_falls_back_to_clock_without_usable_event_time(mock_psycopg_conn):
+    """An item with no parseable enqueued_at must still close, not crash."""
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    item = {
+        "registry": "entity", "action": "remove",
+        "registry_id": "sensor.x", "old_id": None, "params": None,
+        "enqueued_at": "not-a-timestamp",
+    }
+    w._write_item_raw(item)
+
+    params = cur.execute.call_args.args[1]
     assert isinstance(params[0], datetime)
+    assert params[0] == params[2]
 
 
 def test_write_item_entity_rename_closes_old_inserts_new(mock_psycopg_conn):

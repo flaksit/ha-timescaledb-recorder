@@ -458,6 +458,35 @@ def test_close_and_insert_intervals_abut_exactly(worker, clean_db):
     assert rows == [(BASE, second), (second, None)]
 
 
+def test_delayed_remove_then_recreate_does_not_lose_the_entity(worker, clean_db):
+    """The queue can be hours behind — a removal must still close at event time.
+
+    Database down 10:00-12:00; entity removed at 10:00 and re-created at 10:05.
+    Both items drain at 12:00. Closing the removal at dequeue time would put
+    [.., 12:00) across the re-created [10:05, inf), the constraint would reject
+    the re-creation, and the entity would read as permanently removed.
+    """
+    base = BASE + timedelta(hours=10)
+    worker._write_item_raw(_entity_item("create", "sensor.delayed", "n", base))
+
+    removed_at = base + timedelta(minutes=30)
+    recreated_at = removed_at + timedelta(minutes=5)
+    # Both processed now, long after the events they describe.
+    worker._write_item_raw({
+        "registry": "entity", "action": "remove", "registry_id": "sensor.delayed",
+        "old_id": None, "params": None, "enqueued_at": removed_at.isoformat(),
+    })
+    worker._write_item_raw(_entity_item("create", "sensor.delayed", "back", recreated_at))
+
+    assert _violations(clean_db) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+    assert worker.integrity_drops == 0, "the re-creation was rejected"
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT name, valid_from, valid_to FROM entities"
+                    " WHERE entity_id='sensor.delayed' ORDER BY valid_from")
+        rows = cur.fetchall()
+    assert rows == [("n", base, removed_at), ("back", recreated_at, None)], rows
+
+
 def test_remove_then_recreate_produces_no_overlap(worker, clean_db):
     worker._write_item_raw(_entity_item("create", "sensor.rm", "n", BASE))
     worker._write_item_raw({

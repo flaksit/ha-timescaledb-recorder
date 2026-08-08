@@ -364,9 +364,13 @@ The script is safe to run while HA is active — SQLite is opened read-only and 
 
 Databases written before 2.4.0 can hold overlapping dimension versions and entities with more than one open version. The symptom is silent: any query joining a dimension on `valid_to IS NULL` returns duplicated fact rows for affected ids, so sums and counts come out too high while row counts still look plausible. `states_flat` was never affected.
 
-Two things were wrong, both fixed in 2.4.0. The close half of each close-and-insert used a separate, later clock read than the insert, so every metadata change left the outgoing version overrunning its successor. And registry events were handed to the queue through the default multi-threaded executor, so they could be written in a different order than they happened.
+Three separate defects contributed, across two generations of the metadata writer:
 
-Fixing the code stops new damage but does not undo the old. Run the repair script once:
+- The earliest implementation processed each registry event in its own task on a pooled connection, with the close and the insert as separate un-transacted statements. Two events for one entity could interleave and leave both versions open. It also read the clock, and the registry entry itself, when the task started rather than when the event fired.
+- The thread-worker rewrite made the close use a worker-thread clock read while the insert kept the earlier event-loop stamp, so every metadata change left the outgoing version overrunning its successor's start.
+- Registry events were handed to the queue through the default multi-threaded executor, so they could be persisted in a different order than they occurred.
+
+All three are fixed in 2.4.0. Fixing the code stops new damage but does not undo the old. Run the repair script once:
 
 ```bash
 # 1. update the integration and restart HA, so the corrected write path is live
@@ -378,7 +382,7 @@ docker exec homeassistant python3 \
     /config/custom_components/timescaledb_recorder/repair_scd2.py --apply
 ```
 
-**Update and restart first.** With the old code still running, the repaired history re-corrupts immediately, and the constraints the script installs would reject every metadata write.
+**Update and restart first.** Under the old code the constraints the script installs reject every metadata write, and because the old writer retried indefinitely on any error, the metadata queue wedges and stops recording registry changes entirely. If you skip the constraints (`--no-constraints`), the repaired history simply re-corrupts instead. Restart HA again after the repair, so the startup snapshot re-creates a current version for anything the repair left without one.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -394,13 +398,20 @@ docker exec homeassistant python3 \
 
 ### What it does, and what it will not do
 
-History is reconstructed from `valid_from` ordering alone: each version's `valid_to` is set to the next version's `valid_from`. `valid_from` is stamped in the event loop when the registry event fires and is the one field neither defect corrupts, so it is the only trustworthy anchor.
+History is reconstructed from `valid_from` ordering alone: each version's `valid_to` is set to the next version's `valid_from`. The script therefore **writes `valid_to` only**. It never writes `valid_from`, and by default it never deletes a row. The rebuild only ever shrinks a close time, so a version closed long before its successor keeps its recorded gap. The last version of each id is never touched, so an open version stays open and a removal stays closed.
 
-The script therefore **writes `valid_to` only**. It never writes `valid_from`, and by default it never deletes a row. The rebuild only ever shrinks a close time, so a version legitimately closed long before its successor — an entity removed and later re-created — keeps its recorded gap. The last version of each id is never touched, so an open version stays open and a removal stays closed.
+`valid_from` is the best available anchor, not a proven one. It is the field the known defects leave alone, but the earliest writer read it when the processing task started rather than when the event fired, so a timestamp can sit later than the change it records — and a version that was overwritten before it was ever persisted is simply absent. The script normalises intervals. It cannot recover history that was never written, and it does not consult the live HA registries.
 
-Before touching anything it copies each table to `<table>_prerepair_<utc timestamp>`. That is the undo path; drop those tables once you are satisfied. Every row it deletes, rewrites, or flags is archived with its complete original payload in `scd2_repair_quarantine`, tagged with the run id.
+Before touching anything it copies each table to `<table>_prerepair_<utc timestamp>`. That is the undo path, and the only complete record of the pre-repair `valid_to` values; drop those tables once you are satisfied. Rows it deletes or clamps are additionally archived with their full payload in `scd2_repair_quarantine`, tagged with the run id.
 
-Where history is genuinely ambiguous — two versions recorded at the identical `valid_from` with different contents, which is the reordering defect's signature — nothing in the data says which one owned the era. Both rows are kept, one ends up with an empty interval, and the group is reported rather than silently resolved.
+### Read the fidelity report
+
+Passing the invariant checks means the intervals are consistent, not that they are true. The script reports two kinds of doubt it cannot resolve for you:
+
+- **Gaps the `states` table contradicts.** A version closed with no successor for a while is only a real removal if the entity was really absent. If it kept recording states throughout, an insert was lost and the gap is an artefact. The repair preserves the gap anyway — inventing metadata continuity would be a worse lie than admitting the hole — and `states_flat` is unaffected either way, because it derives eras from `valid_from` and ignores `valid_to`.
+- **Ids left with no current version.** Where the newest version is already closed while an older one is open, the rebuild closes the older one and does not reopen anything. That is right if the thing really was removed and wrong if it still exists. Restart HA after the repair: the startup snapshot re-creates an open row for anything that still exists.
+
+Where history is genuinely ambiguous — two versions recorded at the identical `valid_from` with different contents — nothing in the data says which one owned the era. Both rows are kept, one ends up with an empty interval, and the group is reported rather than silently resolved.
 
 Re-running is safe and converges: a second `--apply` changes zero rows. The script exits non-zero if anything is left unresolved.
 
@@ -408,4 +419,4 @@ Re-running is safe and converges: a second `--apply` changes zero rows. The scri
 
 Each table is repaired in a single transaction holding `SHARE ROW EXCLUSIVE`, with a 10-second `lock_timeout`. HA does not need to be stopped, but if the metadata worker happens to be writing to that table the repair gives up rather than waiting — you will see a lock timeout. Nothing is modified when that happens, not even the backup table, so just run it again.
 
-The same holds for any other interruption: a crash, a dropped connection, or Ctrl-C leaves every dimension exactly as it was, because the backup, the rebuild, and the clamp all commit together or not at all. Re-run and it converges.
+The same holds for any other interruption: a crash, a dropped connection, or Ctrl-C leaves the table it was working on exactly as it was, because the backup, the rebuild, and the clamp all commit together or not at all. Atomicity is per table rather than per run, so an interruption partway through can leave earlier dimensions repaired and later ones untouched — which is safe, since each is independently consistent. Re-run and it converges.

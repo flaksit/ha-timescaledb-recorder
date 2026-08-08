@@ -29,6 +29,12 @@ from .persistent_queue import PersistentQueue
 
 _LOGGER = logging.getLogger(__name__)
 
+# Backoff bounds for the drain loop. Short enough that a transient disk error
+# costs one registry change no visible delay; capped so a persistent failure
+# does not spin.
+_DRAIN_RETRY_MIN_S = 1.0
+_DRAIN_RETRY_MAX_S = 30.0
+
 # Fields explicitly typed on each dimension table — excluded from the extra JSONB column
 # to avoid duplication between typed columns and the catch-all extra blob.
 _ENTITY_TYPED_KEYS = frozenset({
@@ -191,14 +197,25 @@ class RegistryListener:
         Sole writer to the queue from this listener. Takes the whole buffer each
         pass so a burst becomes one put_many_async — one fsync — rather than one
         per event.
+
+        This loop must outlive its own errors. It is the only path from the event
+        callbacks to disk, so if it exits, every later registry change piles up in
+        memory unpersisted while nothing reports a problem. A failed flush puts the
+        batch back and retries with a bounded backoff rather than propagating.
         """
-        try:
-            while True:
+        delay = _DRAIN_RETRY_MIN_S
+        while True:
+            try:
                 await self._buffer_ready.wait()
                 await self._flush_buffer()
-        except asyncio.CancelledError:
-            # async_stop cancels us; it flushes whatever is left afterwards.
-            raise
+                delay = _DRAIN_RETRY_MIN_S
+            except asyncio.CancelledError:
+                # async_stop cancels us; it flushes whatever is left afterwards.
+                raise
+            except Exception:  # noqa: BLE001
+                # _flush_buffer has already restored the batch and logged.
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _DRAIN_RETRY_MAX_S)
 
     async def _flush_buffer(self) -> None:
         """Hand the current buffer contents to the queue in one batch."""
@@ -211,12 +228,15 @@ class RegistryListener:
             return
         try:
             await self._meta_queue.put_many_async(batch)
-        except Exception:  # noqa: BLE001
-            # Re-queue at the front so ordering survives a transient write error;
-            # losing these items would leave permanent gaps in SCD2 history.
+        except BaseException:
+            # BaseException, not Exception: a CancelledError raised while awaiting
+            # the executor would otherwise strand this batch in a local variable,
+            # belonging to neither the buffer nor the queue. Put it back in front
+            # so ordering holds and async_stop's final flush can still see it.
             self._buffer = batch + self._buffer
             self._buffer_ready.set()
-            _LOGGER.exception("Failed to enqueue %d registry item(s); will retry", len(batch))
+            _LOGGER.exception(
+                "Failed to enqueue %d registry item(s); retrying", len(batch))
             raise
 
     async def async_start(self) -> None:

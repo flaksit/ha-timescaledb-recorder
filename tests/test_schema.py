@@ -137,6 +137,29 @@ def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):
     assert CREATE_UNIQUE_INDEX_SQL in executed
 
 
+def test_states_flat_joins_point_in_time_not_current_row():
+    """states_flat must resolve metadata as of each state's timestamp.
+
+    Joining on `valid_to IS NULL` regresses two ways: entities deleted from HA
+    lose the metadata for their whole history, and entities that end up with more
+    than one simultaneously-open version duplicate every fact row they match.
+    """
+    from custom_components.timescaledb_recorder.const import (
+        CREATE_VIEW_STATES_FLAT_SQL,
+    )
+
+    sql = CREATE_VIEW_STATES_FLAT_SQL
+    assert "valid_to IS NULL" not in sql
+    # Intervals are derived from consecutive valid_from values and clamped open
+    # at both ends, so exactly one version matches any timestamp.
+    for dim in ("entity_id", "area_id", "device_id"):
+        assert f"PARTITION BY {dim} ORDER BY valid_from" in sql
+    assert sql.count("'-infinity'::timestamptz") == 3   # one per dimension
+    assert sql.count("'infinity'::timestamptz") == 3    # ditto; '-infinity' does not match
+    assert sql.count("lead(valid_from)") == 3
+    assert sql.count("DISTINCT ON") == 3
+
+
 def test_numeric_regex_accepts_negative_states():
     """The view cast guard must accept negatives — grid export and sub-zero
     temperatures are numeric states that a '^[0-9]' guard silently drops."""

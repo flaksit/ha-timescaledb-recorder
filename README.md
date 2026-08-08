@@ -130,7 +130,13 @@ CREATE TABLE IF NOT EXISTS states (
 
 The views matter most for SQL query builders such as Grafana's: a builder reads the column list and emits `AVG(state)`, which fails with `function avg(text) does not exist`. Pointing it at a view exposes `value` as a real numeric column, so aggregation, grouping, and filtering become point-and-click.
 
-`states_flat` joins the *current* registry row (`valid_to IS NULL`) through the partial indexes. Query the dimension tables directly when you need historically-correct metadata — see [Metadata Sync](#metadata-sync).
+`states_flat` resolves metadata **as of each state's timestamp**, not as of today. Each dimension is rewritten into gap-free, non-overlapping intervals — a version runs until the next version begins, with the first and last extended to cover all time — so exactly one version matches any row. That gives three things:
+
+- An entity deleted from HA keeps the metadata it had. Matching on `valid_to IS NULL` instead would blank the metadata for that entity's entire history, which is precisely where it matters.
+- A state row can never be duplicated by the join, even if a dimension contains overlapping versions or an entity somehow has several simultaneously-open ones.
+- Renames are historically accurate: each era shows the name of its time. If a rename must not split a series, `GROUP BY entity_id` rather than `entity_name`.
+
+The range join is not free. Measured over ~48 M rows: an entity-filtered 7-day query runs 99 ms (vs 57 ms for a current-row join), a broad 7-day aggregate 1.7 s (vs 442 ms). Use `states_numeric` when you don't need metadata.
 
 Views are recreated on every integration startup, so they survive a database rebuild or an app reinstall. Read-only roles inherit `SELECT` through the owner's default privileges; no manual `GRANT` is needed.
 

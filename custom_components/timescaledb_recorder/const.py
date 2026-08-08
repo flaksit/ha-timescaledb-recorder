@@ -252,15 +252,57 @@ SELECT
 FROM states;
 """
 
-# Joined to the *current* registry row (valid_to IS NULL) via the partial
-# indexes. This is deliberately not the point-in-time SCD2 join: exploration
-# wants today's names, and the temporal join costs a range scan per row. Use the
-# base tables directly when historically-correct metadata matters.
+# Point-in-time SCD2 join: every state row is labelled with the metadata that was
+# current when the state was recorded.
 #
-# LEFT JOIN throughout — an entity removed from the registry still has states,
-# and dropping that history would make the view lie about totals.
+# Each dimension is first rewritten into gap-free, non-overlapping intervals: a
+# version runs from its own valid_from until the NEXT version's valid_from, with
+# the first extended back to -infinity and the last forward to +infinity.
+# `valid_to` is deliberately ignored. Three properties follow, and all three are
+# load-bearing:
+#
+#   1. Exactly one version matches any timestamp, so the join can never duplicate
+#      a state row. This is not theoretical — the sync has produced entities with
+#      several simultaneously-open versions, and joining those on
+#      `valid_to IS NULL` silently doubled every fact row for those entities.
+#   2. A deleted entity keeps the metadata it had. Matching on `valid_to IS NULL`
+#      loses the registry row the moment an entity is removed from HA, blanking
+#      the metadata for its entire history — exactly where history is most needed.
+#   3. Renames stay historically correct: each era carries the name of its time.
+#      GROUP BY entity_id, not entity_name, if a rename must not split a series.
+#
+# Cost of the range join over the current-row join, measured on ~48M rows: an
+# entity-filtered 7-day query goes 57 ms -> 99 ms, a broad 7-day aggregate
+# 442 ms -> 1.7 s. Use states_numeric when metadata is not needed.
+#
+# LEFT JOIN throughout — an entity absent from the registry still has states, and
+# dropping that history would make the view lie about totals.
+_ENTITY_DIM_COLUMNS = (
+    "entity_id, name, domain, platform, device_class, "
+    + "unit_of_measurement, labels, area_id, device_id"
+)
+
+_SCD2_INTERVALS_SQL = """
+    SELECT {columns},
+           CASE WHEN row_number() OVER w = 1
+                THEN '-infinity'::timestamptz ELSE valid_from END AS eff_from,
+           COALESCE(lead(valid_from) OVER w, 'infinity'::timestamptz) AS eff_to
+    FROM (SELECT DISTINCT ON ({key}, valid_from) *
+          FROM {table}
+          ORDER BY {key}, valid_from, valid_to DESC NULLS FIRST) d
+    WINDOW w AS (PARTITION BY {key} ORDER BY valid_from)
+"""
+
 CREATE_VIEW_STATES_FLAT_SQL = f"""
 CREATE OR REPLACE VIEW states_flat AS
+WITH ent AS ({_SCD2_INTERVALS_SQL.format(
+    table="entities", key="entity_id",
+    columns=_ENTITY_DIM_COLUMNS)}),
+ar AS ({_SCD2_INTERVALS_SQL.format(
+    table="areas", key="area_id", columns="area_id, name")}),
+dev AS ({_SCD2_INTERVALS_SQL.format(
+    table="devices", key="device_id",
+    columns="device_id, name, manufacturer, model")})
 SELECT
     s.entity_id,
     s.last_updated,
@@ -283,9 +325,15 @@ SELECT
     d.model,
     s.attributes
 FROM states s
-LEFT JOIN entities e ON e.entity_id = s.entity_id AND e.valid_to IS NULL
-LEFT JOIN areas    a ON a.area_id   = e.area_id   AND a.valid_to IS NULL
-LEFT JOIN devices  d ON d.device_id = e.device_id AND d.valid_to IS NULL;
+LEFT JOIN ent e ON e.entity_id = s.entity_id
+               AND s.last_updated >= e.eff_from
+               AND s.last_updated <  e.eff_to
+LEFT JOIN ar  a ON a.area_id   = e.area_id
+               AND s.last_updated >= a.eff_from
+               AND s.last_updated <  a.eff_to
+LEFT JOIN dev d ON d.device_id = e.device_id
+               AND s.last_updated >= d.eff_from
+               AND s.last_updated <  d.eff_to;
 """
 
 # SCD2 close-and-insert SQL.

@@ -5,23 +5,21 @@ from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 16 SQL statements.
+    """sync_setup_schema must execute exactly 18 SQL statements.
 
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
     + 4 dimension table DDL (entities, devices, areas, labels)
     + 5 dimension table indexes (entities compound, entities current-row,
       devices, areas, labels)
-    = 16 total
-
-    Phase 2 added CREATE_UNIQUE_INDEX_SQL (D-09-a) after CREATE_INDEX_SQL,
-    raising the total from 15 to 16.
+    + 2 convenience views (states_numeric, states_flat)
+    = 18 total
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 16
+    assert cur.execute.call_count == 18
 
 
 def test_create_schema_order(mock_psycopg_conn):
@@ -48,6 +46,10 @@ def test_create_schema_order(mock_psycopg_conn):
     assert "devices" in calls[8]
     assert "areas" in calls[9]
     assert "labels" in calls[10]
+    # Views come last — states_flat joins the dimension tables, so they
+    # must already exist.
+    assert "CREATE OR REPLACE VIEW states_numeric" in calls[16]
+    assert "CREATE OR REPLACE VIEW states_flat" in calls[17]
 
 
 def test_custom_chunk_interval(mock_psycopg_conn):
@@ -133,3 +135,19 @@ def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):
     sync_setup_schema(conn, chunk_interval_days=7, compress_after_hours=2)
     executed = [call.args[0] for call in cur.execute.call_args_list]
     assert CREATE_UNIQUE_INDEX_SQL in executed
+
+
+def test_numeric_regex_accepts_negative_states():
+    """The view cast guard must accept negatives — grid export and sub-zero
+    temperatures are numeric states that a '^[0-9]' guard silently drops."""
+    import re
+
+    from custom_components.timescaledb_recorder.const import NUMERIC_STATE_REGEX
+
+    pattern = re.compile(NUMERIC_STATE_REGEX)
+
+    for accepted in ("0", "23.5", "-412", "-0.75", "1e-05", "-2.5E+3"):
+        assert pattern.match(accepted), f"{accepted!r} should be numeric"
+
+    for rejected in ("unavailable", "unknown", "None", "on", "", "12.", "1.2.3"):
+        assert not pattern.match(rejected), f"{rejected!r} should not be numeric"

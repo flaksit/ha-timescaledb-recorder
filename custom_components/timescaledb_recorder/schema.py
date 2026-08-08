@@ -22,6 +22,8 @@ from .const import (
     CREATE_DIM_DEVICES_IDX_SQL,
     CREATE_DIM_AREAS_IDX_SQL,
     CREATE_DIM_LABELS_IDX_SQL,
+    CREATE_VIEW_STATES_NUMERIC_SQL,
+    CREATE_VIEW_STATES_FLAT_SQL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -71,6 +73,17 @@ def sync_setup_schema(
         cur.execute(CREATE_DIM_DEVICES_IDX_SQL)
         cur.execute(CREATE_DIM_AREAS_IDX_SQL)
         cur.execute(CREATE_DIM_LABELS_IDX_SQL)
+
+        # Convenience views — must follow the dimension tables, since
+        # states_flat joins them. CREATE OR REPLACE (not IF NOT EXISTS)
+        # so a definition change ships with an integration update rather
+        # than needing manual DDL on every deployment.
+        #
+        # Caveat: CREATE OR REPLACE VIEW can only *append* columns. Renaming,
+        # reordering, or retyping an existing column raises "cannot change name
+        # of view column" — such a change needs an explicit DROP VIEW here.
+        cur.execute(CREATE_VIEW_STATES_NUMERIC_SQL)
+        cur.execute(CREATE_VIEW_STATES_FLAT_SQL)
 
     _LOGGER.debug(
         "Schema setup complete (chunk=%d days, compress_after=%d hours, schedule=%d hours)",

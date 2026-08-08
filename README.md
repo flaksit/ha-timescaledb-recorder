@@ -117,6 +117,23 @@ CREATE TABLE IF NOT EXISTS states (
 
 **Index** — `idx_states_entity_time ON states (entity_id, last_updated DESC)` for fast per-entity time-series lookups.
 
+### Convenience views
+
+`state` is TEXT because HA states are untyped — the same column holds `"23.5"`, `"on"`, and `"unavailable"`. Two views are created alongside the tables so queries don't have to re-derive the numeric cast:
+
+| View | Adds | Use for |
+| ---- | ---- | ------- |
+| `states_numeric` | `value NUMERIC` — the guarded cast of `state` | Numeric queries on a known entity |
+| `states_flat` | `value` plus current registry metadata: `entity_name`, `domain`, `platform`, `device_class`, `unit_of_measurement`, `labels`, `area_id`, `area_name`, `device_id`, `device_name`, `manufacturer`, `model` | Exploring by name, area, or unit instead of raw entity IDs |
+
+`value` is `NULL` wherever `state` is not a number, so non-numeric rows stay visible and aggregates (which ignore NULLs) still return the numeric answer. The cast guard accepts negatives — solar export and sub-zero temperatures are numeric states that a `^[0-9]` guard silently drops.
+
+The views matter most for SQL query builders such as Grafana's: a builder reads the column list and emits `AVG(state)`, which fails with `function avg(text) does not exist`. Pointing it at a view exposes `value` as a real numeric column, so aggregation, grouping, and filtering become point-and-click.
+
+`states_flat` joins the *current* registry row (`valid_to IS NULL`) through the partial indexes. Query the dimension tables directly when you need historically-correct metadata — see [Metadata Sync](#metadata-sync).
+
+Views are recreated on every integration startup, so they survive a database rebuild or an app reinstall. Read-only roles inherit `SELECT` through the owner's default privileges; no manual `GRANT` is needed.
+
 ## Querying
 
 ### Latest state for every entity
@@ -133,11 +150,26 @@ ORDER BY entity_id, last_updated DESC;
 ### Time series for a single sensor
 
 ```sql
-SELECT last_updated, state::numeric AS value
-FROM states
+SELECT last_updated, value
+FROM states_numeric
 WHERE entity_id = 'sensor.living_room_temperature'
   AND last_updated > NOW() - INTERVAL '7 days'
 ORDER BY last_updated;
+```
+
+Casting `state::numeric` directly against the base table instead would abort the whole query the first time the sensor reported `unavailable`.
+
+### Hourly averages by area
+
+```sql
+SELECT time_bucket('1 hour', last_updated) AS bucket,
+       area_name,
+       AVG(value) AS avg_watts
+FROM states_flat
+WHERE unit_of_measurement = 'W'
+  AND last_updated > NOW() - INTERVAL '7 days'
+GROUP BY bucket, area_name
+ORDER BY bucket;
 ```
 
 ### Check compression status

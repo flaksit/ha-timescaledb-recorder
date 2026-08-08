@@ -213,6 +213,81 @@ CREATE INDEX IF NOT EXISTS idx_dim_labels_label_time
     ON labels (label_id, valid_from DESC);
 """
 
+# Convenience views for query tools.
+#
+# `states.state` is TEXT because HA states are untyped strings — the same column
+# holds "23.5", "on", and "unavailable". Every numeric query therefore needs a
+# guarded cast, which SQL query builders (Grafana's included) cannot express:
+# they emit `AVG(state)` from the column list and fail with
+# "function avg(text) does not exist". These views do the cast once so the
+# builders see a real numeric column and point-and-click exploration works.
+#
+# The regex accepts a leading minus (negative power = grid export, sub-zero
+# temperatures) and optional exponent. Omitting the minus silently drops those
+# rows instead of erroring, which is why the guard lives here rather than being
+# retyped per query.
+#
+# CASE (not a WHERE filter) keeps non-numeric rows visible with value = NULL, so
+# the views stay usable for text entities too. Aggregates ignore NULLs, so
+# AVG/SUM/MIN/MAX over mixed entities still return the numeric answer.
+#
+# No GRANT here: init-db.sh in the ha-timescaledb app sets
+# ALTER DEFAULT PRIVILEGES FOR ROLE homeassistant ... GRANT SELECT ON TABLES,
+# and Postgres default privileges treat views as TABLES, so read-only roles
+# inherit access automatically. An explicit GRANT would break deployments that
+# have no such role.
+NUMERIC_STATE_REGEX = r'^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$'
+
+CREATE_VIEW_STATES_NUMERIC_SQL = f"""
+CREATE OR REPLACE VIEW states_numeric AS
+SELECT
+    entity_id,
+    last_updated,
+    last_changed,
+    state,
+    CASE WHEN state ~ '{NUMERIC_STATE_REGEX}'
+         THEN state::numeric
+    END AS value,
+    attributes
+FROM states;
+"""
+
+# Joined to the *current* registry row (valid_to IS NULL) via the partial
+# indexes. This is deliberately not the point-in-time SCD2 join: exploration
+# wants today's names, and the temporal join costs a range scan per row. Use the
+# base tables directly when historically-correct metadata matters.
+#
+# LEFT JOIN throughout — an entity removed from the registry still has states,
+# and dropping that history would make the view lie about totals.
+CREATE_VIEW_STATES_FLAT_SQL = f"""
+CREATE OR REPLACE VIEW states_flat AS
+SELECT
+    s.entity_id,
+    s.last_updated,
+    s.last_changed,
+    s.state,
+    CASE WHEN s.state ~ '{NUMERIC_STATE_REGEX}'
+         THEN s.state::numeric
+    END AS value,
+    e.name                AS entity_name,
+    e.domain,
+    e.platform,
+    e.device_class,
+    e.unit_of_measurement,
+    e.labels,
+    e.area_id,
+    a.name                AS area_name,
+    e.device_id,
+    d.name                AS device_name,
+    d.manufacturer,
+    d.model,
+    s.attributes
+FROM states s
+LEFT JOIN entities e ON e.entity_id = s.entity_id AND e.valid_to IS NULL
+LEFT JOIN areas    a ON a.area_id   = e.area_id   AND a.valid_to IS NULL
+LEFT JOIN devices  d ON d.device_id = e.device_id AND d.valid_to IS NULL;
+"""
+
 # SCD2 close-and-insert SQL.
 # Convention: separate constants per table (not a .format() template) to keep
 # SQL strings explicit, grep-able, and safe from accidental table injection.

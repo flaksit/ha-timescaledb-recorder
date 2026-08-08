@@ -403,3 +403,9 @@ Before touching anything it copies each table to `<table>_prerepair_<utc timesta
 Where history is genuinely ambiguous — two versions recorded at the identical `valid_from` with different contents, which is the reordering defect's signature — nothing in the data says which one owned the era. Both rows are kept, one ends up with an empty interval, and the group is reported rather than silently resolved.
 
 Re-running is safe and converges: a second `--apply` changes zero rows. The script exits non-zero if anything is left unresolved.
+
+### If it fails
+
+Each table is repaired in a single transaction holding `SHARE ROW EXCLUSIVE`, with a 10-second `lock_timeout`. HA does not need to be stopped, but if the metadata worker happens to be writing to that table the repair gives up rather than waiting — you will see a lock timeout. Nothing is modified when that happens, not even the backup table, so just run it again.
+
+The same holds for any other interruption: a crash, a dropped connection, or Ctrl-C leaves every dimension exactly as it was, because the backup, the rebuild, and the clamp all commit together or not at all. Re-run and it converges.

@@ -249,6 +249,10 @@ The fixture builds its damage from issue #17's verbatim evidence rows plus every
 
 `pytest-socket` blocks sockets by default, so the module carries `pytest.mark.enable_socket`.
 
+`tests/test_scd2_real_copy.py` is the counterpart for a restored copy of a real instance. It assumes nothing about the contents — it measures the damage, repairs, and asserts the invariant holds, `valid_from` is byte-identical, no rows were deleted, fan-out is gone, and a burst of registry changes keeps it clean. Set `SCD2_REAL_COPY_DSN` to a **loopback** DSN; the module refuses any non-local host, because it writes.
+
+Rehearse under prod's privilege shape, not as superuser: a non-superuser role that owns the tables and has `CREATE` on the database and schema. That is what exercises `CREATE EXTENSION btree_gist` (trusted since PG 13) and `ALTER TABLE ... ADD CONSTRAINT`, and it is where a missing grant would otherwise surface only on the real run.
+
 ## CI/CD Integration
 
 - No CI configuration file detected (no `.github/workflows/`, no `Makefile`, no `tox.ini`)

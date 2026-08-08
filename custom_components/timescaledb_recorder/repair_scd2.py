@@ -416,11 +416,17 @@ def main() -> int:
 
         if unresolved:
             print(f"\nUnresolved: {', '.join(sorted(set(unresolved)))}. "
-                  "Backups retained; inspect scd2_repair_quarantine.")
+                  "Inspect scd2_repair_quarantine.")
+            if not clean:
+                print(f"Backups retained: <table>_prerepair_{stamp}")
             return 1
 
-        print(f"\nDone. Invariant holds on all dimensions. Backups: "
-              f"<table>_prerepair_{stamp} — drop them once satisfied.")
+        print("\nDone. Invariant holds on all dimensions.")
+        if not clean:
+            # Only mention backups when some were actually taken — this line is
+            # the undo path, and naming tables that do not exist is worse than
+            # saying nothing.
+            print(f"Backups: <table>_prerepair_{stamp} — drop them once satisfied.")
         return 0 if clean_now else 1
 
 

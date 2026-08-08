@@ -499,6 +499,33 @@ def test_remove_then_recreate_produces_no_overlap(worker, clean_db):
     assert _violations(clean_db) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
 
 
+def test_states_flat_labels_states_inside_a_gap(damaged):
+    """The claim that makes preserving a suspicious gap acceptable.
+
+    86 of the reference instance's 96 gaps have states inside them — the entity
+    kept recording while the dimension called it absent. The repair preserves
+    those gaps rather than inventing metadata continuity, which is only defensible
+    because states_flat runs each version until the NEXT version's valid_from and
+    ignores valid_to, so a state landing in the gap is still labelled by the
+    preceding version rather than losing its metadata.
+    """
+    in_gap = BASE + timedelta(days=2)          # inside sensor.gap's [+1d, +4d) hole
+    with damaged.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
+        cur.execute(const.CREATE_VIEW_STATES_NUMERIC_SQL)
+        cur.execute(const.CREATE_VIEW_STATES_FLAT_SQL)
+
+    _repair(damaged)
+
+    with damaged.cursor() as cur:
+        cur.execute("SELECT entity_name FROM states_flat"
+                    " WHERE entity_id='sensor.gap' AND last_updated=%s", (in_gap,))
+        rows = cur.fetchall()
+    assert rows == [("A",)], (
+        "a state inside the gap must still carry the preceding version's metadata")
+
+
 def test_states_flat_row_count_is_unchanged_by_repair(damaged):
     """states_flat was already immune; the repair must not perturb it."""
     with damaged.cursor() as cur:

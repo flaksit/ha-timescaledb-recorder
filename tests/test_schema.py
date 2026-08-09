@@ -178,27 +178,34 @@ def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):
     assert CREATE_UNIQUE_INDEX_SQL in executed
 
 
-def test_states_flat_joins_point_in_time_not_current_row():
-    """states_flat must resolve metadata as of each state's timestamp.
+def test_states_flat_joins_the_recorded_interval():
+    """states_flat must join on the interval the dimension actually records.
 
-    Joining on `valid_to IS NULL` regresses two ways: entities deleted from HA
-    lose the metadata for their whole history, and entities that end up with more
-    than one simultaneously-open version duplicate every fact row they match.
+    It used to synthesise gap-free eras from consecutive valid_from values and
+    ignore valid_to, which hid missing history behind plausible-looking metadata.
+    With the exclusion constraint preventing overlaps, the literal join is safe,
+    and anything the dimension fails to cover surfaces as NULL instead.
     """
     from custom_components.timescaledb_recorder.const import (
         CREATE_VIEW_STATES_FLAT_SQL,
     )
 
     sql = CREATE_VIEW_STATES_FLAT_SQL
+    # One half-open range per dimension: [valid_from, COALESCE(valid_to, inf)).
+    assert sql.count(">= e.valid_from") == 1
+    assert sql.count(">= a.valid_from") == 1
+    assert sql.count(">= d.valid_from") == 1
+    assert sql.count("COALESCE(e.valid_to, 'infinity'::timestamptz)") == 1
+    assert sql.count("COALESCE(a.valid_to, 'infinity'::timestamptz)") == 1
+    assert sql.count("COALESCE(d.valid_to, 'infinity'::timestamptz)") == 1
+    # No era synthesis left behind.
+    assert "lead(valid_from)" not in sql
+    assert "DISTINCT ON" not in sql
+    assert "'-infinity'" not in sql
+    # A current-row join would blank every removed entity's whole history.
     assert "valid_to IS NULL" not in sql
-    # Intervals are derived from consecutive valid_from values and clamped open
-    # at both ends, so exactly one version matches any timestamp.
-    for dim in ("entity_id", "area_id", "device_id"):
-        assert f"PARTITION BY {dim} ORDER BY valid_from" in sql
-    assert sql.count("'-infinity'::timestamptz") == 3   # one per dimension
-    assert sql.count("'infinity'::timestamptz") == 3    # ditto; '-infinity' does not match
-    assert sql.count("lead(valid_from)") == 3
-    assert sql.count("DISTINCT ON") == 3
+    # States are never dropped, only left unlabelled.
+    assert sql.count("LEFT JOIN") == 3
 
 
 def test_numeric_regex_accepts_negative_states():

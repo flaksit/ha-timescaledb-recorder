@@ -499,15 +499,12 @@ def test_remove_then_recreate_produces_no_overlap(worker, clean_db):
     assert _violations(clean_db) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
 
 
-def test_states_flat_labels_states_inside_a_gap(damaged):
-    """The claim that makes preserving a suspicious gap acceptable.
+def test_states_flat_leaves_a_gap_unlabelled(damaged):
+    """A state inside a gap must come back with NULL metadata, not a guess.
 
-    86 of the reference instance's 96 gaps have states inside them — the entity
-    kept recording while the dimension called it absent. The repair preserves
-    those gaps rather than inventing metadata continuity, which is only defensible
-    because states_flat runs each version until the NEXT version's valid_from and
-    ignores valid_to, so a state landing in the gap is still labelled by the
-    preceding version rather than losing its metadata.
+    The view used to synthesise gap-free eras and label such a state from the
+    preceding version, which made missing history indistinguishable from present
+    history. Now the hole is visible.
     """
     in_gap = BASE + timedelta(days=2)          # inside sensor.gap's [+1d, +4d) hole
     with damaged.cursor() as cur:
@@ -521,13 +518,62 @@ def test_states_flat_labels_states_inside_a_gap(damaged):
     with damaged.cursor() as cur:
         cur.execute("SELECT entity_name FROM states_flat"
                     " WHERE entity_id='sensor.gap' AND last_updated=%s", (in_gap,))
+        assert cur.fetchall() == [(None,)], "the gap must surface as NULL metadata"
+        # The row itself survives — LEFT JOIN, so totals stay honest.
+        cur.execute("SELECT count(*) FROM states_flat WHERE entity_id='sensor.gap'")
+        assert cur.fetchone()[0] == 1
+
+
+def test_merge_flag_closes_a_contradicted_gap(damaged):
+    """--merge-identical-gaps turns the two identical rows into one covering both."""
+    in_gap = BASE + timedelta(days=2)
+    with damaged.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
+        # Make the two sensor.gap versions identical, so they qualify.
+        cur.execute("UPDATE entities SET name='A' WHERE entity_id='sensor.gap'")
+        cur.execute(const.CREATE_VIEW_STATES_NUMERIC_SQL)
+        cur.execute(const.CREATE_VIEW_STATES_FLAT_SQL)
+
+    _repair(damaged)
+    merged = repair_scd2.merge_identical_gaps(damaged, "mergetest")
+
+    assert merged == 1
+    with damaged.cursor() as cur:
+        cur.execute("SELECT valid_from, valid_to FROM entities"
+                    " WHERE entity_id='sensor.gap'")
         rows = cur.fetchall()
-    assert rows == [("A",)], (
-        "a state inside the gap must still carry the preceding version's metadata")
+        assert rows == [(BASE, None)], "should be one row spanning both eras"
+        cur.execute("SELECT entity_name FROM states_flat"
+                    " WHERE entity_id='sensor.gap' AND last_updated=%s", (in_gap,))
+        assert cur.fetchall() == [("A",)], "the state is now covered"
+        cur.execute("SELECT count(*) FROM scd2_repair_quarantine"
+                    " WHERE reason='merged_into_previous_version'")
+        assert cur.fetchone()[0] == 1, "the removed row must be archived"
+    assert _violations(damaged) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
 
 
-def test_states_flat_row_count_is_unchanged_by_repair(damaged):
-    """states_flat was already immune; the repair must not perturb it."""
+def test_merge_flag_leaves_differing_versions_alone(damaged):
+    """Only identical payloads merge — a real metadata change must survive."""
+    in_gap = BASE + timedelta(days=2)
+    with damaged.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
+    _repair(damaged)
+    # sensor.gap's two versions are named 'A' and 'A2' in the fixture: different.
+    assert repair_scd2.merge_identical_gaps(damaged, "mergetest2") == 0
+    with damaged.cursor() as cur:
+        cur.execute("SELECT count(*) FROM entities WHERE entity_id='sensor.gap'")
+        assert cur.fetchone()[0] == 2
+
+
+def test_states_flat_stops_fanning_out_after_repair(damaged):
+    """The view now reflects the dimension literally, so the repair fixes it too.
+
+    On damaged data the overlapping versions multiply rows here exactly as they
+    do in any other honest join — which is the point: the damage is visible
+    rather than papered over. After the repair each state appears once.
+    """
     with damaged.cursor() as cur:
         for i in range(10):
             ts = _t("2026-05-01 00:00:00+00:00") + timedelta(minutes=i)
@@ -535,9 +581,12 @@ def test_states_flat_row_count_is_unchanged_by_repair(damaged):
                         " state) VALUES (%s,%s,%s,%s)", (ts, ts, EID, str(i)))
         cur.execute(const.CREATE_VIEW_STATES_NUMERIC_SQL)
         cur.execute(const.CREATE_VIEW_STATES_FLAT_SQL)
-        cur.execute("SELECT count(*) FROM states_flat")
+        cur.execute("SELECT count(*) FROM states_flat WHERE entity_id=%s", (EID,))
         before = cur.fetchone()[0]
+    assert before > 10, "damaged data should fan out through a literal join"
+
     _repair(damaged)
+
     with damaged.cursor() as cur:
-        cur.execute("SELECT count(*) FROM states_flat")
-        assert cur.fetchone()[0] == before
+        cur.execute("SELECT count(*) FROM states_flat WHERE entity_id=%s", (EID,))
+        assert cur.fetchone()[0] == 10

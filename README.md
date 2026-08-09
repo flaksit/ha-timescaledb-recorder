@@ -124,9 +124,13 @@ CREATE TABLE IF NOT EXISTS states (
 | View | Adds | Use for |
 | ---- | ---- | ------- |
 | `states_numeric` | `value NUMERIC` — the guarded cast of `state` | Numeric queries on a known entity |
-| `states_flat` | `value` plus current registry metadata: `entity_name`, `domain`, `platform`, `device_class`, `unit_of_measurement`, `labels`, `area_id`, `area_name`, `device_id`, `device_name`, `manufacturer`, `model` | Exploring by name, area, or unit instead of raw entity IDs |
+| `states_flat` | `value` plus the registry metadata that was current *when each state was recorded*: `entity_name`, `domain`, `platform`, `device_class`, `unit_of_measurement`, `labels`, `area_id`, `area_name`, `device_id`, `device_name`, `manufacturer`, `model` | Exploring by name, area, or unit instead of raw entity IDs |
 
 `value` is `NULL` wherever `state` is not a number, so non-numeric rows stay visible and aggregates (which ignore NULLs) still return the numeric answer. The cast guard accepts negatives — solar export and sub-zero temperatures are numeric states that a `^[0-9]` guard silently drops.
+
+`states_flat` joins each dimension on the interval it actually records — `[valid_from, valid_to)`, with an open version running to infinity — so a rename shows the name of its time rather than today's. Every state row is kept (`LEFT JOIN`), so totals stay honest, but a row the dimension does not cover comes back with **NULL metadata**. That is a real signal, not noise: it means the registry history has a hole there. `repair_scd2.py --verify-only` says whether the dimensions are sound, and its Fidelity section explains any holes.
+
+This requires the SCD2 invariant to hold. On a database that has not yet been repaired, overlapping versions multiply rows here exactly as in any other literal join — run the repair first.
 
 The views matter most for SQL query builders such as Grafana's: a builder reads the column list and emits `AVG(state)`, which fails with `function avg(text) does not exist`. Pointing it at a view exposes `value` as a real numeric column, so aggregation, grouping, and filtering become point-and-click.
 
@@ -362,7 +366,9 @@ The script is safe to run while HA is active — SQLite is opened read-only and 
 
 ## Repairing SCD2 history
 
-Databases written before 2.4.0 can hold overlapping dimension versions and entities with more than one open version. The symptom is silent: any query joining a dimension on `valid_to IS NULL` returns duplicated fact rows for affected ids, so sums and counts come out too high while row counts still look plausible. `states_flat` was never affected.
+Databases written before 2.4.0 can hold overlapping dimension versions and entities with more than one open version. The symptom is silent: any query joining a dimension returns duplicated fact rows for affected ids, so sums and counts come out too high while row counts still look plausible.
+
+`states_flat` used to sidestep this by ignoring `valid_to` and synthesising gap-free eras. From 2.4.0 it joins the recorded interval literally, so it is only correct once the repair has run — and it then shows missing history as NULL metadata instead of hiding it.
 
 Three separate defects contributed, across two generations of the metadata writer:
 
@@ -392,6 +398,7 @@ docker exec homeassistant python3 \
 | `--apply` | off | Back up, repair, verify, and add the constraints |
 | `--verify-only` | off | Check the invariant and exit; never mutates |
 | `--collapse-duplicates` | off | Also delete rows byte-identical to a row that stays |
+| `--merge-identical-gaps` | off | Collapse two identical versions separated by a gap that `states` contradicts into one row covering both |
 | `--no-constraints` | off | Repair without adding the exclusion constraints |
 | `--yes` | off | Skip the `--apply` confirmation. Required when there is no terminal |
 
@@ -409,7 +416,7 @@ Before touching anything it copies each table to `<table>_prerepair_<utc timesta
 
 Passing the invariant checks means the intervals are consistent, not that they are true. The script reports two kinds of doubt it cannot resolve for you:
 
-- **Gaps the `states` table contradicts.** A version closed with no successor for a while is only a real removal if the entity was really absent. If it kept recording states throughout, an insert was lost and the gap is an artefact. The repair preserves the gap anyway — inventing metadata continuity would be a worse lie than admitting the hole — and `states_flat` is unaffected either way, because it derives eras from `valid_from` and ignores `valid_to`.
+- **Gaps the `states` table contradicts.** A version closed with no successor for a while is only a real absence if the entity really was gone. If it kept recording states throughout, it was not. Those state rows come back from `states_flat` with NULL metadata. The report also says whether the versions either side of each gap are identical: where they are, the two rows describe the same unchanged entity and `--merge-identical-gaps` collapses them into one row covering both, which gives those states their metadata back. Where they differ, the era genuinely cannot be attributed to either version and the gap stays.
 - **Ids left with no current version.** Where the newest version is already closed while an older one is open, the rebuild closes the older one and does not reopen anything. That is right if the thing really was removed and wrong if it still exists. The script cannot tell the difference — it never reads the live registries.
 
 **Restarting HA after `--apply` is required, not optional.** That restart is what resolves the second case: the startup snapshot reads the live registries and re-creates an open row for everything that still exists. Until it runs, those ids have no current version and disappear from `valid_to IS NULL` queries.

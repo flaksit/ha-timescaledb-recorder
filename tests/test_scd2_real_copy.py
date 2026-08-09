@@ -162,10 +162,20 @@ def test_fanout_is_gone(conn):
     assert _fanout(conn) == []
 
 
-def test_states_flat_unchanged(conn, baseline):
+def test_states_flat_returns_one_row_per_state(conn, baseline):
+    """The view joins the recorded interval, so the repair fixes it too.
+
+    On the damaged copy the overlapping versions multiply rows here; afterwards
+    each state appears exactly once. A view that ignored valid_to would have
+    looked correct throughout and told you nothing.
+    """
     if baseline["states_flat"] is None:
         pytest.skip("states_flat view not present in the copy")
-    assert _states_flat_count(conn) == baseline["states_flat"]
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM states")
+        states = cur.fetchone()[0]
+    assert baseline["states_flat"] > states, "damaged copy should have fanned out"
+    assert _states_flat_count(conn) == states
 
 
 def test_repair_is_idempotent(conn):

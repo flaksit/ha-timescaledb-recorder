@@ -89,6 +89,12 @@ try:
         SCD2_REPAIR_REBUILD_SQL,
         SCD2_STATES_WITHOUT_DIM_SQL,
         SCD2_SUSPICIOUS_GAPS_SQL,
+        SCD2_MERGE_ARCHIVE_SQL,
+        SCD2_MERGE_DELETE_SQL,
+        SCD2_MERGE_EXTEND_SQL,
+        SCD2_MERGE_PLAN_COUNT_SQL,
+        SCD2_MERGE_PLAN_DROP_SQL,
+        SCD2_MERGE_PLAN_SQL,
         SCD2_NO_CURRENT_VERSION_SQL,
         SCD2_VERIFY_CHECKS,
     )
@@ -119,6 +125,12 @@ except ImportError:
         SCD2_REPAIR_REBUILD_SQL,
         SCD2_STATES_WITHOUT_DIM_SQL,
         SCD2_SUSPICIOUS_GAPS_SQL,
+        SCD2_MERGE_ARCHIVE_SQL,
+        SCD2_MERGE_DELETE_SQL,
+        SCD2_MERGE_EXTEND_SQL,
+        SCD2_MERGE_PLAN_COUNT_SQL,
+        SCD2_MERGE_PLAN_DROP_SQL,
+        SCD2_MERGE_PLAN_SQL,
         SCD2_NO_CURRENT_VERSION_SQL,
         SCD2_VERIFY_CHECKS,
     )
@@ -251,15 +263,14 @@ def report_fidelity(conn: psycopg.Connection) -> int:
               f"({total} state rows fall inside a period the dimension calls absent). "
               "Something existed and was producing data, so the gap does not "
               "reflect a real absence — though the data does not say which write "
-              "was lost. The repair preserves it rather than inventing continuity; "
-              "states_flat is unaffected either way, since it derives eras from "
-              "valid_from and ignores valid_to.")
+              "was lost. Those state rows come back from states_flat with NULL "
+              "metadata, which is the gap being visible rather than guessed at.")
         print(f"  Metadata is identical either side of {same} of those {len(gaps)}. "
-              "For those the gap could be closed without asserting anything the "
-              "surrounding versions do not already record — a direct "
-              "valid_from/valid_to range join would then cover them. Closing is "
-              "not done automatically: it extends a recorded close time, which "
-              "this script otherwise never does.")
+              "Those two versions describe the same unchanged entity, so "
+              "--merge-identical-gaps will collapse each pair into a single row "
+              "covering both — the state rows then get their metadata back. It is "
+              "off by default because it extends a recorded close time, which "
+              "nothing else here does.")
         for entity_id, start, end, n, same_meta in gaps[:5]:
             flag = "same metadata" if same_meta else "METADATA DIFFERS"
             print(f"    {entity_id}: {start} -> {end} ({n} states, {flag})")
@@ -351,6 +362,49 @@ def _id_column(table: str) -> str:
     return dict(SCD2_DIMENSIONS)[table]
 
 
+def merge_identical_gaps(conn: psycopg.Connection, run_id: str) -> int:
+    """Collapse identical versions split by a contradicted gap. Opt-in.
+
+    A pair qualifies only when all three hold: no version covers the period
+    between them, their payloads are identical, and `states` proves the entity
+    was recording throughout. Then the gap is a lost write rather than a real
+    absence, and the two rows are one version cut in half — so they become one
+    row spanning both, not two adjacent identical versions.
+
+    Runs in passes: a chain A-B-C collapses one link at a time, so two statements
+    never contend for the same row. Returns the number of rows merged away.
+
+    This is the only operation in the script that extends a recorded close time.
+    """
+    merged = 0
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(SCD2_REPAIR_LOCK_TIMEOUT_SQL)
+            cur.execute(SCD2_REPAIR_LOCK_SQL.format(table="entities"))
+            for _pass in range(20):     # bounded: real chains are 1-2 links deep
+                cur.execute(SCD2_MERGE_PLAN_DROP_SQL)
+                cur.execute(SCD2_MERGE_PLAN_SQL)
+                cur.execute(SCD2_MERGE_PLAN_COUNT_SQL)
+                pending = cur.fetchone()[0]
+                if not pending:
+                    break
+                # Archive, then DELETE, then extend. Extending first would leave
+                # the surviving row covering the era the doomed row still holds,
+                # and the exclusion constraint rejects that overlap mid-statement.
+                # The plan already carries next_to, so the extension does not
+                # need the deleted row to still exist.
+                cur.execute(SCD2_MERGE_ARCHIVE_SQL, (run_id,))
+                cur.execute(SCD2_MERGE_DELETE_SQL)
+                cur.execute(SCD2_MERGE_EXTEND_SQL)
+                merged += pending
+            else:
+                raise RuntimeError(
+                    "merge did not converge in 20 passes; refusing to continue")
+    if merged:
+        print(f"  entities: merged {merged} version(s) into their predecessor")
+    return merged
+
+
 def add_constraints(conn: psycopg.Connection, tables: list[str]) -> list[str]:
     """Add the exclusion constraint to each verified-clean table.
 
@@ -399,6 +453,10 @@ def parse_args() -> argparse.Namespace:
                         "the repair reaches the invariant without deleting anything.")
     p.add_argument("--no-constraints", action="store_true",
                    help="Repair but do not add the exclusion constraints.")
+    p.add_argument("--merge-identical-gaps", action="store_true",
+                   help="Collapse two identical versions separated by a gap that "
+                        "states contradicts into one row spanning both. The only "
+                        "step that extends a recorded close time; off by default.")
     p.add_argument("--yes", action="store_true",
                    help="Skip the --apply confirmation prompt (for scripted runs).")
     return p.parse_args()
@@ -496,6 +554,8 @@ def main() -> int:
         if not clean:
             for table, _key in SCD2_DIMENSIONS:
                 repair_table(conn, table, run_id, stamp, args.collapse_duplicates)
+            if args.merge_identical_gaps:
+                merge_identical_gaps(conn, run_id)
 
             print("\nRe-checking")
             results = run_verification(conn)

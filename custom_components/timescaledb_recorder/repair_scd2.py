@@ -246,6 +246,7 @@ def report_fidelity(conn: psycopg.Connection) -> int:
     if gaps:
         doubts += len(gaps)
         total = sum(row[3] for row in gaps)
+        same = sum(1 for row in gaps if row[4])
         print(f"  {len(gaps)} gap(s) where the entity kept recording states "
               f"({total} state rows fall inside a period the dimension calls absent). "
               "Something existed and was producing data, so the gap does not "
@@ -253,8 +254,15 @@ def report_fidelity(conn: psycopg.Connection) -> int:
               "was lost. The repair preserves it rather than inventing continuity; "
               "states_flat is unaffected either way, since it derives eras from "
               "valid_from and ignores valid_to.")
-        for entity_id, start, end, n in gaps[:5]:
-            print(f"    {entity_id}: {start} -> {end} ({n} states)")
+        print(f"  Metadata is identical either side of {same} of those {len(gaps)}. "
+              "For those the gap could be closed without asserting anything the "
+              "surrounding versions do not already record — a direct "
+              "valid_from/valid_to range join would then cover them. Closing is "
+              "not done automatically: it extends a recorded close time, which "
+              "this script otherwise never does.")
+        for entity_id, start, end, n, same_meta in gaps[:5]:
+            flag = "same metadata" if same_meta else "METADATA DIFFERS"
+            print(f"    {entity_id}: {start} -> {end} ({n} states, {flag})")
         if len(gaps) > 5:
             print(f"    ... and {len(gaps) - 5} more")
 

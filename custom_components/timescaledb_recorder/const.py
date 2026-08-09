@@ -877,18 +877,38 @@ SCD2_VERIFY_CHECKS = (
 # The window tiebreak matches _SCD2_REPAIR_PLAN_SQL exactly; ordering by
 # valid_from alone leaves ties arbitrary and makes the answer nondeterministic
 # on rows sharing a timestamp.
+# `valid_to IS NOT NULL` is required, not tidiness: GREATEST ignores NULLs in
+# PostgreSQL, so an OPEN row would yield gap_start = valid_from and every open
+# row that has a successor would be reported as a gap spanning its own era.
+# Those are not gaps — the rebuild closes them at the successor's valid_from.
+#
+# The metadata either side of the gap is compared too, with modified_at stripped
+# (HA rewrites it on every internal registry write, which is why the
+# integration's own change detection ignores it). Identical payloads mean the
+# gap could be closed without asserting anything new; differing payloads mean
+# the era genuinely cannot be attributed to either version.
 SCD2_SUSPICIOUS_GAPS_SQL = f"""
-WITH g AS (
-    SELECT entity_id,
-           greatest(valid_to, valid_from) AS gap_start,
-           lead(valid_from) OVER (
-               PARTITION BY entity_id
-               ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid) AS gap_end
-    FROM entities),
+WITH ordered AS (
+    SELECT entity_id, valid_from, valid_to,
+           (name, domain, platform, device_id, area_id, labels,
+            device_class, unit_of_measurement, disabled_by)::text AS payload,
+           (extra - 'modified_at')::text AS extra_cmp,
+           lead(valid_from) OVER w AS gap_end,
+           lead((name, domain, platform, device_id, area_id, labels,
+                 device_class, unit_of_measurement, disabled_by)::text) OVER w AS next_payload,
+           lead((extra - 'modified_at')::text) OVER w AS next_extra
+    FROM entities t
+    WINDOW w AS (PARTITION BY entity_id
+                 ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid)),
 gaps AS (
-    SELECT * FROM g
-     WHERE gap_end IS NOT NULL AND gap_start IS NOT NULL AND gap_start < gap_end)
-SELECT gaps.entity_id, gaps.gap_start, gaps.gap_end, s.n AS states_inside
+    SELECT entity_id, greatest(valid_to, valid_from) AS gap_start, gap_end,
+           (payload IS NOT DISTINCT FROM next_payload
+            AND extra_cmp IS NOT DISTINCT FROM next_extra) AS same_metadata
+      FROM ordered
+     WHERE valid_to IS NOT NULL AND gap_end IS NOT NULL
+       AND greatest(valid_to, valid_from) < gap_end)
+SELECT gaps.entity_id, gaps.gap_start, gaps.gap_end, s.n AS states_inside,
+       gaps.same_metadata
   FROM gaps
   CROSS JOIN LATERAL (
       SELECT count(*) AS n FROM {TABLE_NAME} st

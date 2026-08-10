@@ -521,10 +521,24 @@ def main() -> int:
         report_fidelity(conn)
 
         with conn.cursor() as cur:
-            orphans = _scalar(cur, SCD2_STATES_WITHOUT_DIM_SQL)
-        print(f"\nCoverage (informational): {orphans} entity_id(s) in states have no "
-              "row in entities. Not repairable from here — the next HA start re-creates "
-              "an open row for any that still exist.")
+            cur.execute(SCD2_STATES_WITHOUT_DIM_SQL)
+            orphans = cur.fetchall()
+        print("\nCoverage (informational — nothing here is repairable)")
+        if orphans:
+            total = sum(row[1] for row in orphans)
+            print(f"  {len(orphans)} entity_id(s) produced {total} state rows but have "
+                  "no row in entities at all. Home Assistant keeps many entities in its "
+                  "state machine without an entity-registry entry — sun.sun, zone.home, "
+                  "conversation.*, YAML automations and helpers — and those can never "
+                  "have a dimension row. This is not missing history and the repair has "
+                  "no metadata to invent for them. They still carry a usable `domain` in "
+                  "states_flat; the rest of their metadata is genuinely unknown.")
+            for entity_id, states, last_seen in orphans[:5]:
+                print(f"    {entity_id}: {states} states, last seen {last_seen}")
+            if len(orphans) > 5:
+                print(f"    ... and {len(orphans) - 5} more")
+        else:
+            print("  every entity in states has a dimension row")
 
         if verify_only:
             print("\nClean." if clean else "\nInvariant VIOLATED.")

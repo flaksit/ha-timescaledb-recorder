@@ -206,6 +206,10 @@ def test_states_flat_joins_the_recorded_interval():
     assert "valid_to IS NULL" not in sql
     # States are never dropped, only left unlabelled.
     assert sql.count("LEFT JOIN") == 3
+    # domain comes from the entity_id, so entities HA never registered
+    # (sun.sun, zone.home, YAML helpers) stay filterable.
+    assert "split_part(s.entity_id, '.', 1) AS domain" in sql
+    assert "e.domain" not in sql
 
 
 def test_numeric_regex_accepts_negative_states():

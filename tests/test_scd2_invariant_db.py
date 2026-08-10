@@ -524,6 +524,30 @@ def test_states_flat_leaves_a_gap_unlabelled(damaged):
         assert cur.fetchone()[0] == 1
 
 
+def test_unregistered_entity_keeps_its_domain(damaged):
+    """Entities HA never registered must stay queryable.
+
+    sun.sun, zone.home, conversation.* and YAML automations/helpers live in the
+    state machine without an entity-registry entry, so the dimension can never
+    hold a row for them — on the reference instance that is 46 entity_ids and
+    588627 state rows. Their metadata is genuinely unknown, but the domain is
+    right there in the entity_id, and taking it from the dimension instead would
+    make `WHERE domain = 'sensor'` drop them without a trace.
+    """
+    ts = BASE + timedelta(days=1)
+    with damaged.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,%s)", (ts, ts, "sun.sun", "above_horizon"))
+        cur.execute(const.CREATE_VIEW_STATES_NUMERIC_SQL)
+        cur.execute(const.CREATE_VIEW_STATES_FLAT_SQL)
+        cur.execute("SELECT domain, entity_name FROM states_flat"
+                    " WHERE entity_id='sun.sun'")
+        rows = cur.fetchall()
+
+    assert rows == [("sun", None)], (
+        "domain must survive, entity_name must stay honestly NULL")
+
+
 def test_merge_flag_closes_a_contradicted_gap(damaged):
     """--merge-identical-gaps turns the two identical rows into one covering both."""
     in_gap = BASE + timedelta(days=2)

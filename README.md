@@ -128,7 +128,16 @@ CREATE TABLE IF NOT EXISTS states (
 
 `value` is `NULL` wherever `state` is not a number, so non-numeric rows stay visible and aggregates (which ignore NULLs) still return the numeric answer. The cast guard accepts negatives — solar export and sub-zero temperatures are numeric states that a `^[0-9]` guard silently drops.
 
-`states_flat` joins each dimension on the interval it actually records — `[valid_from, valid_to)`, with an open version running to infinity — so a rename shows the name of its time rather than today's. Every state row is kept (`LEFT JOIN`), so totals stay honest, but a row the dimension does not cover comes back with **NULL metadata**. That is a real signal, not noise: it means the registry history has a hole there. `repair_scd2.py --verify-only` says whether the dimensions are sound, and its Fidelity section explains any holes.
+`states_flat` joins each dimension on the interval it actually records — `[valid_from, valid_to)`, with an open version running to infinity — so a rename shows the name of its time rather than today's. Every state row is kept (`LEFT JOIN`), so totals stay honest, but a row the dimension does not cover comes back with **NULL metadata**.
+
+`domain` is the exception: it is derived from `entity_id` rather than read from the dimension, so it is always populated. Filtering with `WHERE domain = 'sensor'` therefore never silently drops rows.
+
+NULL metadata has two quite different causes, and it is worth knowing which you are looking at:
+
+- **The entity is not in HA's entity registry.** Home Assistant keeps plenty of entities in its state machine without registering them — `sun.sun`, `zone.home`, `conversation.*`, and anything defined in YAML rather than the UI (automations, `input_select`, `input_number`, `input_button`). These can never have a dimension row, their metadata is genuinely unknown, and nothing is wrong. Query them by `entity_id` and `domain`.
+- **The registry history has a hole.** A period no version covers, for an entity that does have registry rows. That is a real defect. `repair_scd2.py --verify-only` reports it, and its Fidelity section explains what can be done.
+
+The repair script's Coverage section lists which entity_ids fall in the first group, so the two are easy to tell apart.
 
 This requires the SCD2 invariant to hold. On a database that has not yet been repaired, overlapping versions multiply rows here exactly as in any other literal join — run the repair first.
 
@@ -379,7 +388,7 @@ Three separate defects contributed, across two generations of the metadata write
 All three are fixed in 2.4.0. Fixing the code stops new damage but does not undo the old. Run the repair script once:
 
 ```bash
-# 1. update the integration and restart HA, so the corrected write path is live
+# 1. deploy 2.4.0 and restart HA, so the corrected write path is live
 # 2. inspect — mutates nothing
 docker exec homeassistant python3 \
     /config/custom_components/timescaledb_recorder/repair_scd2.py --dry-run
@@ -388,6 +397,10 @@ docker exec homeassistant python3 \
     /config/custom_components/timescaledb_recorder/repair_scd2.py --apply
 # 4. restart HA again — required, see "Read the fidelity report" below
 ```
+
+Step 1 is a real deployment, not a merge. This integration installs through HACS, and HACS tracks **releases by tag** rather than commits, so merging to `main` changes nothing on the running instance: publish an annotated release, refresh HACS, download, restart. Never copy files onto the HA install by hand — the next HACS update overwrites them, and until it does the running code no longer matches the repo.
+
+The `states_flat` redefinition ships in the same release: `sync_setup_schema` runs `CREATE OR REPLACE VIEW` on every integration start, so the view changes when the code does. It joins `valid_to` literally, which means that between step 1 and step 3 it reflects the damage — overlapping versions multiply rows there as in any honest join. Keep that window short.
 
 **Update and restart first.** Under the old code the constraints the script installs reject every metadata write, and because the old writer retried indefinitely on any error, the metadata queue wedges and stops recording registry changes entirely. If you skip the constraints (`--no-constraints`), the repaired history simply re-corrupts instead. Restart HA again after the repair, so the startup snapshot re-creates a current version for anything the repair left without one.
 

@@ -298,7 +298,13 @@ SELECT
          THEN s.state::numeric
     END AS value,
     e.name                AS entity_name,
-    e.domain,
+    -- Derived from entity_id, not taken from the dimension. Identical by
+    -- construction (registry_listener stores exactly this), but it also holds
+    -- for entities HA never put in its entity registry — sun.sun, zone.home,
+    -- conversation.*, YAML automations and helpers. Those have no dimension row
+    -- and never will, so reading domain from `e` would leave a `WHERE domain =
+    -- 'sensor'` filter silently dropping them.
+    split_part(s.entity_id, '.', 1) AS domain,
     e.platform,
     e.device_class,
     e.unit_of_measurement,
@@ -801,15 +807,20 @@ SELECT a.{key}::text AS id_value,
 """
 
 # Informational only: entities that produced states but have no dimension row at
-# all. A coverage gap, not this issue's corruption — the repair has no metadata
-# to invent, and the next HA start re-creates an open row for any that still
-# exist. Never drives a mutation.
+# all. Overwhelmingly these are not missing history — HA keeps plenty of entities
+# in its state machine without an entity-registry entry (sun.sun, zone.home,
+# conversation.*, YAML automations and helpers), and those can never have a
+# dimension row. The repair has no metadata to invent for them and must not try.
+# Never drives a mutation.
 SCD2_STATES_WITHOUT_DIM_SQL = f"""
-SELECT count(*) FROM (
-    SELECT DISTINCT entity_id FROM {TABLE_NAME}
-    EXCEPT
-    SELECT DISTINCT entity_id FROM entities
-) x;
+SELECT s.entity_id, c.n AS states, c.last_seen
+  FROM (SELECT DISTINCT entity_id FROM {TABLE_NAME}
+        EXCEPT
+        SELECT DISTINCT entity_id FROM entities) s
+  CROSS JOIN LATERAL (
+      SELECT count(*) AS n, max(last_updated) AS last_seen
+        FROM {TABLE_NAME} st WHERE st.entity_id = s.entity_id) c
+ ORDER BY c.n DESC;
 """
 
 

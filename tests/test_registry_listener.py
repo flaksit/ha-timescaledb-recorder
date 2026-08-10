@@ -513,6 +513,38 @@ async def test_cancellation_does_not_append_twice(enabled_listener, mock_meta_qu
     assert len(appended) == 1, "the batch was appended twice"
 
 
+async def test_a_failed_flush_is_requeued_exactly_once(enabled_listener,
+                                                       mock_meta_queue,
+                                                       mock_entity_registry):
+    """A failed append restores its batch, and _settle_inflight must not do it again.
+
+    _flush_buffer requeues on failure; if it also left the batch recorded as
+    in-flight, shutdown would settle the already-failed append and requeue the
+    same items a second time, and the final flush would write both copies.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=OSError("disk full"))
+    with pytest.raises(OSError):
+        await enabled_listener._flush_buffer()
+
+    assert len(enabled_listener._buffer) == 1
+    assert enabled_listener._inflight is None, (
+        "a batch already back in the buffer is not in flight")
+
+    # This is what async_stop does next.
+    await enabled_listener._settle_inflight()
+    assert len(enabled_listener._buffer) == 1, "the batch was requeued twice"
+
+    appended = []
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=appended.extend)
+    await enabled_listener._flush_buffer()
+    assert len(appended) == 1, "the final flush wrote a duplicate"
+
+
 async def test_stop_flushes_remaining_buffer(enabled_listener, mock_meta_queue,
                                              mock_entity_registry):
     """Shutdown must drain what is still buffered."""

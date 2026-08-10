@@ -65,6 +65,10 @@ OTHER_DAMAGE = [
     ("sensor.overlap", "B", BASE + timedelta(seconds=1), None),
     # inverted interval — tstzrange() raises on this one
     ("sensor.inverted", "A", BASE + timedelta(hours=1), BASE),
+    # A second version of the same id, so range_overlap's `a.ctid < b.ctid`
+    # self-join actually pairs the inverted row and evaluates tstzrange() on it.
+    # With only one version the pair never forms and the raise stays invisible.
+    ("sensor.inverted", "B", BASE + timedelta(hours=2), None),
     # legitimate remove-then-recreate gap; the repair must preserve it
     ("sensor.gap", "A", BASE, BASE + timedelta(days=1)),
     ("sensor.gap", "A2", BASE + timedelta(days=4), None),
@@ -141,6 +145,29 @@ def test_fixture_reproduces_the_reported_damage(damaged):
     assert results["entities"]["sequence"] > 0
     assert results["entities"]["inverted"] == 1
     assert results["devices"]["multi_open"] == 1
+
+
+def test_verification_does_not_die_on_an_inverted_interval(damaged):
+    """The whole script must survive the damage it exists to repair.
+
+    range_overlap builds a tstzrange per row; PostgreSQL raises on an inverted
+    one instead of returning it, and that error is not caught anywhere above.
+    Running the check unconditionally therefore killed --dry-run, --verify-only
+    and --apply alike, before a single row could be clamped.
+    """
+    # The raw check really does raise on this fixture, or the guard proves nothing.
+    range_sql = dict(const.SCD2_VERIFY_CHECKS)["range_overlap"]["entities"]
+    with pytest.raises(psycopg.Error):
+        with damaged.cursor() as cur:
+            cur.execute(range_sql)
+
+    results = repair_scd2.run_verification(damaged)   # must not raise
+    assert results["entities"]["range_overlap"] == const.SCD2_CHECK_SKIPPED
+    assert not repair_scd2.print_verification(results), "a skipped check is not clean"
+
+    # And once the clamp has run, it is executed for real and comes back zero.
+    _repair(damaged)
+    assert repair_scd2.run_verification(damaged)["entities"]["range_overlap"] == 0
 
 
 def test_damaged_dimension_fans_out_fact_rows(damaged):
@@ -442,6 +469,10 @@ def test_replayed_item_does_not_add_a_second_open_row(worker, clean_db):
                     " AND valid_to IS NULL")
         assert cur.fetchone()[0] == 1
     assert _violations(clean_db) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+    # A replay writes nothing precisely because it was already applied. Counting
+    # that as a lost registry change would make the counter non-zero after any
+    # shutdown that landed mid-item, and it is documented as "should stay 0".
+    assert worker.out_of_order_skips == 0
 
 
 def test_close_and_insert_intervals_abut_exactly(worker, clean_db):
@@ -589,6 +620,66 @@ def test_merge_flag_leaves_differing_versions_alone(damaged):
     with damaged.cursor() as cur:
         cur.execute("SELECT count(*) FROM entities WHERE entity_id='sensor.gap'")
         assert cur.fetchone()[0] == 2
+
+
+def _drop_backups(conn) -> None:
+    """Backup names carry a whole-second timestamp, so two runs inside one second
+    collide and the script refuses to overwrite. Not what these tests are about."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE %s",
+                    ("%_prerepair_%",))
+        for (name,) in cur.fetchall():
+            cur.execute(f"DROP TABLE IF EXISTS {name} CASCADE")
+
+
+def _run_main(monkeypatch, *argv: str) -> int:
+    monkeypatch.setattr("sys.argv", ["repair_scd2.py", "--dsn", DSN, "--yes", *argv])
+    return repair_scd2.main()
+
+
+def test_opt_in_steps_still_run_on_an_already_clean_database(damaged, monkeypatch):
+    """The documented workflow reaches the fidelity flags only after a repair.
+
+    --dry-run, read the Fidelity section, decide, re-run with the flag — by which
+    point the first --apply has made the database clean. Gating the opt-in steps
+    on the invariant being violated made that second run print "Nothing to
+    repair" and exit 0 having done nothing, so the gaps it reports were
+    unreachable in practice.
+    """
+    in_gap = BASE + timedelta(days=2)
+    with damaged.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
+        # Make sensor.gap's two versions identical, so the pair qualifies to merge.
+        cur.execute("UPDATE entities SET name='A' WHERE entity_id='sensor.gap'")
+
+    assert _run_main(monkeypatch, "--apply") == 0
+    assert _violations(damaged) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+    _drop_backups(damaged)
+
+    assert _run_main(monkeypatch, "--apply", "--merge-identical-gaps") == 0
+    with damaged.cursor() as cur:
+        cur.execute("SELECT valid_from, valid_to FROM entities"
+                    " WHERE entity_id='sensor.gap'")
+        assert cur.fetchall() == [(BASE, None)], (
+            "the follow-up run must merge the contradicted gap")
+        cur.execute("SELECT count(*) FROM scd2_repair_quarantine"
+                    " WHERE reason='merged_into_previous_version'")
+        assert cur.fetchone()[0] == 1
+
+
+def test_an_extras_only_run_still_writes_the_backup(damaged, monkeypatch):
+    """A run that only carries an opt-in flag still deletes rows, so the
+    documented undo path — a full copy of every table before anything is
+    modified — has to exist for it too."""
+    assert _run_main(monkeypatch, "--apply") == 0
+    _drop_backups(damaged)
+
+    assert _run_main(monkeypatch, "--apply", "--collapse-duplicates") == 0
+    with damaged.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_tables WHERE tablename LIKE %s",
+                    ("entities_prerepair_%",))
+        assert cur.fetchone()[0] == 1
 
 
 def test_states_flat_stops_fanning_out_after_repair(damaged):

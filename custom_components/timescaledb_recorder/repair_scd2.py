@@ -16,6 +16,16 @@ make every metadata write fail.
     3. --apply        back up, repair, verify, add constraints
     4. --verify-only  confirm, now and after a day of normal operation
 
+--verify-only reports the invariant only. The Ambiguity, Fidelity and Coverage
+sections scan the whole `states` hypertable, so they run under --dry-run and
+--apply but not there, which keeps the recurring check seconds rather than
+minutes.
+
+The two opt-in steps — --collapse-duplicates and --merge-identical-gaps — act on
+data the invariant already accepts, so they work on an already-repaired database.
+Reading the Fidelity section of a --dry-run and then re-running with one of them
+is the intended workflow, not an edge case.
+
 What it does
 ------------
 Reconstructs each dimension's version intervals from `valid_from` ordering alone,
@@ -69,6 +79,7 @@ try:
     from .const import (
         SCD2_DIMENSIONS,
         SCD2_BTREE_GIST_SQL,
+        SCD2_CHECK_SKIPPED,
         SCD2_EXCLUDE_CONSTRAINT_SQL,
         SCD2_OPEN_UNIQUE_IDX_SQL,
         SCD2_QUARANTINE_DDL_SQL,
@@ -97,6 +108,7 @@ try:
         SCD2_MERGE_PLAN_SQL,
         SCD2_NO_CURRENT_VERSION_SQL,
         SCD2_VERIFY_CHECKS,
+        SCD2_VERIFY_GUARDS,
     )
 except ImportError:
     # Executed as a plain script (docker exec python3 .../repair_scd2.py), so the
@@ -105,6 +117,7 @@ except ImportError:
     from const import (  # pyright: ignore[reportMissingImports]
         SCD2_DIMENSIONS,
         SCD2_BTREE_GIST_SQL,
+        SCD2_CHECK_SKIPPED,
         SCD2_EXCLUDE_CONSTRAINT_SQL,
         SCD2_OPEN_UNIQUE_IDX_SQL,
         SCD2_QUARANTINE_DDL_SQL,
@@ -133,6 +146,7 @@ except ImportError:
         SCD2_MERGE_PLAN_SQL,
         SCD2_NO_CURRENT_VERSION_SQL,
         SCD2_VERIFY_CHECKS,
+        SCD2_VERIFY_GUARDS,
     )
 
 _HA_CONFIG_ENTRIES = "/config/.storage/core.config_entries"
@@ -190,11 +204,23 @@ def print_identity(conn: psycopg.Connection) -> None:
 
 
 def run_verification(conn: psycopg.Connection) -> dict[str, dict[str, int]]:
-    """Return {table: {check_name: offending_row_count}} for all dimensions."""
+    """Return {table: {check_name: offending_row_count}} for all dimensions.
+
+    A check whose guard (SCD2_VERIFY_GUARDS) found offending rows is recorded as
+    SCD2_CHECK_SKIPPED and never executed: range_overlap's tstzrange() raises on
+    an inverted interval, so on a table holding one, running it would abort the
+    whole script — including the --apply that repairs exactly that damage.
+    Skipping still reports the table as unclean, which is the honest answer:
+    the invariant is violated and the guard says how.
+    """
     results: dict[str, dict[str, int]] = {}
     for table, _key in SCD2_DIMENSIONS:
         per_table: dict[str, int] = {}
         for name, statements in SCD2_VERIFY_CHECKS:
+            guard = SCD2_VERIFY_GUARDS.get(name)
+            if guard is not None and per_table.get(guard):
+                per_table[name] = SCD2_CHECK_SKIPPED
+                continue
             with conn.cursor() as cur:
                 cur.execute(statements[table])
                 per_table[name] = len(cur.fetchall())
@@ -210,11 +236,19 @@ def print_verification(results: dict[str, dict[str, int]]) -> bool:
     print(header)
     print("  " + "-" * (len(header) - 2))
     clean = True
+    skipped = False
     for table, _key in SCD2_DIMENSIONS:
         row = results[table]
-        cells = "".join(f"  {row[n]:>17}" for n in names)
+        cells = "".join(
+            f"  {'skipped' if row[n] == SCD2_CHECK_SKIPPED else row[n]:>17}"
+            for n in names
+        )
         print("  " + table.ljust(width) + cells)
+        skipped = skipped or any(v == SCD2_CHECK_SKIPPED for v in row.values())
         clean = clean and not any(row.values())
+    if skipped:
+        print("  ('skipped' — an earlier check on that table found damage this one "
+              "cannot be run over. It is re-run automatically after the repair.)")
     return clean
 
 
@@ -446,17 +480,22 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--apply", action="store_true",
                       help="Back up, repair, verify, and add constraints.")
     mode.add_argument("--verify-only", action="store_true",
-                      help="Check the invariant and exit. Never mutates.")
+                      help="Check the invariant and exit. Never mutates, and skips "
+                           "the Ambiguity/Fidelity/Coverage sections, which scan the "
+                           "whole states hypertable. Use --dry-run for those.")
     p.add_argument("--collapse-duplicates", action="store_true",
                    help="Also delete rows byte-identical to a row that stays "
                         "(archived to scd2_repair_quarantine first). Off by default: "
-                        "the repair reaches the invariant without deleting anything.")
+                        "the repair reaches the invariant without deleting anything. "
+                        "Works on an already-clean database too.")
     p.add_argument("--no-constraints", action="store_true",
                    help="Repair but do not add the exclusion constraints.")
     p.add_argument("--merge-identical-gaps", action="store_true",
                    help="Collapse two identical versions separated by a gap that "
                         "states contradicts into one row spanning both. The only "
-                        "step that extends a recorded close time; off by default.")
+                        "step that extends a recorded close time; off by default. "
+                        "Works on an already-clean database too — this is the "
+                        "follow-up run after reading the Fidelity section.")
     p.add_argument("--yes", action="store_true",
                    help="Skip the --apply confirmation prompt (for scripted runs).")
     return p.parse_args()
@@ -512,6 +551,14 @@ def main() -> int:
             )
             return 2
 
+        # Everything below scans `states`, which is the hypertable — tens of
+        # millions of rows, tens of seconds. --verify-only is advertised as the
+        # cheap check to re-run after a day of normal operation, so it stops
+        # here: the invariant answer above is already complete.
+        if verify_only:
+            print("\nClean." if clean else "\nInvariant VIOLATED.")
+            return 0 if clean else 1
+
         print("\nAmbiguity")
         ambiguous = report_ambiguity(conn)
         if not any(ambiguous.values()):
@@ -540,24 +587,30 @@ def main() -> int:
         else:
             print("  every entity in states has a dimension row")
 
-        if verify_only:
-            print("\nClean." if clean else "\nInvariant VIOLATED.")
-            return 0 if clean else 1
+        # The opt-in flags act on data the invariant already accepts — duplicate
+        # payloads and contradicted gaps both pass every check. So they must run
+        # independently of `clean`, or they become inert the moment the first
+        # --apply succeeds, which is precisely when the operator has read the
+        # Fidelity section above and decided to use them.
+        extras = args.collapse_duplicates or args.merge_identical_gaps
+        mutating = not clean or extras
 
-        if clean:
+        if not mutating:
             print("\nNothing to repair.")
-        elif not apply_changes:
-            print("\nWould change")
-            preview(conn)
-            print("\nDry run — nothing was modified. Re-run with --apply to repair.")
-            return 1
 
         if not apply_changes:
-            return 0
+            if mutating:
+                print("\nWould change")
+                preview(conn)
+                if extras:
+                    print("  plus the opt-in steps requested above — counts are in "
+                          "the Ambiguity and Fidelity sections.")
+                print("\nDry run — nothing was modified. Re-run with --apply to repair.")
+            return 0 if clean else 1
 
         # Confirm before announcing any work, so the operator is never told
         # "Repairing" for a run they then decline.
-        if not clean and not confirm_apply(_redact(dsn), args):
+        if mutating and not confirm_apply(_redact(dsn), args):
             print("Aborted. Nothing was modified.")
             return 1
 
@@ -565,7 +618,11 @@ def main() -> int:
             cur.execute(SCD2_QUARANTINE_DDL_SQL)
             cur.execute(SCD2_QUARANTINE_IDX_SQL)
 
-        if not clean:
+        if mutating:
+            # Always the full pass, even for an extras-only run on a clean
+            # database: repair_table is what writes the backup tables, and the
+            # documented undo path depends on one existing before any row is
+            # touched. On clean data its rebuild and clamp change nothing.
             for table, _key in SCD2_DIMENSIONS:
                 repair_table(conn, table, run_id, stamp, args.collapse_duplicates)
             if args.merge_identical_gaps:
@@ -596,16 +653,17 @@ def main() -> int:
         if unresolved:
             print(f"\nUnresolved: {', '.join(sorted(set(unresolved)))}. "
                   "Inspect scd2_repair_quarantine.")
-            if not clean:
+            if mutating:
                 print(f"Backups retained: <table>_prerepair_{stamp}")
             return 1
 
         print("\nDone. Invariant holds on all dimensions.")
-        if not clean:
+        if mutating:
             # Only mention backups when some were actually taken — this line is
             # the undo path, and naming tables that do not exist is worse than
             # saying nothing.
             print(f"Backups: <table>_prerepair_{stamp} — drop them once satisfied.")
+        if not clean:
             # Not optional. The rebuild closes non-final open rows and never
             # reopens anything, so ids whose newest version was already closed
             # come out with no current version. This script does not read the

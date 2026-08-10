@@ -201,10 +201,19 @@ class RegistryListener:
         pass so a burst becomes one put_many_async — one fsync — rather than one
         per event.
 
-        This loop must outlive its own errors. It is the only path from the event
-        callbacks to disk, so if it exits, every later registry change piles up in
-        memory unpersisted while nothing reports a problem. A failed flush puts the
-        batch back and retries with a bounded backoff rather than propagating.
+        This loop must outlive every ordinary error. It is the only path from the
+        event callbacks to disk, so if it exits, every later registry change piles
+        up in memory unpersisted while nothing reports a problem. A failed flush
+        puts the batch back and retries with a bounded backoff rather than
+        propagating.
+
+        The exceptions to that are the exceptions that are not `Exception`:
+        cancellation, KeyboardInterrupt, SystemExit. Those say the interpreter or
+        the event loop is going away, and retrying in a backoff loop would fight
+        the shutdown rather than survive it. _flush_buffer catches `BaseException`
+        so it can restore the batch before any of them propagate, then re-raises;
+        the batch is safe in _buffer and async_stop's final flush is what gets it
+        to disk.
         """
         delay = _DRAIN_RETRY_MIN_S
         while True:
@@ -242,6 +251,11 @@ class RegistryListener:
             # Normal shutdown, not a failure — async_stop settles this batch.
             raise
         except BaseException:
+            # Clear before requeuing: this batch is now back in _buffer, and
+            # leaving it recorded as in-flight would let _settle_inflight requeue
+            # the same items a second time if the drainer is cancelled during its
+            # backoff, so the final flush would write both copies.
+            self._inflight = None
             self._requeue(batch)
             _LOGGER.exception(
                 "Failed to enqueue %d registry item(s); retrying", len(batch))
@@ -269,6 +283,7 @@ class RegistryListener:
         try:
             await append
         except Exception:  # noqa: BLE001
+            self._inflight = None
             self._requeue(batch)
             _LOGGER.exception(
                 "Enqueue of %d registry item(s) failed during shutdown", len(batch))

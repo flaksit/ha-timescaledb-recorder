@@ -135,7 +135,7 @@ CREATE TABLE IF NOT EXISTS states (
 NULL metadata has two quite different causes, and it is worth knowing which you are looking at:
 
 - **The entity is not in HA's entity registry.** Home Assistant keeps plenty of entities in its state machine without registering them — `sun.sun`, `zone.home`, `conversation.*`, and anything defined in YAML rather than the UI (automations, `input_select`, `input_number`, `input_button`). These can never have a dimension row, their metadata is genuinely unknown, and nothing is wrong. Query them by `entity_id` and `domain`.
-- **The registry history has a hole.** A period no version covers, for an entity that does have registry rows. That is a real defect. `repair_scd2.py --verify-only` reports it, and its Fidelity section explains what can be done.
+- **The registry history has a hole.** A period no version covers, for an entity that does have registry rows. That is a real defect. `repair_scd2.py --dry-run` reports it under Fidelity, which also explains what can be done about it.
 
 The repair script's Coverage section lists which entity_ids fall in the first group, so the two are easy to tell apart.
 
@@ -143,10 +143,9 @@ This requires the SCD2 invariant to hold. On a database that has not yet been re
 
 The views matter most for SQL query builders such as Grafana's: a builder reads the column list and emits `AVG(state)`, which fails with `function avg(text) does not exist`. Pointing it at a view exposes `value` as a real numeric column, so aggregation, grouping, and filtering become point-and-click.
 
-`states_flat` resolves metadata **as of each state's timestamp**, not as of today. Each dimension is rewritten into gap-free, non-overlapping intervals — a version runs until the next version begins, with the first and last extended to cover all time — so exactly one version matches any row. That gives three things:
+Two consequences worth planning around:
 
-- An entity deleted from HA keeps the metadata it had. Matching on `valid_to IS NULL` instead would blank the metadata for that entity's entire history, which is precisely where it matters.
-- A state row can never be duplicated by the join, even if a dimension contains overlapping versions or an entity somehow has several simultaneously-open ones.
+- An entity deleted from HA keeps the metadata it had for the period it existed, and has none afterwards. Matching on `valid_to IS NULL` instead would blank the metadata for that entity's entire history, which is precisely where it matters.
 - Renames are historically accurate: each era shows the name of its time. If a rename must not split a series, `GROUP BY entity_id` rather than `entity_name`.
 
 The range join is not free. Measured over ~48 M rows: an entity-filtered 7-day query runs 99 ms (vs 57 ms for a current-row join), a broad 7-day aggregate 1.7 s (vs 442 ms). Use `states_numeric` when you don't need metadata.
@@ -315,7 +314,7 @@ ORDER BY last_updated DESC
 LIMIT 10;
 ```
 
-Joining the dimensions directly also works, and with the invariant enforced it can no longer duplicate rows. It is still lossier than the view: an inner join on `valid_from`/`valid_to` drops every state row recorded before the entity's first registry version — including everything imported by `backfill_gaps.py` — and anything falling in a gap between a removal and a re-creation. `states_flat` avoids both by extending the first version back to `-infinity` and running each version until the next one starts.
+Joining the dimensions directly also works, and with the invariant enforced it can no longer duplicate rows. The difference from the view is what happens to rows no version covers — states recorded before the entity's first registry version (including everything imported by `backfill_gaps.py`) and states inside a removal-to-re-creation gap. An inner join drops them; `states_flat` keeps them with NULL metadata, so totals stay right and the hole is visible rather than silently subtracted.
 
 `valid_to IS NULL` on its own is fine for "what is this entity called now", but it is not a point-in-time join: it labels historical rows with today's metadata, and it drops entities that have since been removed from HA.
 
@@ -409,13 +408,15 @@ The `states_flat` redefinition ships in the same release: `sync_setup_schema` ru
 | `--dsn DSN` | read from integration config | PostgreSQL connection string |
 | `--dry-run` | default | Report the damage and what would change; mutates nothing |
 | `--apply` | off | Back up, repair, verify, and add the constraints |
-| `--verify-only` | off | Check the invariant and exit; never mutates |
+| `--verify-only` | off | Check the invariant and exit; never mutates. Skips the Ambiguity, Fidelity and Coverage sections, which scan the whole `states` hypertable — use `--dry-run` for those |
 | `--collapse-duplicates` | off | Also delete rows byte-identical to a row that stays |
 | `--merge-identical-gaps` | off | Collapse two identical versions separated by a gap that `states` contradicts into one row covering both |
 | `--no-constraints` | off | Repair without adding the exclusion constraints |
 | `--yes` | off | Skip the `--apply` confirmation. Required when there is no terminal |
 
 `--apply` asks for confirmation before its first write, and refuses to run unattended without `--yes`. The exit code is 0 when the invariant holds, 1 when it does not or when anything is left unresolved, and 2 when `valid_from` itself looks unsound — the one case where you should stop and investigate rather than repair.
+
+The last two flags act on data the invariant already accepts, so they still work once the repair has run. Reading the Fidelity section of a `--dry-run` and then re-running as `--apply --merge-identical-gaps` is the intended sequence, not a special case; a run that only carries those flags still writes the backup tables first.
 
 ### What it does, and what it will not do
 

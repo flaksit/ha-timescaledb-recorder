@@ -25,6 +25,8 @@ from .const import (
     CREATE_VIEW_STATES_NUMERIC_SQL,
     CREATE_VIEW_STATES_FLAT_SQL,
     SCD2_BTREE_GIST_SQL,
+    SCD2_DDL_LOCK_TIMEOUT_RESET_SQL,
+    SCD2_DDL_LOCK_TIMEOUT_SQL,
     SCD2_DIMENSIONS,
     SCD2_EXCLUDE_CONSTRAINT_SQL,
     SCD2_OPEN_UNIQUE_IDX_SQL,
@@ -57,6 +59,13 @@ def setup_scd2_constraints(conn: psycopg.Connection) -> None:
 
     Requires autocommit (the caller's connection is), so a rejected statement
     does not abort the ones after it.
+
+    Bounded by lock_timeout. ADD CONSTRAINT needs ACCESS EXCLUSIVE, so it queues
+    behind any open reader — a Grafana query on states_flat holds ACCESS SHARE on
+    entities — and while it waits, every later access to that table queues behind
+    it. Without a timeout, one slow dashboard query would stall schema setup,
+    states ingestion and metadata writes for as long as it ran. Giving up is the
+    right answer: this is best-effort DDL and the next startup retries it.
     """
     have_gist = True
     try:
@@ -74,16 +83,36 @@ def setup_scd2_constraints(conn: psycopg.Connection) -> None:
         )
 
     statements = SCD2_EXCLUDE_CONSTRAINT_SQL if have_gist else SCD2_OPEN_UNIQUE_IDX_SQL
-    for table, _key in SCD2_DIMENSIONS:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(SCD2_DDL_LOCK_TIMEOUT_SQL)
+        for table, _key in SCD2_DIMENSIONS:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(statements[table])
+            except psycopg.errors.LockNotAvailable:
+                # Someone else is holding the table. Not a data problem, so the
+                # repair hint would be misleading — say what actually happened.
+                _LOGGER.warning(
+                    "Could not enforce the SCD2 invariant on %s: another session held the "
+                    "table longer than the lock timeout. Schema setup continues; the next "
+                    "startup will retry.",
+                    table,
+                )
+            except psycopg.Error as exc:
+                _LOGGER.warning(
+                    "Could not enforce the SCD2 invariant on %s (%s). This normally means the "
+                    "table still holds overlapping or duplicate-open versions. %s",
+                    table, exc, _REPAIR_HINT,
+                )
+    finally:
+        # The connection is long-lived and shared with the states worker, so the
+        # timeout must not outlive this function.
         try:
             with conn.cursor() as cur:
-                cur.execute(statements[table])
-        except psycopg.Error as exc:
-            _LOGGER.warning(
-                "Could not enforce the SCD2 invariant on %s (%s). This normally means the "
-                "table still holds overlapping or duplicate-open versions. %s",
-                table, exc, _REPAIR_HINT,
-            )
+                cur.execute(SCD2_DDL_LOCK_TIMEOUT_RESET_SQL)
+        except psycopg.Error:
+            _LOGGER.debug("Could not reset lock_timeout after SCD2 DDL", exc_info=True)
 
 
 def sync_setup_schema(

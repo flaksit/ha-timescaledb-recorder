@@ -335,8 +335,11 @@ LEFT JOIN devices d ON {_SCD2_ERA_JOIN.format(
 # intervals abut exactly: [old_vf, new_vf) then [new_vf, infinity). Using a
 # separately-read worker clock instead — which is what issue #17 found — makes
 # the closed interval overrun its successor's start, producing one overlap per
-# metadata change. For "remove" there is no replacement, so the worker clock is
-# the correct close time.
+# metadata change. "remove" has no replacement row to take a valid_from from, so
+# it closes at the item's `enqueued_at` instead — still event time. A clock read
+# at dequeue would close the version whenever the queue happened to drain, which
+# overlaps any re-creation that arrived in between; see
+# meta_worker._close_timestamp.
 #
 # `valid_from < %s` is an ordering guard: an item applied out of order can then
 # never close a version that begins at or after it. Without it, a late-arriving
@@ -430,6 +433,22 @@ WHERE NOT EXISTS (
 # gone. They were the new-row step of the close-and-insert cycle and had no
 # replay protection; the SCD2_SNAPSHOT_* statements above now serve every insert.
 
+# Replay probe. A guarded close+insert that writes nothing has two possible
+# causes, and they mean opposite things: the item was already applied and is
+# being replayed (nothing lost), or a newer version landed first and this change
+# is now unrepresentable (a real loss). An open row whose valid_from equals the
+# incoming one IS the row this item would have inserted, which distinguishes
+# them. Without the probe every replay — routine after any shutdown that lands
+# mid-item — was counted and logged as a lost registry change.
+# Keyed by the item's `registry` field, not by table name.
+# %s = id, %s = the incoming valid_from.
+SCD2_OPEN_VERSION_AT_SQL = {
+    "entity": "SELECT 1 FROM entities WHERE entity_id = %s AND valid_to IS NULL AND valid_from = %s;",
+    "device": "SELECT 1 FROM devices WHERE device_id = %s AND valid_to IS NULL AND valid_from = %s;",
+    "area": "SELECT 1 FROM areas WHERE area_id = %s AND valid_to IS NULL AND valid_from = %s;",
+    "label": "SELECT 1 FROM labels WHERE label_id = %s AND valid_to IS NULL AND valid_from = %s;",
+}
+
 # D-08-d step 4: watermark read (orchestrator → states worker connection).
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
 
@@ -500,6 +519,17 @@ SELECT_LABEL_CURRENT_SQL = (
 # COALESCE(valid_to, 'infinity') maps the open row into the range. 'infinity' is
 # an immutable literal, so it is legal in an index expression (unlike 'now').
 SCD2_BTREE_GIST_SQL = "CREATE EXTENSION IF NOT EXISTS btree_gist;"
+
+# ADD CONSTRAINT takes ACCESS EXCLUSIVE, which queues behind any open reader and
+# then blocks every later access to the table. At startup that reader is a
+# dashboard query against states_flat, and the queue behind the ALTER is schema
+# setup itself — so states ingestion and metadata writes would both stall for as
+# long as the query runs. Failing fast is correct here: the constraint is
+# best-effort and the next startup retries it.
+# Plain SET, not SET LOCAL: schema setup runs in autocommit, where SET LOCAL has
+# no transaction to be local to and would silently do nothing. Hence the reset.
+SCD2_DDL_LOCK_TIMEOUT_SQL = "SET lock_timeout = '5s';"
+SCD2_DDL_LOCK_TIMEOUT_RESET_SQL = "RESET lock_timeout;"
 
 # ALTER TABLE ... ADD CONSTRAINT has no IF NOT EXISTS, so guard on pg_constraint
 # to keep startup DDL idempotent. {table}/{key} are formatted from the hard-coded
@@ -750,8 +780,11 @@ SELECT (jsonb_populate_record(NULL::{table}, row_data)).*
 # ---- Verification ------------------------------------------------------------
 #
 # All checks must return zero rows for the invariant to hold. INVERTED runs
-# first: it guards RANGE below, which raises on an inverted tstzrange rather than
-# returning a row.
+# first and RANGE is skipped whenever it found anything: tstzrange() raises on an
+# inverted range rather than returning a row, so on the very damage this repair
+# exists to fix, running RANGE aborts the run instead of reporting. Ordering
+# alone is not enough — the dependency is declared in SCD2_VERIFY_GUARDS below
+# and enforced by the runner.
 
 _SCD2_VERIFY_INVERTED_SQL = """
 SELECT {key}::text AS id_value, valid_from, valid_to
@@ -850,6 +883,15 @@ SCD2_VERIFY_CHECKS = (
     ("sequence", _per_dimension(_SCD2_VERIFY_SEQUENCE_SQL)),
     ("range_overlap", _per_dimension(_SCD2_VERIFY_RANGE_SQL)),
 )
+
+# {check: the check that must return zero before it can run}. A guarded check
+# whose guard found something is not merely noisy — its SQL raises on that input.
+SCD2_VERIFY_GUARDS = {"range_overlap": "inverted"}
+
+# Recorded in place of a row count for a check that was not run because its guard
+# failed. Negative so it can never be mistaken for "clean" by a truthiness or
+# any() test, and so the display can name it.
+SCD2_CHECK_SKIPPED = -1
 
 
 # ---- Fidelity reporting (issue #17) ------------------------------------------

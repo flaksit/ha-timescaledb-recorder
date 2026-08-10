@@ -5,7 +5,7 @@ from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 23 SQL statements.
+    """sync_setup_schema must execute exactly 25 SQL statements.
 
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
@@ -14,13 +14,14 @@ def test_create_schema_executes_all_statements(mock_psycopg_conn):
       devices, areas, labels)
     + 2 convenience views (states_numeric, states_flat)
     + 1 btree_gist extension + 4 SCD2 exclusion constraints (issue #17)
-    = 23 total
+    + 2 lock_timeout set/reset around the constraint DDL
+    = 25 total
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 23
+    assert cur.execute.call_count == 25
 
 
 def test_create_schema_order(mock_psycopg_conn):
@@ -53,8 +54,12 @@ def test_create_schema_order(mock_psycopg_conn):
     assert "CREATE OR REPLACE VIEW states_flat" in calls[17]
     # Invariant enforcement follows the tables it constrains (issue #17).
     assert "btree_gist" in calls[18]
+    # ADD CONSTRAINT takes ACCESS EXCLUSIVE — bounded so a long-running reader
+    # cannot stall schema setup and, behind it, states ingestion.
+    assert "SET lock_timeout" in calls[19]
     for offset, table in enumerate(("entities", "devices", "areas", "labels")):
-        assert f"excl_{table}_period" in calls[19 + offset]
+        assert f"excl_{table}_period" in calls[20 + offset]
+    assert "RESET lock_timeout" in calls[24]
 
 
 def test_constraint_failure_does_not_abort_schema_setup(mock_psycopg_conn):
@@ -72,6 +77,46 @@ def test_constraint_failure_does_not_abort_schema_setup(mock_psycopg_conn):
 
     cur.execute.side_effect = _side_effect
     sync_setup_schema(conn)  # must not raise
+
+
+def test_lock_timeout_is_reset_even_when_a_constraint_fails(mock_psycopg_conn):
+    """The connection is long-lived and shared with the states worker, so a
+    lock_timeout set for the DDL must never outlive it — including on the
+    damaged-install path where every ALTER is rejected."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "excl_" in sql:
+            raise psycopg.errors.InsufficientPrivilege("nope")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)
+
+    calls = [c.args[0] for c in cur.execute.call_args_list]
+    assert any("RESET lock_timeout" in c for c in calls)
+
+
+def test_a_held_lock_does_not_stall_schema_setup(mock_psycopg_conn):
+    """A reader holding the table is not a data problem, so it must be reported
+    as itself rather than as damage — and setup must carry on regardless."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "excl_" in sql:
+            raise psycopg.errors.LockNotAvailable("canceling statement due to lock timeout")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)  # must not raise
+
+    calls = [c.args[0] for c in cur.execute.call_args_list]
+    assert sum(1 for c in calls if "excl_" in c) == 4, "every table is still attempted"
+    assert any("RESET lock_timeout" in c for c in calls)
 
 
 def test_falls_back_to_unique_index_without_btree_gist(mock_psycopg_conn):

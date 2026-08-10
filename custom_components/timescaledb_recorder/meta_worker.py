@@ -14,7 +14,12 @@ Item-dict schema (D-15-c; produced by plan 09 syncer updates):
                                        # this worker rehydrates via fromisoformat
                                        # on the valid_from slot (index is
                                        # registry-specific — see _rehydrate_params).
-        "enqueued_at": str,            # ISO utc; informational only
+        "enqueued_at": str,            # ISO utc, stamped in the event callback.
+                                       # Load-bearing for "remove": with no
+                                       # params there is no valid_from, so this
+                                       # is the close time (see
+                                       # _close_timestamp). Informational for
+                                       # every other action.
     }
 """
 from __future__ import annotations
@@ -34,6 +39,7 @@ from .const import (
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
     SCD2_CLOSE_LABEL_SQL,
+    SCD2_OPEN_VERSION_AT_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
     SCD2_SNAPSHOT_DEVICE_SQL,
     SCD2_SNAPSHOT_ENTITY_SQL,
@@ -104,7 +110,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         self.integrity_drops: int = 0
         # Count of updates that landed out of order and were therefore skipped
         # rather than spliced into history. Should stay 0: the registry listener
-        # guarantees queue order. Non-zero means that guarantee broke.
+        # guarantees queue order. Non-zero means that guarantee broke. Replays of
+        # an already-applied item also write nothing, but they lose no history and
+        # are excluded — see _note_version_skipped.
         self.out_of_order_skips: int = 0
 
         # retry_until_success is applied to the bound method at __init__ time so
@@ -310,7 +318,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
 
     def _note_version_skipped(self, cur, registry: str, registry_id: str,
                           close_ts: datetime) -> None:
-        """Warn when a close+insert pair wrote nothing.
+        """Warn when a close+insert pair lost a registry change.
 
         The close carries a `valid_from < new_valid_from` guard and the insert is
         guarded on there being no open row, so an update that arrives after a
@@ -318,8 +326,24 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         right trade — splicing it in blind is how the intervals got corrupted —
         but a silent skip loses a registry change, and silence is exactly what let
         issue #17 run undetected. Surface it instead.
+
+        A replay writes nothing for the opposite reason: the item was already
+        applied, and the guards are what make replaying it a no-op. Replays are
+        routine — task_done() runs after the write, so any shutdown that lands
+        mid-item leaves it on disk for next startup — so counting them would make
+        `out_of_order_skips` non-zero after the first unclean restart and destroy
+        its value as a signal. The two are told apart by probing for the open row
+        this item itself would have inserted: one starting at exactly this
+        valid_from is that row, so nothing was lost.
         """
         if cur.rowcount:
+            return
+        cur.execute(SCD2_OPEN_VERSION_AT_SQL[registry], (registry_id, close_ts))
+        if cur.fetchone() is not None:
+            _LOGGER.debug(
+                "%s: %s %s was already applied; replay was a no-op",
+                self.name, registry, registry_id,
+            )
             return
         self.out_of_order_skips += 1
         # ERROR, with the item: this drops a real registry change, exactly like

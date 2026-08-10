@@ -5,23 +5,24 @@ from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 25 SQL statements.
+    """sync_setup_schema must execute exactly 27 SQL statements.
 
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
     + 4 dimension table DDL (entities, devices, areas, labels)
     + 5 dimension table indexes (entities compound, entities current-row,
       devices, areas, labels)
+    + 2 metadata_deadletter DDL (table, index) — issue #17
     + 2 convenience views (states_numeric, states_flat)
     + 1 btree_gist extension + 4 SCD2 exclusion constraints (issue #17)
     + 2 lock_timeout set/reset around the constraint DDL
-    = 25 total
+    = 27 total
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 25
+    assert cur.execute.call_count == 27
 
 
 def test_create_schema_order(mock_psycopg_conn):
@@ -48,18 +49,22 @@ def test_create_schema_order(mock_psycopg_conn):
     assert "devices" in calls[8]
     assert "areas" in calls[9]
     assert "labels" in calls[10]
+    # The dead-letter table is part of setup, not of the failure path that
+    # writes to it (issue #17).
+    assert "metadata_deadletter" in calls[16]
+    assert "idx_metadata_deadletter" in calls[17]
     # Views come last of the main block — states_flat joins the dimension
     # tables, so they must already exist.
-    assert "CREATE OR REPLACE VIEW states_numeric" in calls[16]
-    assert "CREATE OR REPLACE VIEW states_flat" in calls[17]
+    assert "CREATE OR REPLACE VIEW states_numeric" in calls[18]
+    assert "CREATE OR REPLACE VIEW states_flat" in calls[19]
     # Invariant enforcement follows the tables it constrains (issue #17).
-    assert "btree_gist" in calls[18]
+    assert "btree_gist" in calls[20]
     # ADD CONSTRAINT takes ACCESS EXCLUSIVE — bounded so a long-running reader
     # cannot stall schema setup and, behind it, states ingestion.
-    assert "SET lock_timeout" in calls[19]
+    assert "SET lock_timeout" in calls[21]
     for offset, table in enumerate(("entities", "devices", "areas", "labels")):
-        assert f"excl_{table}_period" in calls[20 + offset]
-    assert "RESET lock_timeout" in calls[24]
+        assert f"excl_{table}_period" in calls[22 + offset]
+    assert "RESET lock_timeout" in calls[26]
 
 
 def test_constraint_failure_does_not_abort_schema_setup(mock_psycopg_conn):

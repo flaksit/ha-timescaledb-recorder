@@ -294,6 +294,23 @@ Registry events are buffered in arrival order and handed to the writer in batche
 
 The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates.
 
+### When a change cannot be written
+
+Two things make the writer give up on a registry change rather than retry it forever:
+
+- The exclusion constraint refuses the write. Retrying replays the same conflicting row indefinitely, and since the retry never gives up, one bad item would stop every later metadata write.
+- The change arrived after a newer version had already landed. Splicing it in blind is how the intervals got corrupted in the first place, so the ordering guards refuse it.
+
+Either way the item goes to the **`metadata_deadletter`** table — reason, registry, id, and the complete original item as JSONB — and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself, because the hole in the history does not either. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
+
+```sql
+SELECT detected_at, reason, registry_id, error FROM metadata_deadletter ORDER BY detected_at DESC;
+```
+
+An empty table is the normal state. Anything in it means the dimension history has a gap at that timestamp, and `states_flat` will show NULL metadata there.
+
+Registry changes that fire during the startup window — between the integration subscribing and the initial snapshot completing — are dropped rather than dead-lettered. A create or an update is harmless, since the snapshot reads the registries afterwards and picks it up; a **removal** is not, because the entry is already gone by the time the snapshot looks and the open row stays open indefinitely. That is [issue #19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19) and is not fixed in this release.
+
 ### The invariant
 
 For any id, version intervals never overlap and at most one version is open (`valid_to IS NULL`). This is enforced by the database, not by convention — each dimension carries an exclusion constraint over `(id, tstzrange(valid_from, COALESCE(valid_to, 'infinity'), '[)'))`, installed automatically on startup and requiring the `btree_gist` extension.
@@ -409,12 +426,14 @@ The `states_flat` redefinition ships in the same release: `sync_setup_schema` ru
 | `--dry-run` | default | Report the damage and what would change; mutates nothing |
 | `--apply` | off | Back up, repair, verify, and add the constraints |
 | `--verify-only` | off | Check the invariant and exit; never mutates. Skips the Ambiguity, Fidelity and Coverage sections, which scan the whole `states` hypertable — use `--dry-run` for those |
-| `--collapse-duplicates` | off | Also delete rows byte-identical to a row that stays |
+| `--collapse-duplicates` | off | Also delete rows sharing a surviving row's id, `valid_from` and payload. `valid_to` is not compared — the rebuild collapses all of them to empty intervals anyway |
 | `--merge-identical-gaps` | off | Collapse two identical versions separated by a gap that `states` contradicts into one row covering both |
 | `--no-constraints` | off | Repair without adding the exclusion constraints |
 | `--yes` | off | Skip the `--apply` confirmation. Required when there is no terminal |
 
-`--apply` asks for confirmation before its first write, and refuses to run unattended without `--yes`. The exit code is 0 when the invariant holds, 1 when it does not or when anything is left unresolved, and 2 when `valid_from` itself looks unsound — the one case where you should stop and investigate rather than repair.
+`--apply` asks for confirmation before its first write, including the DDL that creates the quarantine table, and refuses to run unattended without `--yes`. The exit code is 0 when the invariant holds, 1 when it does not or when a dimension is left *unresolved* — meaning a table that still fails a verification check, or one whose constraint could not be created — and 2 when `valid_from` itself looks unsound, the one case where you should stop and investigate rather than repair.
+
+Three things are reported without changing the exit code, because the script cannot decide them and guessing would be worse than saying so: ambiguous `(id, valid_from)` groups, fidelity doubts, and states no version covers. A closing summary repeats all three counts, so a run that is clean but doubtful never looks the same as one that is simply clean. Read them.
 
 The last two flags act on data the invariant already accepts, so they still work once the repair has run. Reading the Fidelity section of a `--dry-run` and then re-running as `--apply --merge-identical-gaps` is the intended sequence, not a special case; a run that only carries those flags still writes the backup tables first.
 
@@ -426,6 +445,20 @@ History is reconstructed from `valid_from` ordering alone: each version's `valid
 
 Before touching anything it copies each table to `<table>_prerepair_<utc timestamp>`. That is the undo path, and the only complete record of the pre-repair `valid_to` values; drop those tables once you are satisfied. Rows it deletes or clamps are additionally archived with their full payload in `scd2_repair_quarantine`, tagged with the run id.
 
+### Undoing a repair
+
+`CREATE TABLE AS` copies rows and nothing else — no indexes, no constraints, no grants — and the rows it copied are the damaged ones the new exclusion constraint exists to reject. So the constraint has to come off first, and the order below is not interchangeable:
+
+```sql
+BEGIN;
+ALTER TABLE entities DROP CONSTRAINT excl_entities_period;
+TRUNCATE entities;
+INSERT INTO entities SELECT * FROM entities_prerepair_<stamp>;
+COMMIT;
+```
+
+The dimension is now exactly as it was, damage included, and `states_flat` fans out again. Repeat per table, then either re-run `repair_scd2.py --apply` or leave it and accept the corruption. To restore a single archived row instead of a whole table, `scd2_repair_quarantine.row_data` holds the complete original: `INSERT INTO entities SELECT (jsonb_populate_record(NULL::entities, row_data)).* FROM scd2_repair_quarantine WHERE ...`.
+
 ### Read the fidelity report
 
 Passing the invariant checks means the intervals are consistent, not that they are true. The script reports two kinds of doubt it cannot resolve for you:
@@ -433,11 +466,13 @@ Passing the invariant checks means the intervals are consistent, not that they a
 - **Gaps the `states` table contradicts.** A version closed with no successor for a while is only a real absence if the entity really was gone. If it kept recording states throughout, it was not. Those state rows come back from `states_flat` with NULL metadata. The report also says whether the versions either side of each gap are identical: where they are, the two rows describe the same unchanged entity and `--merge-identical-gaps` collapses them into one row covering both, which gives those states their metadata back. Where they differ, the era genuinely cannot be attributed to either version and the gap stays.
 - **Ids left with no current version.** Where the newest version is already closed while an older one is open, the rebuild closes the older one and does not reopen anything. That is right if the thing really was removed and wrong if it still exists. The script cannot tell the difference — it never reads the live registries.
 
+The Coverage section counts the third case: states no version covers at all. Three causes, and they need different reactions. Entities with no dimension row ever (`sun.sun`, `zone.home`, YAML helpers) are not missing history and never will have any. States before an entity's first `valid_from` are normal wherever history predates the dimension. States after an entity's last close, or referencing an area or device with no covering version, mean the dimension stops describing something that kept recording. All three come back from `states_flat` with NULL metadata, so all three are counted rather than only the gaps between versions.
+
 **Restarting HA after `--apply` is required, not optional.** That restart is what resolves the second case: the startup snapshot reads the live registries and re-creates an open row for everything that still exists. Until it runs, those ids have no current version and disappear from `valid_to IS NULL` queries.
 
 Where history is genuinely ambiguous — two versions recorded at the identical `valid_from` with different contents — nothing in the data says which one owned the era. Both rows are kept, one ends up with an empty interval, and the group is reported rather than silently resolved.
 
-Re-running is safe and converges: a second `--apply` changes zero rows. The script exits non-zero if anything is left unresolved.
+Re-running is safe and converges: a second `--apply` changes zero rows.
 
 ### If it fails
 

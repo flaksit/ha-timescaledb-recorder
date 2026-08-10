@@ -557,3 +557,51 @@ async def test_stop_flushes_remaining_buffer(enabled_listener, mock_meta_queue,
 
     mock_meta_queue.put_many_async.assert_awaited_once()
     assert enabled_listener._buffer == []
+
+
+async def test_stop_falls_back_to_a_blocking_append(enabled_listener, mock_meta_queue,
+                                                    mock_entity_registry):
+    """A failed final flush must not be the end of the item.
+
+    The async path appends through an executor. When that fails there is still
+    one thing left to try — appending synchronously — and by then the drainer is
+    gone, so nothing else can touch the buffer. Giving up instead threw away
+    every registry change of the last drain interval.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=OSError("executor gone"))
+    appended: list = []
+    mock_meta_queue.put_many = MagicMock(side_effect=appended.extend)
+
+    await enabled_listener.async_stop()
+
+    assert len(appended) == 1, "the item must reach the queue file synchronously"
+    assert appended[0]["registry_id"] == "sensor.x"
+    assert enabled_listener._buffer == []
+
+
+async def test_stop_reports_the_loss_when_even_the_blocking_append_fails(
+    enabled_listener, mock_meta_queue, mock_entity_registry, caplog
+):
+    """If both paths fail the change really is gone, and that must be said.
+
+    Unload still has to succeed — blocking HA shutdown over this is worse — so
+    the log line is the only thing standing between a lost registry change and
+    nobody knowing.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=OSError("executor gone"))
+    mock_meta_queue.put_many = MagicMock(side_effect=OSError("disk full"))
+
+    await enabled_listener.async_stop()
+
+    assert "Dropped 1 buffered registry item" in caplog.text
+    assert enabled_listener._buffer, "the batch is kept for whatever inspects it"

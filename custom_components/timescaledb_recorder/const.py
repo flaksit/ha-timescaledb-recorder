@@ -449,6 +449,17 @@ SCD2_OPEN_VERSION_AT_SQL = {
     "label": "SELECT 1 FROM labels WHERE label_id = %s AND valid_to IS NULL AND valid_from = %s;",
 }
 
+# Is there an open version at all, whatever it starts at? Tells a "remove" whose
+# close matched nothing which case it is in: no open row means the removal was
+# already applied (a replay), an open row means the ordering guard refused to
+# close it and the removal was lost.
+SCD2_OPEN_VERSION_SQL = {
+    "entity": "SELECT valid_from FROM entities WHERE entity_id = %s AND valid_to IS NULL;",
+    "device": "SELECT valid_from FROM devices WHERE device_id = %s AND valid_to IS NULL;",
+    "area": "SELECT valid_from FROM areas WHERE area_id = %s AND valid_to IS NULL;",
+    "label": "SELECT valid_from FROM labels WHERE label_id = %s AND valid_to IS NULL;",
+}
+
 # D-08-d step 4: watermark read (orchestrator → states worker connection).
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
 
@@ -691,8 +702,18 @@ HAVING count(*) > 1
  ORDER BY 1, 2;
 """
 
-# Byte-identical twins at the same (id, valid_from) — artefacts, not history.
-# Reported always; deleted only under --collapse-duplicates.
+# Twins at the same (id, valid_from) carrying the same payload — artefacts, not
+# history. Reported always; deleted only under --collapse-duplicates.
+#
+# "Same payload" excludes valid_to, so twins that differ only in their recorded
+# close time qualify. That is deliberate: the close-timestamp defect is what
+# produced the differing valid_to in the first place, so demanding equality
+# there would make the flag inert against the exact damage it exists for. It
+# costs nothing, because the rebuild collapses every one of these rows to an
+# empty interval anyway — within a valid_from, closed rows sort before the open
+# one and inherit next_from, which equals their own valid_from. So the rows this
+# deletes could never label a state row, and their close times survive in both
+# the quarantine and the pre-repair backup.
 _SCD2_REPAIR_IDENTICAL_DUPES_SQL = """
 WITH grouped AS (
     SELECT {key}::text AS id_value, valid_from,
@@ -708,8 +729,8 @@ SELECT id_value, valid_from, versions FROM grouped
 
 # Opt-in duplicate collapse. Keeps the row the states_flat view would pick
 # (DISTINCT ON ... ORDER BY valid_to DESC NULLS FIRST -> the open twin), archives
-# the losers with their full payload, and deletes only rows proven byte-identical
-# to the survivor.
+# the losers with their full payload, and deletes only rows sharing the
+# survivor's id, valid_from and payload (valid_to excluded — see above).
 # "All payloads in this group are equal" is expressed as min = max over the
 # partition, not count(DISTINCT ...) OVER (...): PostgreSQL rejects DISTINCT in a
 # window function ("DISTINCT is not implemented for window functions").
@@ -732,7 +753,7 @@ losers AS (
 ),
 archived AS (
     INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
-    SELECT %s, '{table}', id_value, 'duplicate_identical_payload', row_data FROM losers
+    SELECT %s, '{table}', id_value, 'duplicate_same_start_same_payload', row_data FROM losers
 )
 DELETE FROM {table} d USING losers l WHERE d.ctid = l.rid;
 """
@@ -768,6 +789,52 @@ SELECT table_name, reason, count(*) AS rows
   FROM scd2_repair_quarantine WHERE run_id = %s
  GROUP BY 1, 2 ORDER BY 1, 2;
 """
+
+# ---- Dead letter (issue #17, #20) --------------------------------------------
+#
+# Where the meta worker puts an item it is about to stop retrying. Two kinds
+# reach it: a write the SCD2 constraints refuse (retrying replays the same
+# conflicting row forever, so the queue would wedge) and a registry change that
+# arrived after a newer version already landed (splicing it in blind is how the
+# intervals got corrupted in the first place).
+#
+# Both used to exist only as an in-memory counter and a log line, which meant a
+# restart erased the evidence that anything had been dropped at all. A table
+# survives restarts, sits next to the data it failed to become, and is where
+# issue #20 already proposed the counters should live. It is created by
+# sync_setup_schema so the worker can always assume it exists.
+#
+# `item` is the complete queue item, so a human can fix the cause and replay it
+# by hand. Never pruned automatically — this is evidence, not cache.
+METADATA_DEADLETTER_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS metadata_deadletter (
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reason      TEXT        NOT NULL,
+    registry    TEXT,
+    registry_id TEXT,
+    error       TEXT,
+    item        JSONB       NOT NULL
+);
+"""
+
+METADATA_DEADLETTER_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_metadata_deadletter_detected_at
+    ON metadata_deadletter (detected_at DESC);
+"""
+
+METADATA_DEADLETTER_INSERT_SQL = """
+INSERT INTO metadata_deadletter (reason, registry, registry_id, error, item)
+VALUES (%s, %s, %s, %s, %s);
+"""
+
+METADATA_DEADLETTER_SUMMARY_SQL = """
+SELECT reason, count(*) AS rows, max(detected_at) AS latest
+  FROM metadata_deadletter GROUP BY 1 ORDER BY 2 DESC;
+"""
+
+# Reasons, so the writer and the reader cannot drift apart.
+DEADLETTER_REASON_INTEGRITY = "scd2_constraint_rejected"
+DEADLETTER_REASON_OUT_OF_ORDER = "arrived_after_newer_version"
 
 # Undo helper for a quarantined row, documented in the repair script's --help.
 _SCD2_QUARANTINE_RESTORE_SQL = """
@@ -857,7 +924,64 @@ SELECT s.entity_id, c.n AS states, c.last_seen
 """
 
 
-def _per_dimension(template: str) -> dict:
+# States whose entity HAS a dimension row, but none covering the moment the
+# state was recorded. Complements SCD2_STATES_WITHOUT_DIM_SQL, which finds
+# entities with no row at all, and SCD2_SUSPICIOUS_GAPS_SQL, which only looks
+# between two versions. This one also catches the two edges that neither sees:
+# states before an entity's first valid_from and states after its last close.
+# Both come back from states_flat with NULL metadata, so both need counting —
+# an unreported NULL is the same silence issue #17 was made of.
+#
+# range_agg unions each entity's eras into one multirange and `@>` asks whether
+# the state falls in any of them, which is the same question states_flat's join
+# asks and cheaper than a correlated subquery per row.
+#
+# greatest(...) applies the clamp's semantics inline: tstzrange() raises on an
+# inverted interval, so without it this would abort on exactly the damage the
+# repair exists to fix. A clamped interval is empty and covers nothing, which is
+# the honest answer for a row whose recorded era is impossible.
+SCD2_STATES_UNCOVERED_SQL = f"""
+WITH covered AS (
+    SELECT entity_id,
+           range_agg(tstzrange(
+               valid_from,
+               greatest(COALESCE(valid_to, 'infinity'::timestamptz), valid_from),
+               '[)')) AS eras
+      FROM entities GROUP BY entity_id)
+SELECT s.entity_id, count(*) AS states, min(s.last_updated) AS first_uncovered,
+       max(s.last_updated) AS last_uncovered
+  FROM {TABLE_NAME} s
+  JOIN covered c ON c.entity_id = s.entity_id
+ WHERE NOT (c.eras @> s.last_updated)
+ GROUP BY 1
+ ORDER BY 2 DESC;
+"""
+
+# Entity versions pointing at an area or device that has no version covering the
+# entity version's own era. Those produce NULL area_name / device_name in
+# states_flat for every state in that era. Dimension-only — no hypertable scan —
+# because the entity version already says which period is affected.
+_SCD2_DIM_UNCOVERED_REFS_SQL = """
+SELECT e.{key}::text AS ref_id, count(*) AS entity_versions
+  FROM entities e
+ WHERE e.{key} IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM {table} t
+        WHERE t.{key} = e.{key}
+          AND t.valid_from <= e.valid_from
+          AND greatest(COALESCE(t.valid_to, 'infinity'::timestamptz), t.valid_from)
+              > e.valid_from)
+ GROUP BY 1
+ ORDER BY 2 DESC;
+"""
+
+SCD2_DIM_UNCOVERED_REFS_SQL = {
+    "areas": _SCD2_DIM_UNCOVERED_REFS_SQL.format(table="areas", key="area_id"),
+    "devices": _SCD2_DIM_UNCOVERED_REFS_SQL.format(table="devices", key="device_id"),
+}
+
+
+def _per_dimension(template: str) -> dict[str, str]:
     """Bind a {table}/{key} template to every SCD2 dimension."""
     return {
         table: template.format(table=table, key=key)
@@ -920,17 +1044,20 @@ SCD2_CHECK_SKIPPED = -1
 #
 # The metadata either side of the gap is compared too, with modified_at stripped
 # (HA rewrites it on every internal registry write, which is why the
-# integration's own change detection ignores it). Identical payloads mean the
-# gap could be closed without asserting anything new; differing payloads mean
-# the era genuinely cannot be attributed to either version.
+# integration's own change detection ignores it) and ha_entity_uuid included
+# (an entity_id reused by a new registry entry is a different entity, however
+# alike the two look). Identical payloads mean the gap could be closed without
+# asserting anything new; differing payloads mean the era genuinely cannot be
+# attributed to either version. The answer drives --merge-identical-gaps, so it
+# must ask exactly the question SCD2_MERGE_PLAN_SQL asks.
 SCD2_SUSPICIOUS_GAPS_SQL = f"""
 WITH ordered AS (
     SELECT entity_id, valid_from, valid_to,
-           (name, domain, platform, device_id, area_id, labels,
+           (ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
             device_class, unit_of_measurement, disabled_by)::text AS payload,
            (extra - 'modified_at')::text AS extra_cmp,
            lead(valid_from) OVER w AS gap_end,
-           lead((name, domain, platform, device_id, area_id, labels,
+           lead((ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
                  device_class, unit_of_measurement, disabled_by)::text) OVER w AS next_payload,
            lead((extra - 'modified_at')::text) OVER w AS next_extra
     FROM entities t
@@ -985,10 +1112,15 @@ SCD2_NO_CURRENT_VERSION_SQL = _per_dimension(_SCD2_NO_CURRENT_VERSION_SQL)
 # ---- Opt-in: merge identical versions separated by a contradicted gap --------
 #
 # Two consecutive versions of one entity, separated by a period no version
-# covers, carrying identical payloads, with `states` proving the entity was
-# recording throughout that period. The gap is not a real absence, and the two
-# rows describe the same unchanged entity, so they are one version split in
-# half by a lost write.
+# covers, carrying identical payloads, with `states` showing the entity was
+# still producing data inside that period. The gap is not a real absence, and
+# the two rows describe the same unchanged entity, so they are one version split
+# in half by a lost write.
+#
+# What the `states` probe proves is weaker than continuous recording: it says at
+# least one state landed inside the gap, so the entity existed then. That is
+# enough to rule out a real absence and is all the fact table can honestly say —
+# an entity can be alive and silent for hours.
 #
 # Merging replaces them with a single row spanning both — the earlier row's
 # valid_to is extended to the later row's valid_to, and the later row is deleted
@@ -1000,6 +1132,11 @@ SCD2_NO_CURRENT_VERSION_SQL = _per_dimension(_SCD2_NO_CURRENT_VERSION_SQL)
 # which the rest of the repair never does. Entities only — the other dimensions
 # have no fact table to corroborate a gap against.
 #
+# `payload` includes ha_entity_uuid: an entity_id freed by a deletion and taken
+# by a new registry entry produces two versions that can be identical in every
+# user-visible field while being different entities. Merging across that would
+# delete the newer identity and assert a continuity that never existed.
+#
 # `payload` deliberately excludes modified_at, which HA rewrites on every
 # internal registry write; the integration's own change detection ignores it for
 # the same reason.
@@ -1007,13 +1144,13 @@ SCD2_MERGE_PLAN_SQL = """
 CREATE TEMP TABLE scd2_merge_plan ON COMMIT DROP AS
 WITH ordered AS (
     SELECT ctid AS rid, entity_id, valid_from, valid_to,
-           (name, domain, platform, device_id, area_id, labels,
+           (ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
             device_class, unit_of_measurement, disabled_by)::text AS payload,
            (extra - 'modified_at')::text AS extra_cmp,
            lead(ctid)       OVER w AS next_rid,
            lead(valid_from) OVER w AS next_from,
            lead(valid_to)   OVER w AS next_to,
-           lead((name, domain, platform, device_id, area_id, labels,
+           lead((ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
                  device_class, unit_of_measurement, disabled_by)::text) OVER w AS next_payload,
            lead((extra - 'modified_at')::text) OVER w AS next_extra
       FROM entities t
@@ -1038,21 +1175,29 @@ SELECT m.rid, m.next_rid, m.entity_id, m.next_to
  WHERE NOT EXISTS (SELECT 1 FROM mergeable m2 WHERE m2.next_rid = m.rid);
 """
 
+# Every reference is schema-qualified for the same reason as the DROP below: a
+# plan statement must never be able to resolve to a permanent table.
 SCD2_MERGE_ARCHIVE_SQL = """
 INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
 SELECT %s, 'entities', p.entity_id, 'merged_into_previous_version', to_jsonb(b)
-  FROM scd2_merge_plan p JOIN entities b ON b.ctid = p.next_rid;
+  FROM pg_temp.scd2_merge_plan p JOIN entities b ON b.ctid = p.next_rid;
 """
 
 # Extends the surviving row to cover both eras. valid_from is untouched.
 SCD2_MERGE_EXTEND_SQL = """
 UPDATE entities a SET valid_to = p.next_to
-  FROM scd2_merge_plan p WHERE a.ctid = p.rid;
+  FROM pg_temp.scd2_merge_plan p WHERE a.ctid = p.rid;
 """
 
 SCD2_MERGE_DELETE_SQL = """
-DELETE FROM entities d USING scd2_merge_plan p WHERE d.ctid = p.next_rid;
+DELETE FROM entities d USING pg_temp.scd2_merge_plan p WHERE d.ctid = p.next_rid;
 """
 
-SCD2_MERGE_PLAN_COUNT_SQL = "SELECT count(*) FROM scd2_merge_plan;"
-SCD2_MERGE_PLAN_DROP_SQL = "DROP TABLE IF EXISTS scd2_merge_plan;"
+SCD2_MERGE_PLAN_COUNT_SQL = "SELECT count(*) FROM pg_temp.scd2_merge_plan;"
+
+# pg_temp is not tidiness. On the first pass no temp table exists yet, so an
+# unqualified DROP resolves through search_path and would take a PERMANENT table
+# of that name with it — outside the backups, outside the quarantine, gone. The
+# schema qualification makes the statement incapable of naming anything but this
+# transaction's own temp table.
+SCD2_MERGE_PLAN_DROP_SQL = "DROP TABLE IF EXISTS pg_temp.scd2_merge_plan;"

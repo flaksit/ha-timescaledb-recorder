@@ -98,6 +98,8 @@ try:
         SCD2_REPAIR_LOCK_TIMEOUT_SQL,
         SCD2_REPAIR_REBUILD_PREVIEW_SQL,
         SCD2_REPAIR_REBUILD_SQL,
+        SCD2_DIM_UNCOVERED_REFS_SQL,
+        SCD2_STATES_UNCOVERED_SQL,
         SCD2_STATES_WITHOUT_DIM_SQL,
         SCD2_SUSPICIOUS_GAPS_SQL,
         SCD2_MERGE_ARCHIVE_SQL,
@@ -136,6 +138,8 @@ except ImportError:
         SCD2_REPAIR_LOCK_TIMEOUT_SQL,
         SCD2_REPAIR_REBUILD_PREVIEW_SQL,
         SCD2_REPAIR_REBUILD_SQL,
+        SCD2_DIM_UNCOVERED_REFS_SQL,
+        SCD2_STATES_UNCOVERED_SQL,
         SCD2_STATES_WITHOUT_DIM_SQL,
         SCD2_SUSPICIOUS_GAPS_SQL,
         SCD2_MERGE_ARCHIVE_SQL,
@@ -175,7 +179,16 @@ def _detect_pg_dsn() -> str:
 
 
 def _redact(dsn: str) -> str:
-    return re.sub(r"(://[^:@]+:)[^@]+(@)", r"\1***\2", dsn) if "@" in dsn else dsn
+    """Mask the password in either DSN form before it reaches stdout.
+
+    Both forms occur in the wild and both get printed: the URI form
+    (postgresql://user:pw@host/db) and the keyword form (host=x password=pw).
+    Missing the second one put a plaintext password in the terminal scrollback
+    and in any log the operator pasted into an issue.
+    """
+    if "@" in dsn:
+        dsn = re.sub(r"(://[^:@/]+:)[^@]+(@)", r"\1***\2", dsn)
+    return re.sub(r"(?i)\bpassword\s*=\s*('(?:[^']|'')*'|\S+)", "password=***", dsn)
 
 
 def _scalar(cur, sql: str, params: tuple = ()) -> object:
@@ -259,6 +272,12 @@ def report_ambiguity(conn: psycopg.Connection) -> dict[str, int]:
     says which version owned the era. The repair keeps every row and lets all but
     one collapse to an empty interval, so no payload is lost, but the collapsed
     versions label no state rows and a human may want to adjudicate.
+
+    Which row survives with a non-empty interval is decided by ctid, i.e.
+    arbitrarily. That is not a shortcut: two payloads claiming the same instant
+    cannot both be right and the data holds nothing that says which is. The
+    count is surfaced here and again in the closing summary so the choice is
+    visible rather than quietly made.
     """
     counts: dict[str, int] = {}
     for table, _key in SCD2_DIMENSIONS:
@@ -272,7 +291,7 @@ def report_ambiguity(conn: psycopg.Connection) -> dict[str, int]:
         if groups:
             print(
                 f"  {table}: {len(groups)} duplicate (id, valid_from) group(s) — "
-                f"{len(identical)} byte-identical, {differing} with differing payloads"
+                f"{len(identical)} with one payload, {differing} with differing payloads"
             )
     return counts
 
@@ -331,6 +350,72 @@ def report_fidelity(conn: psycopg.Connection) -> int:
     return doubts
 
 
+def report_coverage(conn: psycopg.Connection) -> int:
+    """Report states the dimension does not label. Read-only.
+
+    Returns the number of state rows that come back from states_flat with NULL
+    metadata. Three separate causes, reported separately because the answers
+    differ: entities with no dimension row at all, states outside every version
+    an entity does have, and versions pointing at an area or device with no
+    covering version of its own.
+
+    The second one is the reason this exists. The Fidelity section only looks
+    between two versions, so states before an entity's first valid_from and
+    after its last close were invisible to every report here while being
+    exactly the rows a `WHERE device_class = ...` filter silently drops.
+    """
+    with conn.cursor() as cur:
+        cur.execute(SCD2_STATES_WITHOUT_DIM_SQL)
+        orphans = cur.fetchall()
+    if orphans:
+        total = sum(row[1] for row in orphans)
+        print(f"  {len(orphans)} entity_id(s) produced {total} state rows but have "
+              "no row in entities at all. Home Assistant keeps many entities in its "
+              "state machine without an entity-registry entry — sun.sun, zone.home, "
+              "conversation.*, YAML automations and helpers — and those can never "
+              "have a dimension row. This is not missing history and the repair has "
+              "no metadata to invent for them. They still carry a usable `domain` in "
+              "states_flat; the rest of their metadata is genuinely unknown.")
+        for entity_id, states, last_seen in orphans[:5]:
+            print(f"    {entity_id}: {states} states, last seen {last_seen}")
+        if len(orphans) > 5:
+            print(f"    ... and {len(orphans) - 5} more")
+    else:
+        print("  every entity in states has a dimension row")
+
+    with conn.cursor() as cur:
+        cur.execute(SCD2_STATES_UNCOVERED_SQL)
+        uncovered = cur.fetchall()
+    total_uncovered = sum(row[1] for row in uncovered)
+    if uncovered:
+        print(f"  {len(uncovered)} entity_id(s) have a dimension row but {total_uncovered} "
+              "state row(s) fall outside every version of it — before the first "
+              "valid_from, after the last close, or inside a gap. Those come back "
+              "from states_flat with NULL entity metadata. States before the first "
+              "version are normal on an install whose history predates the "
+              "dimension; the rest are worth reading the Fidelity section for.")
+        for entity_id, states, first_seen, last_seen in uncovered[:5]:
+            print(f"    {entity_id}: {states} states, {first_seen} -> {last_seen}")
+        if len(uncovered) > 5:
+            print(f"    ... and {len(uncovered) - 5} more")
+
+    for table, sql in SCD2_DIM_UNCOVERED_REFS_SQL.items():
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            refs = cur.fetchall()
+        if refs:
+            versions = sum(row[1] for row in refs)
+            print(f"  {len(refs)} {table[:-1]} id(s) referenced by {versions} entity "
+                  f"version(s) have no {table[:-1]} version covering that period, so "
+                  f"states in it get NULL {table[:-1]} metadata.")
+            for ref_id, n in refs[:5]:
+                print(f"    {ref_id}: {n} entity version(s)")
+            if len(refs) > 5:
+                print(f"    ... and {len(refs) - 5} more")
+
+    return total_uncovered
+
+
 def preview(conn: psycopg.Connection) -> None:
     """Print how many rows --apply would change, changing nothing."""
     for table, _key in SCD2_DIMENSIONS:
@@ -363,17 +448,16 @@ def repair_table(
         if _scalar(cur, SCD2_REGCLASS_EXISTS_SQL, (backup,)):
             raise RuntimeError(f"Backup table {backup} already exists; refusing to overwrite")
 
+    collapsed = 0
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(SCD2_REPAIR_LOCK_TIMEOUT_SQL)
             cur.execute(SCD2_REPAIR_LOCK_SQL.format(table=table))
             cur.execute(SCD2_REPAIR_BACKUP_SQL.format(backup=backup, table=table))
-            print(f"  {table}: backed up to {backup}")
 
             if collapse_duplicates:
                 cur.execute(SCD2_REPAIR_COLLAPSE_SQL[table], (run_id,))
-                if cur.rowcount:
-                    print(f"  {table}: collapsed {cur.rowcount} byte-identical duplicate(s)")
+                collapsed = cur.rowcount
 
             # Archive before clamping — the clamp discards the recorded close
             # time, so capture it while it still exists.
@@ -389,6 +473,14 @@ def repair_table(
             rebuilt = cur.rowcount
             cur.execute(SCD2_REPAIR_CLAMP_SQL[table])
             clamped = cur.rowcount
+
+    # Reported only after the commit. Announcing the backup from inside the
+    # transaction told the operator a table existed that a later failure in the
+    # same transaction would roll straight back — and the backup is the undo
+    # path, so that is the one line that must never be optimistic.
+    print(f"  {table}: backed up to {backup}")
+    if collapsed:
+        print(f"  {table}: collapsed {collapsed} duplicate(s) sharing a start and payload")
     print(f"  {table}: rebuilt {rebuilt} interval(s), clamped {clamped}")
 
 
@@ -445,6 +537,14 @@ def add_constraints(conn: psycopg.Connection, tables: list[str]) -> list[str]:
     Returns the tables left unprotected. Falls back to a unique index on open rows
     when btree_gist cannot be installed — that catches duplicate open versions but
     not overlaps between closed ones, so it is a degradation, and it says so.
+
+    Bounded by lock_timeout, exactly as the integration's startup DDL is. ADD
+    CONSTRAINT takes ACCESS EXCLUSIVE, and a request for that lock queues behind
+    any open reader and blocks every writer arriving after it. A `SELECT ... FROM
+    states_flat` over the hypertable is minutes long, so without the timeout one
+    analytics query stalls the whole instance's metadata ingestion for as long as
+    it runs. Failing fast leaves the table unprotected, which is reported and
+    retryable; wedging production is neither.
     """
     have_gist = True
     try:
@@ -458,7 +558,10 @@ def add_constraints(conn: psycopg.Connection, tables: list[str]) -> list[str]:
     failed: list[str] = []
     for table in tables:
         try:
-            with conn.cursor() as cur:
+            with conn.transaction(), conn.cursor() as cur:
+                # SET LOCAL, so the bound dies with the transaction rather than
+                # leaking a 10s lock_timeout into the rest of the session.
+                cur.execute(SCD2_REPAIR_LOCK_TIMEOUT_SQL)
                 cur.execute(statements[table])
             print(f"  {table}: invariant enforced")
         except psycopg.Error as exc:
@@ -484,10 +587,13 @@ def parse_args() -> argparse.Namespace:
                            "the Ambiguity/Fidelity/Coverage sections, which scan the "
                            "whole states hypertable. Use --dry-run for those.")
     p.add_argument("--collapse-duplicates", action="store_true",
-                   help="Also delete rows byte-identical to a row that stays "
-                        "(archived to scd2_repair_quarantine first). Off by default: "
-                        "the repair reaches the invariant without deleting anything. "
-                        "Works on an already-clean database too.")
+                   help="Also delete rows sharing a surviving row's id, valid_from "
+                        "and payload (archived to scd2_repair_quarantine first). "
+                        "valid_to is not compared — the rebuild collapses all of "
+                        "them to empty intervals anyway, so none of them can label "
+                        "a state row. Off by default: the repair reaches the "
+                        "invariant without deleting anything. Works on an "
+                        "already-clean database too.")
     p.add_argument("--no-constraints", action="store_true",
                    help="Repair but do not add the exclusion constraints.")
     p.add_argument("--merge-identical-gaps", action="store_true",
@@ -561,31 +667,15 @@ def main() -> int:
 
         print("\nAmbiguity")
         ambiguous = report_ambiguity(conn)
-        if not any(ambiguous.values()):
+        ambiguity_total = sum(ambiguous.values())
+        if not ambiguity_total:
             print("  none")
 
         print("\nFidelity — what the repair cannot decide")
-        report_fidelity(conn)
+        doubts = report_fidelity(conn)
 
-        with conn.cursor() as cur:
-            cur.execute(SCD2_STATES_WITHOUT_DIM_SQL)
-            orphans = cur.fetchall()
         print("\nCoverage (informational — nothing here is repairable)")
-        if orphans:
-            total = sum(row[1] for row in orphans)
-            print(f"  {len(orphans)} entity_id(s) produced {total} state rows but have "
-                  "no row in entities at all. Home Assistant keeps many entities in its "
-                  "state machine without an entity-registry entry — sun.sun, zone.home, "
-                  "conversation.*, YAML automations and helpers — and those can never "
-                  "have a dimension row. This is not missing history and the repair has "
-                  "no metadata to invent for them. They still carry a usable `domain` in "
-                  "states_flat; the rest of their metadata is genuinely unknown.")
-            for entity_id, states, last_seen in orphans[:5]:
-                print(f"    {entity_id}: {states} states, last seen {last_seen}")
-            if len(orphans) > 5:
-                print(f"    ... and {len(orphans) - 5} more")
-        else:
-            print("  every entity in states has a dimension row")
+        uncovered = report_coverage(conn)
 
         # The opt-in flags act on data the invariant already accepts — duplicate
         # payloads and contradicted gaps both pass every check. So they must run
@@ -614,11 +704,15 @@ def main() -> int:
             print("Aborted. Nothing was modified.")
             return 1
 
-        with conn.cursor() as cur:
-            cur.execute(SCD2_QUARANTINE_DDL_SQL)
-            cur.execute(SCD2_QUARANTINE_IDX_SQL)
-
         if mutating:
+            # DDL inside the guard, not before it: a run with nothing to do
+            # skips the confirmation prompt, and a run that skipped confirmation
+            # must not issue DDL either. "--apply asks before its first write"
+            # has to be true of every write, including CREATE TABLE.
+            with conn.cursor() as cur:
+                cur.execute(SCD2_QUARANTINE_DDL_SQL)
+                cur.execute(SCD2_QUARANTINE_IDX_SQL)
+
             # Always the full pass, even for an extras-only run on a clean
             # database: repair_table is what writes the backup tables, and the
             # documented undo path depends on one existing before any row is
@@ -649,6 +743,15 @@ def main() -> int:
             print("\nArchived to scd2_repair_quarantine (run %s)" % run_id)
             for table, reason, count in rows:
                 print(f"  {table}: {count} x {reason}")
+
+        # Restated at the end because the sections above scroll away, and
+        # because none of these three affect the exit code. A run that is
+        # "clean" and a run that is clean but has 86 contradicted gaps must not
+        # look the same to someone reading the last line.
+        print("\nStill open (reported, not repaired — the exit code ignores these)")
+        print(f"  ambiguous (id, valid_from) groups : {ambiguity_total}")
+        print(f"  fidelity doubts                   : {doubts}")
+        print(f"  states with no covering version   : {uncovered}")
 
         if unresolved:
             print(f"\nUnresolved: {', '.join(sorted(set(unresolved)))}. "

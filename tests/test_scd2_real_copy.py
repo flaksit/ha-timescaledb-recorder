@@ -1,9 +1,10 @@
 """Repair checks against a copy of a real, damaged database (issue #17).
 
-`test_scd2_invariant_db.py` builds synthetic damage. This module makes no
-assumptions about the contents at all: point it at a restored copy of a real
-instance and every assertion still applies. That is what makes it a meaningful
-rehearsal for the one-shot production run.
+`test_scd2_invariant_db.py` builds synthetic damage. This module assumes nothing
+about WHICH entities or metadata a copy contains — every assertion is written
+against whatever is there. It does assume the copy is damaged, since a clean one
+would make the before/after comparisons vacuous, and it says so in its first two
+tests rather than passing quietly.
 
 Load a copy first — dimension tables in full, plus enough of `states` to measure
 join fan-out — then:
@@ -11,8 +12,13 @@ join fan-out — then:
     SCD2_REAL_COPY_DSN=postgresql://postgres:pw@127.0.0.1:5601/homeassistant \
         uv run pytest tests/test_scd2_real_copy.py
 
+The tests run in order and share one connection: the module repairs the copy in
+place, so each test builds on the previous one's result. Selecting a single test
+out of the middle proves less than running the module.
+
 NEVER point this at production: it repairs, and it drops nothing but does write.
-The module refuses to run against a host that is not loopback.
+The module refuses to run against anything but a loopback server unless
+SCD2_ALLOW_DESTRUCTIVE=1 says the target really is disposable.
 """
 import os
 import threading
@@ -31,6 +37,7 @@ from custom_components.timescaledb_recorder.meta_worker import (  # noqa: E402
 from custom_components.timescaledb_recorder.registry_listener import (  # noqa: E402
     RegistryListener,
 )
+from tests.db_guard import assert_disposable  # noqa: E402
 
 DSN = os.environ.get("SCD2_REAL_COPY_DSN")
 
@@ -52,13 +59,13 @@ def _clean() -> dict:
 @pytest.fixture(scope="module")
 def conn():
     with psycopg.connect(DSN, autocommit=True) as c:
-        with c.cursor() as cur:
-            cur.execute("SELECT coalesce(host(inet_server_addr()), 'local')")
-            host = cur.fetchone()[0]
-        # Loopback / container-local only. The repair mutates; a stray DSN
-        # pointing at the live instance must fail here, not halfway through.
-        assert host.startswith(("127.", "172.", "::1")) or host == "local", (
-            f"refusing to run against non-local host {host!r}")
+        # The repair mutates; a stray DSN pointing at the live instance must
+        # fail here, not halfway through. The old check asked the SERVER for its
+        # address and accepted 172.16/12, which is the Docker bridge — precisely
+        # where a production container answers. This asks where the client was
+        # pointed instead. No size check: a large `states` is what this module
+        # wants, and the repair works behind a backup rather than dropping.
+        assert_disposable(c, max_states=None)
         yield c
 
 
@@ -71,6 +78,7 @@ def baseline(conn):
         "valid_from": _valid_from_checksum(conn),
         "fanout": _fanout(conn),
         "states_flat": _states_flat_count(conn),
+        "gaps": _gap_set(conn),
     }
 
 
@@ -85,6 +93,49 @@ def _row_counts(conn) -> dict:
             cur.execute(f"SELECT count(*) FROM {table}")
             out[table] = cur.fetchone()[0]
     return out
+
+
+def _gap_set(conn) -> set:
+    """Every period an entity's history leaves uncovered, as (id, start, end).
+
+    "The repair preserves gaps" was asserted only on synthetic data, where the
+    fixture has exactly one. On real history the rebuild touches thousands of
+    intervals, and shrink-only is what stops it erasing a legitimate
+    remove-then-recreate gap — so the claim needs checking against data that
+    actually has them.
+
+    greatest(...) mirrors the clamp and the window tiebreak mirrors the rebuild
+    plan, so a gap is measured the same way before and after.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT entity_id, gap_start, gap_end FROM (
+                SELECT entity_id,
+                       greatest(valid_to, valid_from) AS gap_start,
+                       lead(valid_from) OVER (
+                           PARTITION BY entity_id
+                           ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid
+                       ) AS gap_end
+                  FROM entities
+                 WHERE valid_to IS NOT NULL) g
+             WHERE gap_end IS NOT NULL AND gap_start < gap_end""")
+        return set(cur.fetchall())
+
+
+def _eras(conn) -> dict:
+    """Every recorded interval per entity_id, open rows as (from, None)."""
+    out: dict = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT entity_id, valid_from, valid_to FROM entities")
+        for entity_id, valid_from, valid_to in cur.fetchall():
+            out.setdefault(entity_id, []).append((valid_from, valid_to))
+    return out
+
+
+def _covers(eras: list, start, end) -> bool:
+    """Does any era overlap [start, end)?"""
+    return any(era_from < end and (era_to is None or era_to > start)
+               for era_from, era_to in eras)
 
 
 def _valid_from_checksum(conn) -> dict:
@@ -156,6 +207,22 @@ def test_repair_wrote_no_valid_from(conn, baseline):
 
 def test_repair_deleted_nothing(conn, baseline):
     assert _row_counts(conn) == baseline["rows"]
+
+
+def test_repair_preserved_every_gap(conn, baseline):
+    """Shrink-only means a gap can widen but must never be filled.
+
+    A gap is a period the dimension says nothing existed. Closing one would
+    invent metadata continuity, and on real history that would be thousands of
+    silent inventions rather than the single synthetic case the other module
+    covers. Checked as coverage rather than as equal tuples: the rebuild moves a
+    gap's start earlier when it shrinks an overrunning interval, which widens
+    the gap without filling any of it.
+    """
+    eras = _eras(conn)
+    filled = [(eid, start, end) for eid, start, end in baseline["gaps"]
+              if _covers(eras.get(eid, []), start, end)]
+    assert filled == [], f"{len(filled)} gap(s) were filled in by the repair"
 
 
 def test_fanout_is_gone(conn):

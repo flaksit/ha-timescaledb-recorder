@@ -10,9 +10,11 @@ answer. Skipped automatically when no database is reachable.
     SCD2_TEST_DSN=postgresql://postgres:pw@127.0.0.1:5599/hatest uv run pytest \
         tests/test_scd2_invariant_db.py
 
-To run against a copy of real data, restore the four dimension tables into that
-database first — the assertions are written to hold for any history, not just the
-synthetic fixture.
+DESTRUCTIVE. The `damaged` fixture drops and recreates entities, devices, areas,
+labels and states, so this module needs a scratch database of its own and refuses
+to run against anything but a loopback server (see tests/db_guard.py). Point it at
+a copy of real data and the copy is gone — use tests/test_scd2_real_copy.py for
+that, which repairs in place instead of rebuilding.
 """
 import os
 import threading
@@ -31,6 +33,7 @@ from custom_components.timescaledb_recorder.meta_worker import (  # noqa: E402
 from custom_components.timescaledb_recorder.registry_listener import (  # noqa: E402
     RegistryListener,
 )
+from tests.db_guard import assert_disposable  # noqa: E402
 
 DSN = os.environ.get("SCD2_TEST_DSN")
 
@@ -87,6 +90,8 @@ OTHER_DAMAGE = [
 @pytest.fixture
 def conn():
     with psycopg.connect(DSN, autocommit=True) as c:
+        # Before the first DROP, not after: a wrong DSN must cost nothing.
+        assert_disposable(c)
         yield c
 
 
@@ -95,7 +100,7 @@ def damaged(conn):
     """A schema holding the issue's evidence plus every other damage shape."""
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS entities, devices, areas, labels, states,"
-                    " scd2_repair_quarantine CASCADE")
+                    " scd2_repair_quarantine, metadata_deadletter CASCADE")
         cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE %s",
                     ("%_prerepair_%",))
         for (name,) in cur.fetchall():
@@ -103,7 +108,8 @@ def damaged(conn):
         for ddl in (const.CREATE_DIM_ENTITIES_SQL, const.CREATE_DIM_DEVICES_SQL,
                     const.CREATE_DIM_AREAS_SQL, const.CREATE_DIM_LABELS_SQL,
                     const.CREATE_TABLE_SQL, const.SCD2_QUARANTINE_DDL_SQL,
-                    const.SCD2_QUARANTINE_IDX_SQL):
+                    const.SCD2_QUARANTINE_IDX_SQL,
+                    const.METADATA_DEADLETTER_DDL_SQL):
             cur.execute(ddl)
         for eid, name, vf, vt in EVIDENCE_ROWS + OTHER_DAMAGE:
             cur.execute(
@@ -295,7 +301,7 @@ def test_repair_refuses_to_overwrite_an_existing_backup(damaged):
         repair_scd2.repair_table(damaged, "entities", "same", "same", False)
 
 
-def test_collapse_duplicates_removes_only_byte_identical_rows(damaged):
+def test_collapse_duplicates_removes_only_rows_with_the_same_payload(damaged):
     _repair(damaged, "c1", collapse=True)
     with damaged.cursor() as cur:
         cur.execute("SELECT count(*) FROM entities WHERE entity_id='sensor.twins'")
@@ -303,7 +309,7 @@ def test_collapse_duplicates_removes_only_byte_identical_rows(damaged):
         cur.execute("SELECT count(*) FROM entities WHERE entity_id='sensor.ambig'")
         assert cur.fetchone()[0] == 2, "differing payloads must never be deleted"
         cur.execute("SELECT count(*) FROM scd2_repair_quarantine"
-                    " WHERE reason='duplicate_identical_payload'")
+                    " WHERE reason='duplicate_same_start_same_payload'")
         assert cur.fetchone()[0] == 1
 
 
@@ -375,10 +381,10 @@ def clean_db(conn):
     """Empty, constrained dimensions — the state a fresh install starts in."""
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS entities, devices, areas, labels, states,"
-                    " scd2_repair_quarantine CASCADE")
+                    " scd2_repair_quarantine, metadata_deadletter CASCADE")
         for ddl in (const.CREATE_DIM_ENTITIES_SQL, const.CREATE_DIM_DEVICES_SQL,
                     const.CREATE_DIM_AREAS_SQL, const.CREATE_DIM_LABELS_SQL,
-                    const.CREATE_TABLE_SQL):
+                    const.CREATE_TABLE_SQL, const.METADATA_DEADLETTER_DDL_SQL):
             cur.execute(ddl)
     assert repair_scd2.add_constraints(
         conn, [t for t, _k in const.SCD2_DIMENSIONS]) == []
@@ -585,8 +591,11 @@ def test_merge_flag_closes_a_contradicted_gap(damaged):
     with damaged.cursor() as cur:
         cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
                     " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
-        # Make the two sensor.gap versions identical, so they qualify.
-        cur.execute("UPDATE entities SET name='A' WHERE entity_id='sensor.gap'")
+        # Make the two sensor.gap versions identical, so they qualify. The
+        # registry UUID counts: two versions of ONE entity share it, and the
+        # fixture gives each row its own.
+        cur.execute("UPDATE entities SET name='A', ha_entity_uuid='uuid-A'"
+                    " WHERE entity_id='sensor.gap'")
         cur.execute(const.CREATE_VIEW_STATES_NUMERIC_SQL)
         cur.execute(const.CREATE_VIEW_STATES_FLAT_SQL)
 
@@ -650,8 +659,10 @@ def test_opt_in_steps_still_run_on_an_already_clean_database(damaged, monkeypatc
     with damaged.cursor() as cur:
         cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
                     " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
-        # Make sensor.gap's two versions identical, so the pair qualifies to merge.
-        cur.execute("UPDATE entities SET name='A' WHERE entity_id='sensor.gap'")
+        # Make sensor.gap's two versions identical, so the pair qualifies to
+        # merge — same registry UUID included.
+        cur.execute("UPDATE entities SET name='A', ha_entity_uuid='uuid-A'"
+                    " WHERE entity_id='sensor.gap'")
 
     assert _run_main(monkeypatch, "--apply") == 0
     assert _violations(damaged) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
@@ -705,3 +716,244 @@ def test_states_flat_stops_fanning_out_after_repair(damaged):
     with damaged.cursor() as cur:
         cur.execute("SELECT count(*) FROM states_flat WHERE entity_id=%s", (EID,))
         assert cur.fetchone()[0] == 10
+
+
+# ---------------------------------------------------------------------------
+# Findings from the cross-AI review of the #17 fix. Each of these failed before
+# the corresponding change and is here so it cannot come back quietly.
+# ---------------------------------------------------------------------------
+
+def test_two_changes_at_one_timestamp_are_counted_not_taken_for_a_replay(
+    worker, clean_db
+):
+    """A lost change must never be filed as a harmless replay.
+
+    Replay detection used to ask only "does an open row start at this item's
+    valid_from?". Two changes stamped identically both answer yes, so the second
+    one — a different payload that the ordering guard refused — was logged at
+    debug as an already-applied replay and left out of the skip count. The probe
+    now compares the payload too.
+    """
+    worker._write_item_raw(_entity_item("create", "sensor.tie", "first", BASE))
+    worker._write_item_raw(_entity_item("update", "sensor.tie", "second", BASE))
+
+    assert worker.out_of_order_skips == 1, "the lost change must be counted"
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT name FROM entities WHERE valid_to IS NULL")
+        assert cur.fetchall() == [("first",)]
+        cur.execute("SELECT count(*) FROM metadata_deadletter WHERE reason=%s",
+                    (const.DEADLETTER_REASON_OUT_OF_ORDER,))
+        assert cur.fetchone()[0] == 1, "and recorded where a restart cannot erase it"
+
+
+def test_a_genuine_replay_is_still_silent(worker, clean_db):
+    """The payload comparison must not turn routine replays into false alarms.
+
+    task_done() runs after the write, so any unclean shutdown replays an item.
+    If those counted, the skip counter would be non-zero on every install and
+    would stop meaning anything.
+    """
+    worker._write_item_raw(_entity_item("create", "sensor.replay", "n", BASE))
+    update = _entity_item("update", "sensor.replay", "n2", BASE + timedelta(seconds=1))
+    worker._write_item_raw(update)
+    worker._write_item_raw(update)
+
+    assert worker.out_of_order_skips == 0
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM metadata_deadletter")
+        assert cur.fetchone()[0] == 0
+
+
+def test_a_removal_the_guard_refuses_is_counted(worker, clean_db):
+    """A "remove" has no insert to fall back on, so nothing else notices it failed.
+
+    Close the row at a timestamp at or before its own valid_from and the
+    `valid_from < close_ts` guard matches nothing. The version stays open and
+    the dimension goes on claiming the entity exists — silently, until now.
+    """
+    worker._write_item_raw(_entity_item("create", "sensor.ghost", "n", BASE))
+    worker._write_item_raw({
+        "registry": "entity", "action": "remove", "registry_id": "sensor.ghost",
+        "old_id": None, "params": None,
+        "enqueued_at": (BASE - timedelta(seconds=1)).isoformat(),
+    })
+
+    assert worker.out_of_order_skips == 1
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM entities WHERE valid_to IS NULL")
+        assert cur.fetchone()[0] == 1, "the version the removal failed to close"
+        cur.execute("SELECT count(*) FROM metadata_deadletter WHERE reason=%s",
+                    (const.DEADLETTER_REASON_OUT_OF_ORDER,))
+        assert cur.fetchone()[0] == 1
+
+
+def test_a_removal_replay_is_silent(worker, clean_db):
+    """Closing an already-closed version writes nothing and loses nothing."""
+    worker._write_item_raw(_entity_item("create", "sensor.gone", "n", BASE))
+    remove = {
+        "registry": "entity", "action": "remove", "registry_id": "sensor.gone",
+        "old_id": None, "params": None,
+        "enqueued_at": (BASE + timedelta(seconds=5)).isoformat(),
+    }
+    worker._write_item_raw(remove)
+    worker._write_item_raw(remove)
+
+    assert worker.out_of_order_skips == 0
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM metadata_deadletter")
+        assert cur.fetchone()[0] == 0
+
+
+def test_an_item_the_constraint_rejects_survives_in_the_dead_letter(worker, clean_db):
+    """Dropping the item keeps the queue moving; it must not lose the change.
+
+    The counter is in memory and the log rotates, so before the dead-letter
+    table the only record of a dropped registry change could be gone by the time
+    anyone looked.
+    """
+    # An open version starting inside a closed interval of the same id: the
+    # exclusion constraint refuses it, and no not-exists guard catches it first.
+    with clean_db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO entities (entity_id, ha_entity_uuid, name, domain,"
+            " valid_from, valid_to) VALUES (%s,%s,%s,%s,%s,%s)",
+            ("sensor.dup", "u", "n", "sensor", BASE, BASE + timedelta(days=1)))
+    worker._write_item_raw(
+        _entity_item("create", "sensor.dup", "n2", BASE + timedelta(hours=1)))
+
+    assert worker.integrity_drops == 1
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT registry, registry_id, item FROM metadata_deadletter"
+                    " WHERE reason=%s", (const.DEADLETTER_REASON_INTEGRITY,))
+        rows = cur.fetchall()
+    assert len(rows) == 1
+    registry, registry_id, item = rows[0]
+    assert (registry, registry_id) == ("entity", "sensor.dup")
+    assert item["action"] == "create", "the whole item must be replayable by hand"
+
+
+def test_merge_refuses_two_versions_with_different_entity_uuids(damaged):
+    """An entity_id freed by a deletion and re-taken is not one entity.
+
+    Every user-visible field can match while the registry UUID differs, and
+    merging then deletes the newer identity and asserts a continuity that never
+    happened. The payload comparison includes ha_entity_uuid so it cannot.
+    """
+    in_gap = BASE + timedelta(days=2)
+    with damaged.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
+        # Identical in everything the merge used to look at...
+        cur.execute("UPDATE entities SET name='A', ha_entity_uuid='uuid-A'"
+                    " WHERE entity_id='sensor.gap'")
+        # ...but a different registry entry either side of the gap.
+        cur.execute("UPDATE entities SET ha_entity_uuid='uuid-second'"
+                    " WHERE entity_id='sensor.gap' AND valid_from > %s", (BASE,))
+    _repair(damaged)
+
+    assert repair_scd2.merge_identical_gaps(damaged, "uuidtest") == 0
+    with damaged.cursor() as cur:
+        cur.execute("SELECT count(*) FROM entities WHERE entity_id='sensor.gap'")
+        assert cur.fetchone()[0] == 2, "both identities must survive"
+
+
+def test_the_gap_report_also_treats_a_uuid_change_as_different(damaged):
+    """The report drives the flag, so it has to ask the same question."""
+    in_gap = BASE + timedelta(days=2)
+    with damaged.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,%s)", (in_gap, in_gap, "sensor.gap", "7"))
+        cur.execute("UPDATE entities SET name='A', ha_entity_uuid='uuid-A'"
+                    " WHERE entity_id='sensor.gap'")
+        cur.execute("UPDATE entities SET ha_entity_uuid='uuid-second'"
+                    " WHERE entity_id='sensor.gap' AND valid_from > %s", (BASE,))
+    _repair(damaged)
+
+    with damaged.cursor() as cur:
+        cur.execute(const.SCD2_SUSPICIOUS_GAPS_SQL)
+        gaps = {row[0]: row[4] for row in cur.fetchall()}
+    assert gaps.get("sensor.gap") is False, (
+        "a different registry entry must not be reported as 'same metadata'")
+
+
+def test_the_merge_plan_cannot_drop_a_permanent_table_of_the_same_name(damaged):
+    """The plan's DROP runs before its temp table exists.
+
+    Unqualified, it resolved through search_path and would have taken a
+    permanent scd2_merge_plan with it — a table outside the backups and outside
+    the quarantine, so no undo path covered it.
+    """
+    with damaged.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS public.scd2_merge_plan")
+        cur.execute("CREATE TABLE public.scd2_merge_plan (keep_me text)")
+        cur.execute("INSERT INTO public.scd2_merge_plan VALUES ('irreplaceable')")
+    _repair(damaged)
+
+    repair_scd2.merge_identical_gaps(damaged, "droptest")
+
+    with damaged.cursor() as cur:
+        cur.execute("SELECT keep_me FROM public.scd2_merge_plan")
+        assert cur.fetchall() == [("irreplaceable",)]
+        cur.execute("DROP TABLE public.scd2_merge_plan")
+
+
+def test_coverage_finds_states_outside_every_version(damaged):
+    """Fidelity only looks between two versions.
+
+    States before an entity's first valid_from and after its last close come
+    back from states_flat with NULL metadata just the same, and nothing counted
+    them — so a report could say "clean" while a filter on device_class silently
+    dropped years of history.
+    """
+    before = BASE - timedelta(days=10)
+    after = BASE + timedelta(days=400)
+    with damaged.cursor() as cur:
+        for ts in (before, after):
+            cur.execute(
+                "INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                " VALUES (%s,%s,%s,%s)", (ts, ts, "sensor.clean", "1"))
+    _repair(damaged)
+
+    with damaged.cursor() as cur:
+        cur.execute(const.SCD2_STATES_UNCOVERED_SQL)
+        uncovered = {row[0]: row[1] for row in cur.fetchall()}
+    # sensor.clean's newest version is still open, so it runs to infinity and
+    # covers the later state. Only the leading edge is uncovered.
+    assert uncovered.get("sensor.clean") == 1, "the state before the first version"
+
+    # Close that version — an entity removed from HA — and the trailing edge
+    # appears too. Both are NULL metadata in states_flat; neither was counted
+    # anywhere before.
+    with damaged.cursor() as cur:
+        cur.execute("UPDATE entities SET valid_to = %s"
+                    " WHERE entity_id='sensor.clean' AND valid_to IS NULL",
+                    (BASE + timedelta(days=2),))
+        cur.execute(const.SCD2_STATES_UNCOVERED_SQL)
+        uncovered = {row[0]: row[1] for row in cur.fetchall()}
+    assert uncovered.get("sensor.clean") == 2
+
+
+def test_the_backup_tables_restore_the_pre_repair_state(damaged, monkeypatch):
+    """The documented undo path, exercised rather than asserted.
+
+    CREATE TABLE AS copies rows and nothing else, and the rows it copies are the
+    damaged ones the new exclusion constraint rejects — so the order matters:
+    drop the constraint, restore, and only then repair again.
+    """
+    before = _snapshot(damaged)
+    assert _run_main(monkeypatch, "--apply") == 0
+    assert _violations(damaged) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+
+    with damaged.cursor() as cur:
+        cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE %s",
+                    ("entities_prerepair_%",))
+        backup = cur.fetchone()[0]
+        cur.execute("ALTER TABLE entities DROP CONSTRAINT excl_entities_period")
+        cur.execute("TRUNCATE entities")
+        cur.execute(f"INSERT INTO entities SELECT * FROM {backup}")
+
+    assert _snapshot(damaged) == before, "the backup must reproduce the damage exactly"
+
+    _drop_backups(damaged)
+    assert _run_main(monkeypatch, "--apply") == 0
+    assert _violations(damaged) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}

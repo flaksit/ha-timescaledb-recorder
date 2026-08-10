@@ -31,15 +31,20 @@ from typing import TYPE_CHECKING
 
 import psycopg
 import psycopg.rows
+from psycopg.types.json import Jsonb
 
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    DEADLETTER_REASON_INTEGRITY,
+    DEADLETTER_REASON_OUT_OF_ORDER,
+    METADATA_DEADLETTER_INSERT_SQL,
     SCD2_CLOSE_AREA_SQL,
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
     SCD2_CLOSE_LABEL_SQL,
     SCD2_OPEN_VERSION_AT_SQL,
+    SCD2_OPEN_VERSION_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
     SCD2_SNAPSHOT_DEVICE_SQL,
     SCD2_SNAPSHOT_ENTITY_SQL,
@@ -50,6 +55,7 @@ from .issues import (
     clear_meta_worker_stalled_issue,
     create_db_unreachable_issue,
     create_meta_worker_stalled_issue,
+    create_metadata_dropped_issue,
 )
 from .retry import retry_until_success
 
@@ -107,12 +113,15 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         self._last_retry_attempt: int | None = None
         # Count of items dropped because they violated the SCD2 invariant. Any
         # non-zero value means metadata history has a hole and warrants a look.
+        # In-process only, and reset by a restart — metadata_deadletter is the
+        # durable record; these are the cheap in-memory view of it.
         self.integrity_drops: int = 0
-        # Count of updates that landed out of order and were therefore skipped
-        # rather than spliced into history. Should stay 0: the registry listener
-        # guarantees queue order. Non-zero means that guarantee broke. Replays of
-        # an already-applied item also write nothing, but they lose no history and
-        # are excluded — see _note_version_skipped.
+        # Count of changes that landed out of order and were therefore skipped
+        # rather than spliced into history — updates whose close+insert matched
+        # nothing, and removals the ordering guard refused. Should stay 0: the
+        # registry listener guarantees queue order. Non-zero means that guarantee
+        # broke. Replays of an already-applied item also write nothing, but they
+        # lose no history and are excluded — see _note_version_skipped.
         self.out_of_order_skips: int = 0
 
         # retry_until_success is applied to the bound method at __init__ time so
@@ -284,17 +293,48 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         never gives up, so one bad item would wedge every later metadata write
         and silently stop the dimension tables from tracking anything. Dropping
         it keeps ingestion alive; the constraint has already done its job by
-        refusing the write, and the ERROR log carries the item for diagnosis.
+        refusing the write.
+
+        Dropping is not forgetting. The item goes to the dead-letter table
+        first, so the change survives the restart that erases the counter and
+        the log rotation that erases the traceback, and a repair issue puts it
+        in front of the operator. A drop nobody can see is the failure mode that
+        made issue #17 last for months.
         """
         try:
             self._dispatch_item(item)
-        except (psycopg.errors.ExclusionViolation, psycopg.errors.UniqueViolation):
+        except (psycopg.errors.ExclusionViolation, psycopg.errors.UniqueViolation) as err:
             self.integrity_drops += 1
             _LOGGER.error(
                 "%s: SCD2 invariant rejected a metadata write; dropping the item to "
                 "keep the queue moving (total dropped: %d). Item: %r",
                 self.name, self.integrity_drops, item, exc_info=True,
             )
+            self._dead_letter(item, DEADLETTER_REASON_INTEGRITY, str(err))
+
+    def _dead_letter(self, item: dict, reason: str, error: str) -> None:
+        """Record an item the worker is about to stop trying to write.
+
+        Best-effort by construction: it runs on a connection that has just
+        raised, so the insert gets its own transaction and its own failure
+        handling. If even this fails the log line above is all that is left —
+        which is where this whole path started, so it says so loudly rather
+        than pretending the item was captured.
+        """
+        try:
+            conn = self.get_db_connection()
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute(
+                    METADATA_DEADLETTER_INSERT_SQL,
+                    (reason, item.get("registry"), item.get("registry_id"),
+                     error, Jsonb(item)),
+                )
+        except Exception:  # noqa: BLE001 — the caller has already given up on this item
+            _LOGGER.error(
+                "%s: could not dead-letter the dropped item; it now exists only in "
+                "this log. Item: %r", self.name, item, exc_info=True,
+            )
+        self._hass.add_job(create_metadata_dropped_issue, self._hass)
 
     def _dispatch_item(self, item: dict) -> None:
         """Route one item to the per-registry SCD2 path."""
@@ -317,7 +357,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             _LOGGER.warning("Unknown registry type in metadata item: %s", registry)
 
     def _note_version_skipped(self, cur, registry: str, registry_id: str,
-                          close_ts: datetime) -> None:
+                          close_ts: datetime, params: tuple[object, ...] | None) -> None:
         """Warn when a close+insert pair lost a registry change.
 
         The close carries a `valid_from < new_valid_from` guard and the insert is
@@ -332,27 +372,100 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         routine — task_done() runs after the write, so any shutdown that lands
         mid-item leaves it on disk for next startup — so counting them would make
         `out_of_order_skips` non-zero after the first unclean restart and destroy
-        its value as a signal. The two are told apart by probing for the open row
-        this item itself would have inserted: one starting at exactly this
-        valid_from is that row, so nothing was lost.
+        its value as a signal.
+
+        Telling the two apart needs both halves of the question. The open row
+        must start at exactly this item's valid_from AND carry this item's
+        payload. The timestamp alone is not enough: two changes stamped in the
+        same microsecond produce a second item whose close and insert both match
+        nothing, and an open row does start at its valid_from — so a timestamp-only
+        probe calls a genuinely lost change a replay and does not even count it.
+        The payload comparison closes that hole, and costs one indexed read on a
+        path that only runs when nothing was written.
         """
         if cur.rowcount:
             return
         cur.execute(SCD2_OPEN_VERSION_AT_SQL[registry], (registry_id, close_ts))
-        if cur.fetchone() is not None:
+        if cur.fetchone() is not None and not self._open_row_differs(
+            registry, registry_id, params
+        ):
             _LOGGER.debug(
                 "%s: %s %s was already applied; replay was a no-op",
                 self.name, registry, registry_id,
             )
             return
+        self._note_change_lost(registry, registry_id, close_ts,
+                               "arrived after a newer version")
+
+    def _open_row_differs(self, registry: str, registry_id: str,
+                          params: tuple[object, ...] | None) -> bool:
+        """Does the currently-open row describe something other than `params`?
+
+        Delegates to the registry listener's change-detection helpers so the
+        comparison is the same one that decides whether a change is worth
+        writing at all. Anything else would let the two disagree about what
+        "the same version" means.
+        """
+        if params is None:
+            # No payload to compare against, so nothing can prove this is a
+            # replay. Treat it as a real skip: over-reporting a lost change is
+            # recoverable, under-reporting one is what issue #17 was.
+            return True
+        comparators = {
+            "entity": self._registry_listener._entity_row_changed,
+            "device": self._registry_listener._device_row_changed,
+            "area": self._registry_listener._area_row_changed,
+            "label": self._registry_listener._label_row_changed,
+        }
+        conn = self.get_db_connection()
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+            return comparators[registry](dict_cur, registry_id, params)
+
+    def _note_removal_skipped(self, cur, registry: str, registry_id: str,
+                              close_ts: datetime) -> None:
+        """Warn when a "remove" failed to close anything.
+
+        A removal has no replacement row, so it has no insert to fall back on
+        and nothing downstream notices that it did nothing. Two cases reach
+        here and they are opposites: no open row at all means the removal was
+        already applied and this is a replay, while an open row that survived
+        means the `valid_from < close_ts` guard refused it — the version starts
+        at or after the moment the entity was removed, so the removal is lost
+        and the dimension will go on claiming the thing still exists.
+        """
+        if cur.rowcount:
+            return
+        cur.execute(SCD2_OPEN_VERSION_SQL[registry], (registry_id,))
+        row = cur.fetchone()
+        if row is None:
+            _LOGGER.debug(
+                "%s: %s %s was already closed; replay was a no-op",
+                self.name, registry, registry_id,
+            )
+            return
+        self._note_change_lost(
+            registry, registry_id, close_ts,
+            f"open version starts at {row[0]}, at or after the removal",
+        )
+
+    def _note_change_lost(self, registry: str, registry_id: str,
+                          close_ts: datetime, why: str) -> None:
+        """Count, log and dead-letter a registry change the guards refused.
+
+        Same treatment as an integrity drop: both lose a real change, so both
+        must be equally findable afterwards.
+        """
         self.out_of_order_skips += 1
-        # ERROR, with the item: this drops a real registry change, exactly like
-        # an integrity drop, and the two should be equally findable in the log.
         _LOGGER.error(
-            "%s: %s %s arrived after a newer version and was skipped to keep the "
-            "SCD2 intervals consistent (total skipped: %d). Queue ordering should "
-            "make this impossible. Change was stamped %s.",
-            self.name, registry, registry_id, self.out_of_order_skips, close_ts,
+            "%s: %s %s was skipped to keep the SCD2 intervals consistent — %s "
+            "(total skipped: %d). Queue ordering should make this impossible. "
+            "Change was stamped %s.",
+            self.name, registry, registry_id, why, self.out_of_order_skips, close_ts,
+        )
+        self._dead_letter(
+            {"registry": registry, "registry_id": registry_id,
+             "close_ts": close_ts.isoformat(), "why": why},
+            DEADLETTER_REASON_OUT_OF_ORDER, why,
         )
 
     @staticmethod
@@ -435,13 +548,14 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
             elif action == "remove":
                 cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts))
+                self._note_removal_skipped(cur, "entity", registry_id, close_ts)
             elif action == "update":
                 if old_id is not None:
                     # Rename path — atomic close of the old id + insert under the new.
                     with conn.transaction():
                         cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, old_id, close_ts))
                         cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "entity", registry_id, close_ts)
+                        self._note_version_skipped(cur, "entity", registry_id, close_ts, params)
                 else:
                     # Field-change path. The change-detection read runs inside the
                     # transaction so it and the close+insert see one snapshot.
@@ -455,7 +569,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                                 SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts)
                             )
                             cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                            self._note_version_skipped(cur, "entity", registry_id, close_ts)
+                            self._note_version_skipped(cur, "entity", registry_id, close_ts, params)
 
     # ------------------------------------------------------------------
     # Per-registry dispatch — device/area/label (D-05-c). Mechanical copies
@@ -484,6 +598,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
             elif action == "remove":
                 cur.execute(SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts))
+                self._note_removal_skipped(cur, "device", registry_id, close_ts)
             elif action == "update":
                 with conn.transaction():
                     with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
@@ -495,7 +610,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                             SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts)
                         )
                         cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "device", registry_id, close_ts)
+                        self._note_version_skipped(cur, "device", registry_id, close_ts, params)
 
     def _process_area(
         self,
@@ -518,6 +633,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
             elif action == "remove":
                 cur.execute(SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts))
+                self._note_removal_skipped(cur, "area", registry_id, close_ts)
             elif action == "update":
                 with conn.transaction():
                     with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
@@ -529,7 +645,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                             SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts)
                         )
                         cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "area", registry_id, close_ts)
+                        self._note_version_skipped(cur, "area", registry_id, close_ts, params)
 
     def _process_label(
         self,
@@ -552,6 +668,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
             elif action == "remove":
                 cur.execute(SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts))
+                self._note_removal_skipped(cur, "label", registry_id, close_ts)
             elif action == "update":
                 with conn.transaction():
                     with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
@@ -563,4 +680,4 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                             SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts)
                         )
                         cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "label", registry_id, close_ts)
+                        self._note_version_skipped(cur, "label", registry_id, close_ts, params)

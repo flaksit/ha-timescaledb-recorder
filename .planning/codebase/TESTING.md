@@ -245,11 +245,15 @@ SCD2_TEST_DSN=postgresql://postgres:pw@127.0.0.1:5599/hatest uv run pytest \
     tests/test_scd2_invariant_db.py
 ```
 
-The fixture builds its damage from issue #17's verbatim evidence rows plus every other shape (overlap, inverted interval, remove-then-recreate gap, identical twins, ambiguous same-timestamp versions, already-correct history). Assertions are written to hold for any history, so restoring a copy of real dimension tables into that database and re-running is a valid exercise.
+The fixture builds its damage from issue #17's verbatim evidence rows plus every other shape (overlap, inverted interval, remove-then-recreate gap, identical twins, ambiguous same-timestamp versions, already-correct history).
+
+**This module is destructive.** The fixture drops and recreates `entities`, `devices`, `areas`, `labels` and `states`, so it needs a scratch database of its own — pointing it at a copy of real data destroys the copy. `tests/db_guard.py` refuses any non-loopback target, and additionally refuses a database that already holds more than 1000 state rows, since loopback proves nothing against an SSH tunnel. `SCD2_ALLOW_DESTRUCTIVE=1` overrides both.
 
 `pytest-socket` blocks sockets by default, so the module carries `pytest.mark.enable_socket`.
 
-`tests/test_scd2_real_copy.py` is the counterpart for a restored copy of a real instance. It assumes nothing about the contents — it measures the damage, repairs, and asserts the invariant holds, `valid_from` is byte-identical, no rows were deleted, fan-out is gone, and a burst of registry changes keeps it clean. Set `SCD2_REAL_COPY_DSN` to a **loopback** DSN; the module refuses any non-local host, because it writes.
+`tests/test_scd2_real_copy.py` is the counterpart for a restored copy of a real instance. It assumes nothing about WHICH entities the copy contains — it measures the damage, repairs, and asserts the invariant holds, `valid_from` is byte-identical, no rows were deleted, every pre-repair gap is still uncovered, fan-out is gone, and a burst of registry changes keeps it clean. It does assume the copy is damaged, and fails loudly if it is not, since a clean copy makes the before/after comparisons vacuous. Its tests run in order against one connection.
+
+Set `SCD2_REAL_COPY_DSN` to a **loopback** DSN. The guard checks where the client connected (`conn.info.host`), not what the server reports: a containerised Postgres answers with its bridge address whoever reached it, which is why an earlier version of this check had to allow the whole `172.16/12` range — exactly where a production container lives. No size limit applies here, because a large `states` is the point of this module.
 
 Rehearse under prod's privilege shape, not as superuser: a non-superuser role that owns the tables and has `CREATE` on the database and schema. That is what exercises `CREATE EXTENSION btree_gist` (trusted since PG 13) and `ALTER TABLE ... ADD CONSTRAINT`, and it is where a missing grant would otherwise surface only on the real run.
 

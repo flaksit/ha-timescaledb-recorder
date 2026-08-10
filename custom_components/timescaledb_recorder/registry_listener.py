@@ -7,6 +7,7 @@ from typing import Callable
 
 import attrs
 import psycopg
+import psycopg.rows
 
 from homeassistant.core import HomeAssistant, Event, callback
 from homeassistant.helpers import entity_registry as er
@@ -130,6 +131,16 @@ class RegistryListener:
     processed before the snapshot row exists, causing the SCD2 close/insert to target
     a non-existent row. DISCARD mode eliminates this ordering hazard. The backfill
     captures the registry state at snapshot time; changes after enable() flow normally.
+
+    What DISCARD costs, stated plainly because it is a real hole and not a
+    rounding error (issue #19): the snapshot reads the registries as they are
+    when it runs, so a create or an update inside the window is picked up by it.
+    A REMOVAL is not — the entry is already gone, the snapshot has nothing to
+    see, and the open row stays open indefinitely, so the dimension goes on
+    claiming the thing exists. An entity created and deleted inside the window
+    is never recorded at all. Fixing it means buffering the window's events and
+    enqueuing them ahead of the snapshot; that is issue #19's job, not this
+    class's docstring.
 
     Event ordering (issue #17): handlers append to an in-memory buffer synchronously
     and a single drain task moves the buffer to the PersistentQueue. Each handler
@@ -401,7 +412,7 @@ class RegistryListener:
     # ------------------------------------------------------------------
 
     def _entity_row_changed(
-        self, cur: psycopg.Cursor, entity_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], entity_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open entity row differs from new_params.
 
@@ -427,7 +438,7 @@ class RegistryListener:
         )
 
     def _device_row_changed(
-        self, cur: psycopg.Cursor, device_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], device_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open device row differs from new_params.
 
@@ -448,7 +459,7 @@ class RegistryListener:
         )
 
     def _area_row_changed(
-        self, cur: psycopg.Cursor, area_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], area_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open area row differs from new_params.
 
@@ -464,7 +475,7 @@ class RegistryListener:
         )
 
     def _label_row_changed(
-        self, cur: psycopg.Cursor, label_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], label_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open label row differs from new_params.
 
@@ -668,7 +679,34 @@ class RegistryListener:
         try:
             await self._flush_buffer()
         except Exception:  # noqa: BLE001
-            # Already logged in _flush_buffer. Unload must not fail on this —
-            # the items stay in the buffer and are lost with the listener, which
-            # is strictly better than blocking HA shutdown.
-            _LOGGER.error("Dropped %d buffered registry item(s) on shutdown", len(self._buffer))
+            # Already logged in _flush_buffer, which put the batch back in
+            # _buffer. Try once more synchronously before giving up: the async
+            # path failed in the executor, and by now the drainer is gone and
+            # nothing else can touch the buffer, so a direct append is safe and
+            # a blocking write is affordable on a shutdown path. Only if this
+            # also fails is the change genuinely lost.
+            self._flush_buffer_blocking()
+
+    def _flush_buffer_blocking(self) -> None:
+        """Last-resort synchronous append, for shutdown only.
+
+        Unload must not fail on this — losing the items is bad, blocking HA
+        shutdown is worse — so the failure is reported and swallowed.
+        """
+        batch = self._buffer
+        self._buffer = []
+        if not batch:
+            return
+        try:
+            self._meta_queue.put_many(batch)
+        except Exception:  # noqa: BLE001
+            self._buffer = batch
+            _LOGGER.exception(
+                "Dropped %d buffered registry item(s) on shutdown; the metadata "
+                "queue could not be written even synchronously", len(batch),
+            )
+        else:
+            _LOGGER.warning(
+                "Persisted %d buffered registry item(s) synchronously after the "
+                "shutdown flush failed", len(batch),
+            )

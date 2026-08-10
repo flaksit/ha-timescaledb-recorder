@@ -24,6 +24,8 @@ from .const import (
     CREATE_DIM_LABELS_IDX_SQL,
     CREATE_VIEW_STATES_NUMERIC_SQL,
     CREATE_VIEW_STATES_FLAT_SQL,
+    METADATA_DEADLETTER_DDL_SQL,
+    METADATA_DEADLETTER_IDX_SQL,
     SCD2_BTREE_GIST_SQL,
     SCD2_DDL_LOCK_TIMEOUT_RESET_SQL,
     SCD2_DDL_LOCK_TIMEOUT_SQL,
@@ -159,6 +161,13 @@ def sync_setup_schema(
         cur.execute(CREATE_DIM_DEVICES_IDX_SQL)
         cur.execute(CREATE_DIM_AREAS_IDX_SQL)
         cur.execute(CREATE_DIM_LABELS_IDX_SQL)
+
+        # Where the meta worker records an item it gives up on. Created here,
+        # not by the worker, so the drop path can assume it exists — a worker
+        # that has to CREATE TABLE while handling a failure has two ways to
+        # lose the item instead of one.
+        cur.execute(METADATA_DEADLETTER_DDL_SQL)
+        cur.execute(METADATA_DEADLETTER_IDX_SQL)
 
         # Convenience views — must follow the dimension tables, since
         # states_flat joins them. CREATE OR REPLACE (not IF NOT EXISTS)

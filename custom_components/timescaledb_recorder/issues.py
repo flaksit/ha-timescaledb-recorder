@@ -21,6 +21,7 @@ _STATES_WORKER_STALLED_ID = "states_worker_stalled"
 _META_WORKER_STALLED_ID = "meta_worker_stalled"
 _DB_UNREACHABLE_ID = "db_unreachable"
 _RECORDER_DISABLED_ID = "recorder_disabled"
+_METADATA_DROPPED_ID = "metadata_dropped"
 
 
 @callback
@@ -170,4 +171,25 @@ def clear_recorder_disabled_issue(hass: HomeAssistant) -> None:
     Called if a subsequent startup check finds the recorder available again.
     """
     ir.async_delete_issue(hass, DOMAIN, _RECORDER_DISABLED_ID)
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
+
+
+@callback
+def create_metadata_dropped_issue(hass: HomeAssistant) -> None:
+    """Register the metadata_dropped repair issue (issue #17).
+
+    Fired by the meta worker the first time it gives up on an item. The item
+    itself is in the metadata_deadletter table; this exists so the operator
+    learns that metadata history has a hole without reading the log. Never
+    cleared automatically — the hole does not heal on its own, and a repair
+    issue that disappears on restart would hide exactly what it is for.
+    """
+    ir.async_create_issue(
+        hass,
+        domain=DOMAIN,
+        issue_id=_METADATA_DROPPED_ID,
+        is_fixable=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key=_METADATA_DROPPED_ID,
+    )
     async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)

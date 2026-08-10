@@ -1,9 +1,11 @@
 """Unit tests for RegistryListener (registry relay + SCD2 change-detection helpers)."""
+import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from custom_components.timescaledb_recorder import registry_listener as registry_listener_module
 from custom_components.timescaledb_recorder.registry_listener import RegistryListener, _to_json_safe
 from custom_components.timescaledb_recorder.persistent_queue import PersistentQueue
 
@@ -81,7 +83,7 @@ def test_entity_callback_discarded_before_enable(listener, mock_meta_queue):
     event = MagicMock()
     event.data = {"action": "update", "entity_id": "sensor.temp", "old_entity_id": None}
     listener._handle_entity_registry_updated(event)
-    mock_meta_queue.put_async.assert_not_called()
+    assert listener._buffer == []
 
 
 def test_device_callback_discarded_before_enable(listener, mock_meta_queue):
@@ -90,7 +92,7 @@ def test_device_callback_discarded_before_enable(listener, mock_meta_queue):
     event = MagicMock()
     event.data = {"action": "update", "device_id": "dev-001"}
     listener._handle_device_registry_updated(event)
-    mock_meta_queue.put_async.assert_not_called()
+    assert listener._buffer == []
 
 
 def test_area_callback_discarded_before_enable(listener, mock_meta_queue):
@@ -99,7 +101,7 @@ def test_area_callback_discarded_before_enable(listener, mock_meta_queue):
     event = MagicMock()
     event.data = {"action": "update", "area_id": "area-001"}
     listener._handle_area_registry_updated(event)
-    mock_meta_queue.put_async.assert_not_called()
+    assert listener._buffer == []
 
 
 def test_label_callback_discarded_before_enable(listener, mock_meta_queue):
@@ -108,7 +110,7 @@ def test_label_callback_discarded_before_enable(listener, mock_meta_queue):
     event = MagicMock()
     event.data = {"action": "update", "label_id": "label-001"}
     listener._handle_label_registry_updated(event)
-    mock_meta_queue.put_async.assert_not_called()
+    assert listener._buffer == []
 
 
 def test_entity_callback_enqueues_after_enable(enabled_listener, mock_meta_queue, mock_entity_registry):
@@ -123,8 +125,8 @@ def test_entity_callback_enqueues_after_enable(enabled_listener, mock_meta_queue
     }
     enabled_listener._handle_entity_registry_updated(event)
 
-    mock_meta_queue.put_async.assert_called_once()
-    item = mock_meta_queue.put_async.call_args.args[0]
+    assert len(enabled_listener._buffer) == 1
+    item = enabled_listener._buffer[0]
     assert item["registry"] == "entity"
     assert item["action"] == "update"
 
@@ -145,10 +147,9 @@ def test_entity_callback_enqueues_dict(enabled_listener, mock_meta_queue, mock_e
     }
     enabled_listener._handle_entity_registry_updated(event)
 
-    enabled_listener._hass.async_create_task.assert_called_once()
-    mock_meta_queue.put_async.assert_called_once()
+    assert len(enabled_listener._buffer) == 1
 
-    item = mock_meta_queue.put_async.call_args.args[0]
+    item = enabled_listener._buffer[0]
     assert item["registry"] == "entity"
     assert item["action"] == "update"
     assert item["registry_id"] == "sensor.living_room_temp"
@@ -169,7 +170,7 @@ def test_entity_remove_enqueues_params_none(enabled_listener, mock_meta_queue):
     }
     enabled_listener._handle_entity_registry_updated(event)
 
-    item = mock_meta_queue.put_async.call_args.args[0]
+    item = enabled_listener._buffer[-1]
     assert item["params"] is None, "Remove action must not fetch params"
     assert item["action"] == "remove"
     enabled_listener._entity_reg.async_get.assert_not_called()
@@ -187,7 +188,7 @@ def test_entity_rename_sets_old_id(enabled_listener, mock_meta_queue, mock_entit
     }
     enabled_listener._handle_entity_registry_updated(event)
 
-    item = mock_meta_queue.put_async.call_args.args[0]
+    item = enabled_listener._buffer[-1]
     assert item["old_id"] == "sensor.old_name"
     assert item["registry_id"] == "sensor.living_room_temp"
 
@@ -201,7 +202,7 @@ def test_area_reorder_skipped(enabled_listener, mock_meta_queue):
     event = MagicMock()
     event.data = {"action": "reorder"}
     enabled_listener._handle_area_registry_updated(event)
-    mock_meta_queue.put_async.assert_not_called()
+    assert enabled_listener._buffer == []
 
 
 # ---------------------------------------------------------------------------
@@ -312,3 +313,295 @@ def test_device_row_changed_returns_true_when_no_row(listener, mock_psycopg_conn
         "{}",           # [7] extra
     )
     assert listener._device_row_changed(cur, "device-001", params) is True
+
+
+# ---------------------------------------------------------------------------
+# Ordered hand-off to the meta queue (issue #17)
+# ---------------------------------------------------------------------------
+
+def _accept_any_entity_id(reg):
+    """Make the registry mock resolve any entity_id to a real-shaped entry.
+
+    The shared fixture only knows two ids; these tests fire bursts across many,
+    and an unresolvable id makes the handler skip the event entirely.
+    """
+    entry = reg.async_get("sensor.living_room_temp")
+    reg.async_get = MagicMock(return_value=entry)
+    return reg
+
+
+async def test_buffer_preserves_event_order(enabled_listener, mock_entity_registry):
+    """The buffer must record events in the order they fired.
+
+    Previously each event became its own task calling put_async, which offloads
+    the append to the default multi-threaded executor; concurrent appends raced
+    and queue order stopped matching event order. valid_from is stamped at event
+    time, so a reordered queue made the worker apply versions out of sequence and
+    corrupt the SCD2 intervals.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    for i in range(50):
+        event = MagicMock()
+        event.data = {"action": "update", "entity_id": f"sensor.e{i}",
+                      "old_entity_id": None}
+        enabled_listener._handle_entity_registry_updated(event)
+
+    ids = [item["registry_id"] for item in enabled_listener._buffer]
+    assert ids == [f"sensor.e{i}" for i in range(50)]
+
+
+async def test_valid_from_is_monotonic_in_buffer_order(enabled_listener, mock_entity_registry):
+    """Queue position must agree with the valid_from stamps the items carry.
+
+    This is the property the SCD2 close+insert depends on: if position disagrees
+    with valid_from, a version gets applied against the wrong predecessor.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    for _ in range(20):
+        event = MagicMock()
+        event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+        enabled_listener._handle_entity_registry_updated(event)
+
+    stamps = [item["params"][11] for item in enabled_listener._buffer]
+    assert stamps == sorted(stamps)
+
+
+async def test_flush_sends_one_batch_and_clears(enabled_listener, mock_meta_queue,
+                                                mock_entity_registry):
+    """Draining hands the whole buffer over in a single put_many_async."""
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    for i in range(5):
+        event = MagicMock()
+        event.data = {"action": "update", "entity_id": f"sensor.e{i}",
+                      "old_entity_id": None}
+        enabled_listener._handle_entity_registry_updated(event)
+
+    await enabled_listener._flush_buffer()
+
+    mock_meta_queue.put_many_async.assert_awaited_once()
+    batch = mock_meta_queue.put_many_async.await_args.args[0]
+    assert [i["registry_id"] for i in batch] == [f"sensor.e{i}" for i in range(5)]
+    assert enabled_listener._buffer == []
+
+
+async def test_flush_requeues_batch_on_failure(enabled_listener, mock_meta_queue,
+                                               mock_entity_registry):
+    """A failed enqueue must not silently drop registry changes — losing them
+    leaves a permanent gap in SCD2 history."""
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    mock_meta_queue.put_many_async.side_effect = OSError("disk full")
+    with pytest.raises(OSError):
+        await enabled_listener._flush_buffer()
+
+    assert len(enabled_listener._buffer) == 1
+
+
+async def test_drain_loop_survives_an_enqueue_failure(enabled_listener, mock_meta_queue,
+                                                     mock_entity_registry):
+    """The drainer is the only path from callback to disk.
+
+    If it exits on the first error, every later registry change accumulates in
+    memory unpersisted while nothing reports a problem. It must retry instead.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    calls = []
+
+    async def flaky(batch):
+        calls.append(list(batch))
+        if len(calls) == 1:
+            raise OSError("disk full")
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=flaky)
+
+    with patch.object(registry_listener_module, "_DRAIN_RETRY_MIN_S", 0.01), \
+         patch.object(registry_listener_module, "_DRAIN_RETRY_MAX_S", 0.01):
+        task = asyncio.get_running_loop().create_task(enabled_listener._drain_loop())
+        event = MagicMock()
+        event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+        enabled_listener._handle_entity_registry_updated(event)
+
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(calls) >= 2:
+                break
+
+        assert not task.done(), "drain loop died on the first enqueue error"
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(calls) >= 2, "the failed batch was never retried"
+    assert calls[1][0]["registry_id"] == "sensor.x", "retry lost the item"
+    assert enabled_listener._buffer == []
+
+
+async def test_cancellation_then_failed_append_returns_the_batch(enabled_listener,
+                                                                 mock_meta_queue,
+                                                                 mock_entity_registry):
+    """Cancelled mid-flush and the append then fails: the items must come back.
+
+    The buffer is swapped out before awaiting the executor, so without settling
+    the in-flight append these items would belong to neither the buffer nor the
+    queue — silently lost.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    started = asyncio.Event()
+
+    async def slow_failure(_batch):
+        started.set()
+        await asyncio.sleep(0.05)
+        raise OSError("disk full")
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=slow_failure)
+
+    flush = asyncio.get_running_loop().create_task(enabled_listener._flush_buffer())
+    await started.wait()
+    flush.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flush
+
+    # Shielded, so still in flight: neither lost nor yet known to have succeeded.
+    assert enabled_listener._inflight is not None
+    await enabled_listener._settle_inflight()
+    assert len(enabled_listener._buffer) == 1, "batch was lost on cancellation"
+
+
+async def test_cancellation_does_not_append_twice(enabled_listener, mock_meta_queue,
+                                                  mock_entity_registry):
+    """Cancelling the awaiter does not stop an append already in the executor.
+
+    Requeuing unconditionally would then write the same items a second time. The
+    batch must be requeued only if the append actually failed.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    appended = []
+    started = asyncio.Event()
+
+    async def slow_but_successful(batch):
+        started.set()
+        await asyncio.sleep(0.05)
+        appended.extend(batch)      # succeeds despite the awaiter being cancelled
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=slow_but_successful)
+
+    flush = asyncio.get_running_loop().create_task(enabled_listener._flush_buffer())
+    await started.wait()
+    flush.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flush
+
+    await enabled_listener._settle_inflight()
+
+    assert len(appended) == 1, "the shielded append should have completed"
+    assert enabled_listener._buffer == [], "a successful append must not be requeued"
+
+    await enabled_listener._flush_buffer()
+    assert len(appended) == 1, "the batch was appended twice"
+
+
+async def test_a_failed_flush_is_requeued_exactly_once(enabled_listener,
+                                                       mock_meta_queue,
+                                                       mock_entity_registry):
+    """A failed append restores its batch, and _settle_inflight must not do it again.
+
+    _flush_buffer requeues on failure; if it also left the batch recorded as
+    in-flight, shutdown would settle the already-failed append and requeue the
+    same items a second time, and the final flush would write both copies.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=OSError("disk full"))
+    with pytest.raises(OSError):
+        await enabled_listener._flush_buffer()
+
+    assert len(enabled_listener._buffer) == 1
+    assert enabled_listener._inflight is None, (
+        "a batch already back in the buffer is not in flight")
+
+    # This is what async_stop does next.
+    await enabled_listener._settle_inflight()
+    assert len(enabled_listener._buffer) == 1, "the batch was requeued twice"
+
+    appended = []
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=appended.extend)
+    await enabled_listener._flush_buffer()
+    assert len(appended) == 1, "the final flush wrote a duplicate"
+
+
+async def test_stop_flushes_remaining_buffer(enabled_listener, mock_meta_queue,
+                                             mock_entity_registry):
+    """Shutdown must drain what is still buffered."""
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    await enabled_listener.async_stop()
+
+    mock_meta_queue.put_many_async.assert_awaited_once()
+    assert enabled_listener._buffer == []
+
+
+async def test_stop_falls_back_to_a_blocking_append(enabled_listener, mock_meta_queue,
+                                                    mock_entity_registry):
+    """A failed final flush must not be the end of the item.
+
+    The async path appends through an executor. When that fails there is still
+    one thing left to try — appending synchronously — and by then the drainer is
+    gone, so nothing else can touch the buffer. Giving up instead threw away
+    every registry change of the last drain interval.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=OSError("executor gone"))
+    appended: list = []
+    mock_meta_queue.put_many = MagicMock(side_effect=appended.extend)
+
+    await enabled_listener.async_stop()
+
+    assert len(appended) == 1, "the item must reach the queue file synchronously"
+    assert appended[0]["registry_id"] == "sensor.x"
+    assert enabled_listener._buffer == []
+
+
+async def test_stop_reports_the_loss_when_even_the_blocking_append_fails(
+    enabled_listener, mock_meta_queue, mock_entity_registry, caplog
+):
+    """If both paths fail the change really is gone, and that must be said.
+
+    Unload still has to succeed — blocking HA shutdown over this is worse — so
+    the log line is the only thing standing between a lost registry change and
+    nobody knowing.
+    """
+    enabled_listener._entity_reg = _accept_any_entity_id(mock_entity_registry)
+    event = MagicMock()
+    event.data = {"action": "update", "entity_id": "sensor.x", "old_entity_id": None}
+    enabled_listener._handle_entity_registry_updated(event)
+
+    mock_meta_queue.put_many_async = AsyncMock(side_effect=OSError("executor gone"))
+    mock_meta_queue.put_many = MagicMock(side_effect=OSError("disk full"))
+
+    await enabled_listener.async_stop()
+
+    assert "Dropped 1 buffered registry item" in caplog.text
+    assert enabled_listener._buffer, "the batch is kept for whatever inspects it"

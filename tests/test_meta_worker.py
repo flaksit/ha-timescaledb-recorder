@@ -11,7 +11,6 @@ from custom_components.timescaledb_recorder.const import (
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
     SCD2_CLOSE_LABEL_SQL,
-    SCD2_INSERT_ENTITY_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
     SCD2_SNAPSHOT_DEVICE_SQL,
     SCD2_SNAPSHOT_ENTITY_SQL,
@@ -92,6 +91,51 @@ def test_write_item_entity_remove_uses_close_sql(mock_psycopg_conn):
     sql, params = call_args.args
     assert sql == SCD2_CLOSE_ENTITY_SQL
     assert params[1] == "sensor.x"
+    # A removal closes at the time the event fired, not the time the worker got
+    # round to it — see test_remove_closes_at_event_time_not_dequeue_time.
+    assert params[0] == datetime.fromisoformat("2026-04-21T12:00:00+00:00")
+    assert params[0] == params[2]
+
+
+def test_remove_closes_at_event_time_not_dequeue_time(mock_psycopg_conn):
+    """A delayed queue must not push a removal's close time forward.
+
+    With the database unreachable for hours, dequeue time is hours after the
+    entity actually vanished. Closing at dequeue time can then overlap a
+    re-creation that happened in between, and the constraint rejects it — leaving
+    the entity permanently marked removed.
+    """
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    removed_at = "2026-04-21T10:00:00+00:00"
+    item = {
+        "registry": "entity", "action": "remove",
+        "registry_id": "sensor.x", "old_id": None, "params": None,
+        "enqueued_at": removed_at,
+    }
+    w._write_item_raw(item)
+
+    params = cur.execute.call_args.args[1]
+    assert params[0] == datetime.fromisoformat(removed_at)
+    assert params[2] == datetime.fromisoformat(removed_at)
+
+
+def test_remove_falls_back_to_clock_without_usable_event_time(mock_psycopg_conn):
+    """An item with no parseable enqueued_at must still close, not crash."""
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    item = {
+        "registry": "entity", "action": "remove",
+        "registry_id": "sensor.x", "old_id": None, "params": None,
+        "enqueued_at": "not-a-timestamp",
+    }
+    w._write_item_raw(item)
+
+    params = cur.execute.call_args.args[1]
+    assert isinstance(params[0], datetime)
+    assert params[0] == params[2]
 
 
 def test_write_item_entity_rename_closes_old_inserts_new(mock_psycopg_conn):
@@ -114,7 +158,113 @@ def test_write_item_entity_rename_closes_old_inserts_new(mock_psycopg_conn):
     calls = cur.execute.call_args_list
     sqls = [c.args[0] for c in calls]
     assert SCD2_CLOSE_ENTITY_SQL in sqls
-    assert SCD2_INSERT_ENTITY_SQL in sqls
+    # The guarded snapshot statement, not a bare INSERT: a replayed rename must
+    # not be able to add a second open row (issue #17).
+    assert SCD2_SNAPSHOT_ENTITY_SQL in sqls
+
+
+def test_close_timestamp_equals_incoming_valid_from(mock_psycopg_conn):
+    """Issue #17: close and insert of one change must share one timestamp.
+
+    A separate clock read for the close puts it after the successor's start,
+    producing an overlapping interval on every single metadata change.
+    """
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    conn.transaction = MagicMock(return_value=MagicMock(
+        __enter__=MagicMock(), __exit__=MagicMock(return_value=False),
+    ))
+    w._registry_listener._entity_row_changed = MagicMock(return_value=True)
+    valid_from = "2026-04-21T12:00:00+00:00"
+    item = {
+        "registry": "entity", "action": "update",
+        "registry_id": "sensor.x", "old_id": None,
+        "params": ["sensor.x", "uuid", "n", "sensor", "zha", None, None,
+                   [], None, None, None, valid_from, "{}"],
+        "enqueued_at": valid_from,
+    }
+    w._write_item_raw(item)
+
+    close = next(c for c in cur.execute.call_args_list
+                 if c.args[0] == SCD2_CLOSE_ENTITY_SQL)
+    insert = next(c for c in cur.execute.call_args_list
+                  if c.args[0] == SCD2_SNAPSHOT_ENTITY_SQL)
+    expected = datetime.fromisoformat(valid_from)
+    assert close.args[1][0] == expected, "close must use the incoming valid_from"
+    assert close.args[1][2] == expected, "ordering guard must use the same value"
+    assert insert.args[1][_VALID_FROM_INDEX["entity"]] == expected
+
+
+@pytest.mark.parametrize("registry,params,close_sql", [
+    ("device", ["dev-1", "n", "m", "mo", None, [], "2026-04-21T12:00:00+00:00", "{}"],
+     SCD2_CLOSE_DEVICE_SQL),
+    ("area", ["area-1", "n", "2026-04-21T12:00:00+00:00", "{}"], SCD2_CLOSE_AREA_SQL),
+    ("label", ["label-1", "n", "#fff", "2026-04-21T12:00:00+00:00", "{}"],
+     SCD2_CLOSE_LABEL_SQL),
+])
+def test_close_timestamp_for_other_registries(mock_psycopg_conn, registry, params, close_sql):
+    """The single-timestamp rule applies to every dimension, not just entities."""
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    conn.transaction = MagicMock(return_value=MagicMock(
+        __enter__=MagicMock(), __exit__=MagicMock(return_value=False),
+    ))
+    getattr(w._registry_listener, f"_{registry}_row_changed").return_value = True
+    item = {
+        "registry": registry, "action": "update",
+        "registry_id": params[0], "old_id": None,
+        "params": params, "enqueued_at": "2026-04-21T12:00:00+00:00",
+    }
+    w._write_item_raw(item)
+
+    close = next(c for c in cur.execute.call_args_list if c.args[0] == close_sql)
+    expected = datetime.fromisoformat("2026-04-21T12:00:00+00:00")
+    assert close.args[1][0] == expected
+    assert close.args[1][2] == expected
+
+
+def test_integrity_violation_drops_item_instead_of_wedging_queue(mock_psycopg_conn):
+    """Issue #17: retry_until_success never gives up, so an unretryable
+    constraint violation must not reach it — one bad item would otherwise stall
+    every later metadata write forever."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    cur.execute.side_effect = psycopg.errors.ExclusionViolation("overlaps")
+    item = {
+        "registry": "entity", "action": "create",
+        "registry_id": "sensor.x", "old_id": None,
+        "params": ["sensor.x", "uuid", "n", "sensor", "zha", None, None,
+                   [], None, None, None, "2026-04-21T12:00:00+00:00", "{}"],
+        "enqueued_at": "2026-04-21T12:00:00+00:00",
+    }
+    w._write_item_raw(item)  # must not raise
+    assert w.integrity_drops == 1
+
+
+def test_transient_errors_still_propagate_to_retry(mock_psycopg_conn):
+    """Only integrity violations are swallowed — a dropped connection must still
+    reach retry_until_success or the item would be lost."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    cur.execute.side_effect = psycopg.OperationalError("connection lost")
+    item = {
+        "registry": "entity", "action": "create",
+        "registry_id": "sensor.x", "old_id": None,
+        "params": ["sensor.x", "uuid", "n", "sensor", "zha", None, None,
+                   [], None, None, None, "2026-04-21T12:00:00+00:00", "{}"],
+        "enqueued_at": "2026-04-21T12:00:00+00:00",
+    }
+    with pytest.raises(psycopg.OperationalError):
+        w._write_item_raw(item)
+    assert w.integrity_drops == 0
 
 
 def test_write_item_device_create(mock_psycopg_conn):

@@ -124,17 +124,23 @@ CREATE TABLE IF NOT EXISTS states (
 | View | Adds | Use for |
 | ---- | ---- | ------- |
 | `states_numeric` | `value NUMERIC` — the guarded cast of `state` | Numeric queries on a known entity |
-| `states_flat` | `value` plus current registry metadata: `entity_name`, `domain`, `platform`, `device_class`, `unit_of_measurement`, `labels`, `area_id`, `area_name`, `device_id`, `device_name`, `manufacturer`, `model` | Exploring by name, area, or unit instead of raw entity IDs |
+| `states_flat` | `value` plus the registry metadata that was current *when each state was recorded*: `entity_name`, `domain`, `platform`, `device_class`, `unit_of_measurement`, `labels`, `area_id`, `area_name`, `device_id`, `device_name`, `manufacturer`, `model` | Exploring by name, area, or unit instead of raw entity IDs |
 
 `value` is `NULL` wherever `state` is not a number, so non-numeric rows stay visible and aggregates (which ignore NULLs) still return the numeric answer. The cast guard accepts negatives — solar export and sub-zero temperatures are numeric states that a `^[0-9]` guard silently drops.
 
+`states_flat` left-joins each dimension on its recorded interval `[valid_from, valid_to)` (open versions run to infinity). Every state row is kept; a row no version covers gets **NULL metadata**, except `domain`, which is derived from `entity_id` and always populated. NULL metadata means one of:
+
+- **The entity is not in HA's entity registry** — `sun.sun`, `zone.home`, `conversation.*`, YAML-defined automations and helpers. Expected; query by `entity_id` and `domain`. The repair script's Coverage section lists them.
+- **The registry history has a gap** for a registered entity. A real defect, reported by `repair_scd2.py --dry-run` under Fidelity.
+
+On a database written before 2.4.0, run the [repair](#repairing-scd2-history) first: overlapping versions duplicate rows in this join.
+
 The views matter most for SQL query builders such as Grafana's: a builder reads the column list and emits `AVG(state)`, which fails with `function avg(text) does not exist`. Pointing it at a view exposes `value` as a real numeric column, so aggregation, grouping, and filtering become point-and-click.
 
-`states_flat` resolves metadata **as of each state's timestamp**, not as of today. Each dimension is rewritten into gap-free, non-overlapping intervals — a version runs until the next version begins, with the first and last extended to cover all time — so exactly one version matches any row. That gives three things:
+Consequences:
 
-- An entity deleted from HA keeps the metadata it had. Matching on `valid_to IS NULL` instead would blank the metadata for that entity's entire history, which is precisely where it matters.
-- A state row can never be duplicated by the join, even if a dimension contains overlapping versions or an entity somehow has several simultaneously-open ones.
-- Renames are historically accurate: each era shows the name of its time. If a rename must not split a series, `GROUP BY entity_id` rather than `entity_name`.
+- An entity deleted from HA keeps its metadata for the period it existed. Matching on `valid_to IS NULL` instead would blank its entire history.
+- Each era shows the name of its time. If a rename must not split a series, `GROUP BY entity_id` rather than `entity_name`.
 
 The range join is not free. Measured over ~48 M rows: an entity-filtered 7-day query runs 99 ms (vs 57 ms for a current-row join), a broad 7-day aggregate 1.7 s (vs 442 ms). Use `states_numeric` when you don't need metadata.
 
@@ -276,27 +282,41 @@ After the snapshot, the integration subscribes to four HA registry events:
 - `EVENT_AREA_REGISTRY_UPDATED`
 - `EVENT_LABEL_REGISTRY_UPDATED`
 
-Each event triggers the SCD2 close-and-insert cycle: the current open row is closed (`valid_to = now()`), and a new row is inserted with the updated fields (`valid_from = now()`). Entity renames (entity_id changes) are handled the same way — the old entity_id row closes and a new one opens under the new entity_id.
+Each event triggers the SCD2 close-and-insert cycle: the open row is closed and a new row inserted, both stamped with the time the event fired, so each interval ends exactly where its successor begins. Events are written in arrival order. Entity renames (entity_id changes) close the old entity_id row and open one under the new entity_id.
 
 The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates.
 
-### Example query: point-in-time metadata join
+### When a change cannot be written
+
+A registry change is dropped instead of retried when the exclusion constraint rejects it, or when a newer version of the same id is already stored. The item goes to the **`metadata_deadletter`** table (reason, registry, id, full item as JSONB) and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
 
 ```sql
-SELECT s.entity_id, s.state, e.name, e.area_id, a.name AS area_name
-FROM states s
-JOIN entities e ON e.entity_id = s.entity_id
-  AND s.last_updated >= e.valid_from
-  AND (e.valid_to IS NULL OR s.last_updated < e.valid_to)
-LEFT JOIN areas a ON a.area_id = e.area_id
-  AND s.last_updated >= a.valid_from
-  AND (a.valid_to IS NULL OR s.last_updated < a.valid_to)
-WHERE s.entity_id = 'sensor.living_room_temperature'
-ORDER BY s.last_updated DESC
+SELECT detected_at, reason, registry_id, error FROM metadata_deadletter ORDER BY detected_at DESC;
+```
+
+The table is normally empty. Each row is a gap in the dimension history, shown as NULL metadata in `states_flat`.
+
+Registry changes during startup, before the initial snapshot completes, are discarded. Creates and updates are picked up by the snapshot; a **removal** is lost and the row stays open ([#19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19)).
+
+### The invariant
+
+For any id, version intervals never overlap, so at most one version is open (`valid_to IS NULL`). Each dimension enforces this with an exclusion constraint over `(id, tstzrange(valid_from, COALESCE(valid_to, 'infinity'), '[)'))`, installed on startup. It needs the `btree_gist` extension; without it the integration logs a warning and falls back to a unique index on open rows, which cannot detect overlaps between closed versions.
+
+On a database written before 2.4.0 the constraints fail to apply (logged, not fatal) until the history is [repaired](#repairing-scd2-history).
+
+### Example query: point-in-time metadata join
+
+`states_flat` already does it:
+
+```sql
+SELECT last_updated, state, value, entity_name, area_name
+FROM states_flat
+WHERE entity_id = 'sensor.living_room_temperature'
+ORDER BY last_updated DESC
 LIMIT 10;
 ```
 
-The join conditions (`>= valid_from AND (valid_to IS NULL OR < valid_to)`) ensure you get the metadata row that was current at the time each state was recorded — not necessarily the current metadata. This is what makes the join historically correct.
+A hand-written inner join on the dimensions drops state rows no version covers (e.g. before the entity's first version); `states_flat` keeps them with NULL metadata. `valid_to IS NULL` alone gives current metadata, not point-in-time, and drops removed entities.
 
 ## Differences from the built-in recorder
 
@@ -351,3 +371,74 @@ Optional arguments:
 The script is safe to run while HA is active — SQLite is opened read-only and re-running is idempotent. Each bucket does a cheap `COUNT(*)` comparison first; buckets already in sync are skipped with no row fetches.
 
 **`--end` precision snapping:** `--end 2026-04-10` includes the full day; `--end 2026-04-10T14:30` includes the full minute, and so on.
+
+## Repairing SCD2 history
+
+Versions before 2.4.0 could write overlapping dimension versions and several open versions per id. Any join on a dimension then duplicates state rows for affected ids, inflating sums and counts. 2.4.0 stops new damage; repair existing damage once:
+
+```bash
+# 1. install 2.4.0 via HACS and restart HA
+# 2. inspect — mutates nothing
+docker exec homeassistant python3 \
+    /config/custom_components/timescaledb_recorder/repair_scd2.py --dry-run
+# 3. back up, repair, verify, add constraints
+docker exec homeassistant python3 \
+    /config/custom_components/timescaledb_recorder/repair_scd2.py --apply
+# 4. restart HA again
+```
+
+Order matters:
+
+- **Install 2.4.0 before repairing.** Older versions retry rejected writes forever, so the new constraints would wedge their metadata queue. Without the constraints (`--no-constraints`) the history re-corrupts.
+- **Keep steps 1–3 close together.** 2.4.0 redefines `states_flat` to join `valid_to` literally, so it duplicates rows until the repair runs.
+- **Restart after `--apply`.** The startup snapshot re-creates a current version for ids the repair left without one (see Fidelity below).
+
+**Downgrading below 2.4.0** after the constraints are in place: first `ALTER TABLE <t> DROP CONSTRAINT excl_<t>_period` for `entities`, `devices`, `areas` and `labels`, or the old writer wedges as above.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dsn DSN` | read from integration config | PostgreSQL connection string |
+| `--dry-run` | default | Report the damage and what would change; mutates nothing |
+| `--apply` | off | Back up, repair, verify, and add the constraints |
+| `--verify-only` | off | Check the invariant only; skips the Ambiguity, Fidelity and Coverage sections, which scan the whole `states` hypertable |
+| `--collapse-duplicates` | off | Also delete rows sharing a surviving row's id, `valid_from` and payload |
+| `--merge-identical-gaps` | off | Merge two identical versions separated by a gap that `states` contradicts into one row |
+| `--no-constraints` | off | Repair without adding the exclusion constraints |
+| `--yes` | off | Skip the `--apply` confirmation. Required without a terminal |
+
+Exit codes: 0 invariant holds; 1 invariant violated, or a table still fails verification or its constraint could not be created; 2 `valid_from` itself looks unsound — stop and investigate. Ambiguity, Fidelity and Coverage findings do not change the exit code; read them. `--collapse-duplicates` and `--merge-identical-gaps` also work on an already-repaired database, so `--dry-run`, then `--apply --merge-identical-gaps` after reading Fidelity, is a valid sequence.
+
+### What it does
+
+Each version's `valid_to` is set to the next version's `valid_from`. Only `valid_to` is written, and only ever shrunk, so recorded gaps survive; the last version per id is untouched; nothing is deleted unless a flag says so. `valid_from` is trusted as the anchor, though the earliest writer stamped it at processing time, so it can lag the real change. History that was never written cannot be recovered, and the live HA registries are not consulted.
+
+Each table is first copied to `<table>_prerepair_<utc timestamp>`, the only full record of the old `valid_to` values; drop those once satisfied. Deleted or clamped rows are also archived as JSONB in `scd2_repair_quarantine`, tagged with the run id.
+
+### Undoing a repair
+
+The backup table has no constraints and holds rows the constraint rejects, so drop the constraint first:
+
+```sql
+BEGIN;
+ALTER TABLE entities DROP CONSTRAINT excl_entities_period;
+TRUNCATE entities;
+INSERT INTO entities SELECT * FROM entities_prerepair_<stamp>;
+COMMIT;
+```
+
+Repeat per table. To restore one archived row: `INSERT INTO entities SELECT (jsonb_populate_record(NULL::entities, row_data)).* FROM scd2_repair_quarantine WHERE ...`.
+
+### Read the report
+
+Consistent intervals are not necessarily true ones. The script reports what it cannot decide:
+
+- **Ambiguity** — two versions with the same id and `valid_from` but different contents. Both are kept; one gets an empty interval.
+- **Fidelity: gaps `states` contradicts** — a version closed with no successor while the entity kept recording. Those states get NULL metadata in `states_flat`. If the versions either side are identical, `--merge-identical-gaps` merges them and restores that metadata; otherwise the gap stays.
+- **Fidelity: ids with no current version** — the newest version was already closed while an older one was open, and the rebuild closes the older one too. Correct if the thing was removed. If it still exists, the restart after `--apply` re-creates its current version; until then it is missing from `valid_to IS NULL` queries.
+- **Coverage** — states no version covers: entities never in the registry (expected), states before an entity's first version (normal where history predates the dimension), and states after its last close or pointing at an uncovered device or area (the dimension stopped describing something that kept recording).
+
+A second `--apply` changes nothing.
+
+### If it fails
+
+Each table is repaired in one transaction under `SHARE ROW EXCLUSIVE` with a 10-second `lock_timeout`, backup included. HA can keep running; if the metadata worker holds the lock, the repair times out having changed nothing — run it again. Any interruption leaves the current table untouched and earlier tables repaired, each consistent on its own; re-running converges.

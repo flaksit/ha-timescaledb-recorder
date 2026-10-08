@@ -1,4 +1,5 @@
 """RegistryListener: thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker."""
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -6,6 +7,7 @@ from typing import Callable
 
 import attrs
 import psycopg
+import psycopg.rows
 
 from homeassistant.core import HomeAssistant, Event, callback
 from homeassistant.helpers import entity_registry as er
@@ -18,6 +20,7 @@ from homeassistant.helpers.area_registry import EVENT_AREA_REGISTRY_UPDATED
 from homeassistant.helpers.label_registry import EVENT_LABEL_REGISTRY_UPDATED
 
 from .const import (
+    DOMAIN,
     SELECT_ENTITY_CURRENT_SQL,
     SELECT_DEVICE_CURRENT_SQL,
     SELECT_AREA_CURRENT_SQL,
@@ -26,6 +29,12 @@ from .const import (
 from .persistent_queue import PersistentQueue
 
 _LOGGER = logging.getLogger(__name__)
+
+# Backoff bounds for the drain loop. Short enough that a transient disk error
+# costs one registry change no visible delay; capped so a persistent failure
+# does not spin.
+_DRAIN_RETRY_MIN_S = 1.0
+_DRAIN_RETRY_MAX_S = 30.0
 
 # Fields explicitly typed on each dimension table — excluded from the extra JSONB column
 # to avoid duplication between typed columns and the catch-all extra blob.
@@ -122,6 +131,28 @@ class RegistryListener:
     processed before the snapshot row exists, causing the SCD2 close/insert to target
     a non-existent row. DISCARD mode eliminates this ordering hazard. The backfill
     captures the registry state at snapshot time; changes after enable() flow normally.
+
+    What DISCARD costs, stated plainly because it is a real hole and not a
+    rounding error (issue #19): the snapshot reads the registries as they are
+    when it runs, so a create or an update inside the window is picked up by it.
+    A REMOVAL is not — the entry is already gone, the snapshot has nothing to
+    see, and the open row stays open indefinitely, so the dimension goes on
+    claiming the thing exists. An entity created and deleted inside the window
+    is never recorded at all. Fixing it means buffering the window's events and
+    enqueuing them ahead of the snapshot; that is issue #19's job, not this
+    class's docstring.
+
+    Event ordering (issue #17): handlers append to an in-memory buffer synchronously
+    and a single drain task moves the buffer to the PersistentQueue. Each handler
+    previously did hass.async_create_task(queue.put_async(item)), and put_async
+    offloads the append with run_in_executor(None, ...) onto the default
+    multi-threaded executor — so concurrent appends raced for the queue lock and
+    landed in arbitrary order. valid_from is stamped here at event time, so an
+    out-of-order append made the worker apply versions in the wrong sequence and
+    corrupted the SCD2 intervals. A list append in a @callback cannot be reordered
+    (it never awaits), and one drainer means one writer, so queue order is now
+    event order. Draining through put_many_async also keeps the single-fsync
+    property that issue #11 introduced.
     """
 
     def __init__(
@@ -140,6 +171,15 @@ class RegistryListener:
         # DISCARD mode: events are dropped until enable() is called. Prevents
         # out-of-order SCD2 writes during the initial drain+backfill window.
         self._enabled: bool = False
+        # Ordered hand-off to the meta queue (issue #17). Handlers append here
+        # synchronously; _drain_loop is the only reader and the only writer to
+        # the PersistentQueue, so event order survives all the way to the worker.
+        self._buffer: list[dict] = []
+        self._buffer_ready = asyncio.Event()
+        self._drain_task: asyncio.Task | None = None
+        # (append task, its batch) while an enqueue is in flight, so a cancelled
+        # flush can be settled rather than guessed at.
+        self._inflight: tuple[asyncio.Task, list[dict]] | None = None
 
     def bind_meta_queue(self, q: PersistentQueue) -> None:
         """Wire the PersistentQueue after construction. Used by __init__.py
@@ -154,6 +194,111 @@ class RegistryListener:
         """
         self._enabled = True
 
+    @callback
+    def _enqueue(self, item: dict) -> None:
+        """Append one item to the ordered buffer and wake the drain task.
+
+        Must stay synchronous. The moment this awaits, two events can interleave
+        and the buffer stops recording event order — which is the whole point of
+        it existing (see the ordering note in the class docstring).
+        """
+        self._buffer.append(item)
+        self._buffer_ready.set()
+
+    async def _drain_loop(self) -> None:
+        """Move buffered items to the PersistentQueue, preserving order.
+
+        Sole writer to the queue from this listener. Takes the whole buffer each
+        pass so a burst becomes one put_many_async — one fsync — rather than one
+        per event.
+
+        This loop must outlive every ordinary error. It is the only path from the
+        event callbacks to disk, so if it exits, every later registry change piles
+        up in memory unpersisted while nothing reports a problem. A failed flush
+        puts the batch back and retries with a bounded backoff rather than
+        propagating.
+
+        The exceptions to that are the exceptions that are not `Exception`:
+        cancellation, KeyboardInterrupt, SystemExit. Those say the interpreter or
+        the event loop is going away, and retrying in a backoff loop would fight
+        the shutdown rather than survive it. _flush_buffer catches `BaseException`
+        so it can restore the batch before any of them propagate, then re-raises;
+        the batch is safe in _buffer and async_stop's final flush is what gets it
+        to disk.
+        """
+        delay = _DRAIN_RETRY_MIN_S
+        while True:
+            try:
+                await self._buffer_ready.wait()
+                await self._flush_buffer()
+                delay = _DRAIN_RETRY_MIN_S
+            except asyncio.CancelledError:
+                # async_stop cancels us; it flushes whatever is left afterwards.
+                raise
+            except Exception:  # noqa: BLE001
+                # _flush_buffer has already restored the batch and logged.
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _DRAIN_RETRY_MAX_S)
+
+    async def _flush_buffer(self) -> None:
+        """Hand the current buffer contents to the queue in one batch."""
+        # Swap before awaiting: put_many_async yields, and events arriving during
+        # that window must land in the next batch, not be dropped with this one.
+        batch = self._buffer
+        self._buffer = []
+        self._buffer_ready.clear()
+        if not batch:
+            return
+
+        # Shielded, and tracked: cancelling the awaiter does not stop an append
+        # already running in the executor. Requeuing on cancellation would then
+        # append the same items twice. Instead the in-flight append is recorded
+        # so async_stop can await its real outcome and requeue only if it failed.
+        append = asyncio.ensure_future(self._meta_queue.put_many_async(batch))
+        self._inflight = (append, batch)
+        try:
+            await asyncio.shield(append)
+        except asyncio.CancelledError:
+            # Normal shutdown, not a failure — async_stop settles this batch.
+            raise
+        except BaseException:
+            # Clear before requeuing: this batch is now back in _buffer, and
+            # leaving it recorded as in-flight would let _settle_inflight requeue
+            # the same items a second time if the drainer is cancelled during its
+            # backoff, so the final flush would write both copies.
+            self._inflight = None
+            self._requeue(batch)
+            _LOGGER.exception(
+                "Failed to enqueue %d registry item(s); retrying", len(batch))
+            raise
+        else:
+            self._inflight = None
+
+    def _requeue(self, batch: list[dict]) -> None:
+        """Put an unpersisted batch back at the front, preserving order."""
+        self._buffer = batch + self._buffer
+        self._buffer_ready.set()
+
+    async def _settle_inflight(self) -> None:
+        """Await an append left running by a cancelled flush.
+
+        Only the append itself can say whether the items reached disk, so the
+        decision to requeue waits for it. Without this, shutdown either loses the
+        batch or writes it twice.
+        """
+        inflight = self._inflight
+        self._inflight = None
+        if inflight is None:
+            return
+        append, batch = inflight
+        try:
+            await append
+        except Exception:  # noqa: BLE001
+            self._inflight = None
+            self._requeue(batch)
+            _LOGGER.exception(
+                "Enqueue of %d registry item(s) failed during shutdown", len(batch))
+
     async def async_start(self) -> None:
         """Cache registry references and register event listeners in DISCARD mode.
 
@@ -165,6 +310,12 @@ class RegistryListener:
         self._device_reg = dr.async_get(self._hass)
         self._area_reg = ar.async_get(self._hass)
         self._label_reg = lr.async_get(self._hass)
+
+        # Start the drainer before subscribing, so no event can be buffered
+        # without something running to move it to the queue.
+        self._drain_task = self._hass.async_create_background_task(
+            self._drain_loop(), f"{DOMAIN}_registry_drain"
+        )
 
         self._cancel_listeners.append(
             self._hass.bus.async_listen(
@@ -261,7 +412,7 @@ class RegistryListener:
     # ------------------------------------------------------------------
 
     def _entity_row_changed(
-        self, cur: psycopg.Cursor, entity_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], entity_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open entity row differs from new_params.
 
@@ -287,7 +438,7 @@ class RegistryListener:
         )
 
     def _device_row_changed(
-        self, cur: psycopg.Cursor, device_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], device_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open device row differs from new_params.
 
@@ -308,7 +459,7 @@ class RegistryListener:
         )
 
     def _area_row_changed(
-        self, cur: psycopg.Cursor, area_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], area_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open area row differs from new_params.
 
@@ -324,7 +475,7 @@ class RegistryListener:
         )
 
     def _label_row_changed(
-        self, cur: psycopg.Cursor, label_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], label_id: str, new_params: tuple
     ) -> bool:
         """Return True if the current open label row differs from new_params.
 
@@ -376,7 +527,7 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Device registry event handling
@@ -412,7 +563,7 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Area registry event handling
@@ -458,7 +609,7 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Label registry event handling
@@ -494,18 +645,68 @@ class RegistryListener:
             "params": _to_json_safe(params),
             "enqueued_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._hass.async_create_task(self._meta_queue.put_async(item))
+        self._enqueue(item)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def async_stop(self) -> None:
-        """Cancel all registry event subscriptions.
+        """Cancel subscriptions, then flush anything still buffered.
 
-        No write buffer to flush — events are processed immediately by the meta worker,
-        so no final flush is needed on shutdown.
+        Order matters: unsubscribe first so no new events arrive, then stop the
+        drainer, then flush what is left. Skipping the final flush would silently
+        drop registry changes that arrived in the last drain interval, leaving
+        permanent gaps in SCD2 history.
         """
         for cancel in self._cancel_listeners:
             cancel()
         self._cancel_listeners.clear()
+
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            try:
+                await self._drain_task
+            except asyncio.CancelledError:
+                pass
+            self._drain_task = None
+
+        # Cancelling the drainer does not stop an append already running in the
+        # executor. Settle it first: requeue only if it genuinely failed, so the
+        # final flush below cannot write the same items a second time.
+        await self._settle_inflight()
+
+        try:
+            await self._flush_buffer()
+        except Exception:  # noqa: BLE001
+            # Already logged in _flush_buffer, which put the batch back in
+            # _buffer. Try once more synchronously before giving up: the async
+            # path failed in the executor, and by now the drainer is gone and
+            # nothing else can touch the buffer, so a direct append is safe and
+            # a blocking write is affordable on a shutdown path. Only if this
+            # also fails is the change genuinely lost.
+            self._flush_buffer_blocking()
+
+    def _flush_buffer_blocking(self) -> None:
+        """Last-resort synchronous append, for shutdown only.
+
+        Unload must not fail on this — losing the items is bad, blocking HA
+        shutdown is worse — so the failure is reported and swallowed.
+        """
+        batch = self._buffer
+        self._buffer = []
+        if not batch:
+            return
+        try:
+            self._meta_queue.put_many(batch)
+        except Exception:  # noqa: BLE001
+            self._buffer = batch
+            _LOGGER.exception(
+                "Dropped %d buffered registry item(s) on shutdown; the metadata "
+                "queue could not be written even synchronously", len(batch),
+            )
+        else:
+            _LOGGER.warning(
+                "Persisted %d buffered registry item(s) synchronously after the "
+                "shutdown flush failed", len(batch),
+            )

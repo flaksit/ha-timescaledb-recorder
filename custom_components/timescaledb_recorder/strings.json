@@ -68,6 +68,10 @@
     "recorder_disabled": {
       "title": "Home Assistant recorder integration is disabled",
       "description": "The Home Assistant recorder integration is not loaded or has been disabled. The TimescaleDB recorder relies on HA's sqlite recorder as a safety net for backfilling state changes after a database outage. Without it, events dropped during a TimescaleDB outage cannot be recovered. To fix this, re-enable the recorder integration in your configuration and restart Home Assistant."
+    },
+    "metadata_dropped": {
+      "title": "TimescaleDB recorder dropped a metadata change",
+      "description": "The TimescaleDB recorder gave up on a registry metadata change and dropped it so the metadata queue could keep moving. The full item is kept in the metadata_deadletter table in TimescaleDB, together with the reason it was dropped. This leaves a hole in the dimension history that does not heal on its own: inspect that table, fix the cause, and re-apply the change by editing the entity, device, area or label in Home Assistant. This issue does not clear automatically."
     }
   }
 }

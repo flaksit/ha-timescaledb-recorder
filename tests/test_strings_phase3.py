@@ -14,7 +14,7 @@ def test_strings_json_is_valid_json():
     assert isinstance(data, dict)
 
 
-def test_strings_json_has_all_five_issue_keys():
+def test_strings_json_has_every_issue_key():
     data = _load_strings()
     expected = {
         "buffer_dropping",
@@ -22,6 +22,7 @@ def test_strings_json_has_all_five_issue_keys():
         "meta_worker_stalled",
         "db_unreachable",
         "recorder_disabled",
+        "metadata_dropped",
     }
     assert set(data["issues"].keys()) == expected
 
@@ -33,6 +34,7 @@ def test_new_issue_entries_have_nonempty_title_and_description():
         "meta_worker_stalled",
         "db_unreachable",
         "recorder_disabled",
+        "metadata_dropped",
     ]
     for key in new_keys:
         entry = data["issues"][key]

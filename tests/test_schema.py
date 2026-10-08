@@ -5,21 +5,24 @@ from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 18 SQL statements.
+    """sync_setup_schema must execute exactly 27 SQL statements.
 
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
     + 4 dimension table DDL (entities, devices, areas, labels)
     + 5 dimension table indexes (entities compound, entities current-row,
       devices, areas, labels)
+    + 2 metadata_deadletter DDL (table, index) — issue #17
     + 2 convenience views (states_numeric, states_flat)
-    = 18 total
+    + 1 btree_gist extension + 4 SCD2 exclusion constraints (issue #17)
+    + 2 lock_timeout set/reset around the constraint DDL
+    = 27 total
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 18
+    assert cur.execute.call_count == 27
 
 
 def test_create_schema_order(mock_psycopg_conn):
@@ -46,10 +49,98 @@ def test_create_schema_order(mock_psycopg_conn):
     assert "devices" in calls[8]
     assert "areas" in calls[9]
     assert "labels" in calls[10]
-    # Views come last — states_flat joins the dimension tables, so they
-    # must already exist.
-    assert "CREATE OR REPLACE VIEW states_numeric" in calls[16]
-    assert "CREATE OR REPLACE VIEW states_flat" in calls[17]
+    # The dead-letter table is part of setup, not of the failure path that
+    # writes to it (issue #17).
+    assert "metadata_deadletter" in calls[16]
+    assert "idx_metadata_deadletter" in calls[17]
+    # Views come last of the main block — states_flat joins the dimension
+    # tables, so they must already exist.
+    assert "CREATE OR REPLACE VIEW states_numeric" in calls[18]
+    assert "CREATE OR REPLACE VIEW states_flat" in calls[19]
+    # Invariant enforcement follows the tables it constrains (issue #17).
+    assert "btree_gist" in calls[20]
+    # ADD CONSTRAINT takes ACCESS EXCLUSIVE — bounded so a long-running reader
+    # cannot stall schema setup and, behind it, states ingestion.
+    assert "SET lock_timeout" in calls[21]
+    for offset, table in enumerate(("entities", "devices", "areas", "labels")):
+        assert f"excl_{table}_period" in calls[22 + offset]
+    assert "RESET lock_timeout" in calls[26]
+
+
+def test_constraint_failure_does_not_abort_schema_setup(mock_psycopg_conn):
+    """A damaged install cannot create the constraints, and that must not stop
+    schema setup — states ingestion is never held hostage to dimension repair.
+    """
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "excl_" in sql or "btree_gist" in sql:
+            raise psycopg.errors.InsufficientPrivilege("nope")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)  # must not raise
+
+
+def test_lock_timeout_is_reset_even_when_a_constraint_fails(mock_psycopg_conn):
+    """The connection is long-lived and shared with the states worker, so a
+    lock_timeout set for the DDL must never outlive it — including on the
+    damaged-install path where every ALTER is rejected."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "excl_" in sql:
+            raise psycopg.errors.InsufficientPrivilege("nope")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)
+
+    calls = [c.args[0] for c in cur.execute.call_args_list]
+    assert any("RESET lock_timeout" in c for c in calls)
+
+
+def test_a_held_lock_does_not_stall_schema_setup(mock_psycopg_conn):
+    """A reader holding the table is not a data problem, so it must be reported
+    as itself rather than as damage — and setup must carry on regardless."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "excl_" in sql:
+            raise psycopg.errors.LockNotAvailable("canceling statement due to lock timeout")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)  # must not raise
+
+    calls = [c.args[0] for c in cur.execute.call_args_list]
+    assert sum(1 for c in calls if "excl_" in c) == 4, "every table is still attempted"
+    assert any("RESET lock_timeout" in c for c in calls)
+
+
+def test_falls_back_to_unique_index_without_btree_gist(mock_psycopg_conn):
+    """Without btree_gist the weaker guarantee still gets installed."""
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+
+    def _side_effect(sql, *args, **kwargs):
+        if "btree_gist" in sql:
+            raise psycopg.errors.InsufficientPrivilege("no CREATE on database")
+        return None
+
+    cur.execute.side_effect = _side_effect
+    sync_setup_schema(conn)
+
+    calls = [c.args[0] for c in cur.execute.call_args_list]
+    assert any("ux_entities_open" in c for c in calls)
+    assert not any("excl_entities_period" in c for c in calls)
 
 
 def test_custom_chunk_interval(mock_psycopg_conn):
@@ -137,27 +228,38 @@ def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):
     assert CREATE_UNIQUE_INDEX_SQL in executed
 
 
-def test_states_flat_joins_point_in_time_not_current_row():
-    """states_flat must resolve metadata as of each state's timestamp.
+def test_states_flat_joins_the_recorded_interval():
+    """states_flat must join on the interval the dimension actually records.
 
-    Joining on `valid_to IS NULL` regresses two ways: entities deleted from HA
-    lose the metadata for their whole history, and entities that end up with more
-    than one simultaneously-open version duplicate every fact row they match.
+    It used to synthesise gap-free eras from consecutive valid_from values and
+    ignore valid_to, which hid missing history behind plausible-looking metadata.
+    With the exclusion constraint preventing overlaps, the literal join is safe,
+    and anything the dimension fails to cover surfaces as NULL instead.
     """
     from custom_components.timescaledb_recorder.const import (
         CREATE_VIEW_STATES_FLAT_SQL,
     )
 
     sql = CREATE_VIEW_STATES_FLAT_SQL
+    # One half-open range per dimension: [valid_from, COALESCE(valid_to, inf)).
+    assert sql.count(">= e.valid_from") == 1
+    assert sql.count(">= a.valid_from") == 1
+    assert sql.count(">= d.valid_from") == 1
+    assert sql.count("COALESCE(e.valid_to, 'infinity'::timestamptz)") == 1
+    assert sql.count("COALESCE(a.valid_to, 'infinity'::timestamptz)") == 1
+    assert sql.count("COALESCE(d.valid_to, 'infinity'::timestamptz)") == 1
+    # No era synthesis left behind.
+    assert "lead(valid_from)" not in sql
+    assert "DISTINCT ON" not in sql
+    assert "'-infinity'" not in sql
+    # A current-row join would blank every removed entity's whole history.
     assert "valid_to IS NULL" not in sql
-    # Intervals are derived from consecutive valid_from values and clamped open
-    # at both ends, so exactly one version matches any timestamp.
-    for dim in ("entity_id", "area_id", "device_id"):
-        assert f"PARTITION BY {dim} ORDER BY valid_from" in sql
-    assert sql.count("'-infinity'::timestamptz") == 3   # one per dimension
-    assert sql.count("'infinity'::timestamptz") == 3    # ditto; '-infinity' does not match
-    assert sql.count("lead(valid_from)") == 3
-    assert sql.count("DISTINCT ON") == 3
+    # States are never dropped, only left unlabelled.
+    assert sql.count("LEFT JOIN") == 3
+    # domain comes from the entity_id, so entities HA never registered
+    # (sun.sun, zone.home, YAML helpers) stay filterable.
+    assert "split_part(s.entity_id, '.', 1) AS domain" in sql
+    assert "e.domain" not in sql
 
 
 def test_numeric_regex_accepts_negative_states():

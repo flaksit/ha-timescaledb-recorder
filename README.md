@@ -412,7 +412,9 @@ Exit codes: 0 invariant holds; 1 invariant violated, or a table still fails veri
 
 Each version's `valid_to` is set to the next version's `valid_from`. Only `valid_to` is written, and only ever shrunk, so recorded gaps survive; the last version per id is untouched; nothing is deleted unless a flag says so. `valid_from` is trusted as the anchor, though the earliest writer stamped it at processing time, so it can lag the real change. History that was never written cannot be recovered, and the live HA registries are not consulted.
 
-Each table is first copied to `<table>_prerepair_<utc timestamp>`, the only full record of the old `valid_to` values; drop those once satisfied. Deleted or clamped rows are also archived as JSONB in `scd2_repair_quarantine`, tagged with the run id.
+One exception writes `valid_from`: an entity whose first version starts before its device's first version, typically left by a history import that backdated entities but not devices, is moved later to the device's start — but never past the entity's first recorded state, and not if that would empty the version.
+
+Each table is first copied to `<table>_prerepair_<utc timestamp>`, the only full record of the old values; drop those once satisfied. Deleted, clamped or start-aligned rows are also archived as JSONB in `scd2_repair_quarantine`, tagged with the run id.
 
 ### Undoing a repair
 
@@ -435,7 +437,7 @@ Consistent intervals are not necessarily true ones. The script reports what it c
 - **Ambiguity** — two versions with the same id and `valid_from` but different contents. Both are kept; one gets an empty interval.
 - **Fidelity: gaps `states` contradicts** — a version closed with no successor while the entity kept recording. Those states get NULL metadata in `states_flat`. If the versions either side are identical, `--merge-identical-gaps` merges them and restores that metadata; otherwise the gap stays.
 - **Fidelity: ids with no current version** — the newest version was already closed while an older one was open, and the rebuild closes the older one too. Correct if the thing was removed. If it still exists, the restart after `--apply` re-creates its current version; until then it is missing from `valid_to IS NULL` queries.
-- **Coverage** — states no version covers: entities never in the registry (expected), states before an entity's first version (normal where history predates the dimension), and states after its last close or pointing at an uncovered device or area (the dimension stopped describing something that kept recording).
+- **Coverage** — states no version covers: entities never in the registry (expected), states before an entity's first version (normal where history predates the dimension), and states after its last close or pointing at an uncovered device or area (the dimension stopped describing something that kept recording). Entity versions starting before their device are listed here too; `--apply` aligns them as above.
 
 A second `--apply` changes nothing.
 

@@ -224,7 +224,10 @@ def test_repair_deletes_nothing_by_default(damaged):
 
 
 def test_repair_never_writes_valid_from(damaged):
-    """valid_from is the anchor the reconstruction trusts; it must survive intact."""
+    """valid_from is the anchor the reconstruction trusts; it must survive intact.
+
+    The fixture's entities reference no device, so the start alignment (tested
+    below) has nothing to do here."""
     with damaged.cursor() as cur:
         cur.execute("SELECT entity_id, valid_from FROM entities ORDER BY 1, 2")
         before = cur.fetchall()
@@ -957,3 +960,113 @@ def test_the_backup_tables_restore_the_pre_repair_state(damaged, monkeypatch):
     _drop_backups(damaged)
     assert _run_main(monkeypatch, "--apply") == 0
     assert _violations(damaged) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+
+
+# ---- Entity start aligned to its device --------------------------------------
+#
+# A history migration backdated entities to a 2000-01-01 sentinel but not their
+# devices, leaving entity versions that start before the device they point at.
+
+SENTINEL = datetime(2000, 1, 1, tzinfo=timezone.utc)
+DEVICE_FROM = BASE + timedelta(days=30)
+
+
+def _add_backdated(conn, entity_id: str, valid_to=None, successor_from=None) -> None:
+    """An entity on dev_late whose first version starts at the sentinel."""
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO devices (device_id, name, valid_from, valid_to)"
+                    " SELECT 'dev_late', 'Late', %s, NULL WHERE NOT EXISTS"
+                    " (SELECT 1 FROM devices WHERE device_id = 'dev_late')",
+                    (DEVICE_FROM,))
+        cur.execute(
+            "INSERT INTO entities (entity_id, ha_entity_uuid, name, domain, device_id,"
+            " valid_from, valid_to) VALUES (%s,%s,'A','sensor','dev_late',%s,%s)",
+            (entity_id, f"uuid-{entity_id}", SENTINEL, valid_to))
+        if successor_from is not None:
+            cur.execute(
+                "INSERT INTO entities (entity_id, ha_entity_uuid, name, domain,"
+                " device_id, valid_from, valid_to)"
+                " VALUES (%s,%s,'B','sensor','dev_late',%s,NULL)",
+                (entity_id, f"uuid-{entity_id}", successor_from))
+
+
+def _add_state(conn, entity_id: str, ts: datetime) -> None:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO states (last_updated, last_changed, entity_id, state)"
+                    " VALUES (%s,%s,%s,'1')", (ts, ts, entity_id))
+
+
+def _starts(conn, entity_id: str) -> list:
+    with conn.cursor() as cur:
+        cur.execute("SELECT valid_from FROM entities WHERE entity_id = %s"
+                    " ORDER BY valid_from", (entity_id,))
+        return [row[0] for row in cur.fetchall()]
+
+
+def test_entity_start_moves_to_its_device(damaged):
+    _add_backdated(damaged, "sensor.no_states")
+    _repair(damaged)
+    assert _starts(damaged, "sensor.no_states") == [DEVICE_FROM]
+    with damaged.cursor() as cur:
+        cur.execute("SELECT row_data->>'valid_from' FROM scd2_repair_quarantine"
+                    " WHERE reason = 'start_aligned_to_device'"
+                    " AND id_value = 'sensor.no_states'")
+        (archived,) = cur.fetchone()
+    assert datetime.fromisoformat(archived) == SENTINEL, "original start must be archived"
+
+
+def test_alignment_never_passes_the_first_state(damaged):
+    """The device starts after the entity's first state: stop at the state, so it
+    keeps its entity metadata."""
+    first_state = DEVICE_FROM - timedelta(days=3)
+    _add_backdated(damaged, "sensor.early_state")
+    _add_state(damaged, "sensor.early_state", first_state)
+    _add_state(damaged, "sensor.early_state", DEVICE_FROM + timedelta(days=1))
+    _repair(damaged)
+    assert _starts(damaged, "sensor.early_state") == [first_state]
+    with damaged.cursor() as cur:
+        cur.execute(const.SCD2_STATES_UNCOVERED_SQL)
+        assert "sensor.early_state" not in {row[0] for row in cur.fetchall()}
+
+
+def test_alignment_skips_a_version_it_would_empty(damaged):
+    """The first version ends before the device starts; moving it would erase it."""
+    end = DEVICE_FROM - timedelta(days=1)
+    _add_backdated(damaged, "sensor.short", valid_to=end, successor_from=end)
+    _repair(damaged)
+    assert _starts(damaged, "sensor.short") == [SENTINEL, end]
+
+
+def test_alignment_leaves_later_versions_alone(damaged):
+    """Only the first version moves; a successor keeps its recorded start."""
+    successor = DEVICE_FROM + timedelta(days=5)
+    _add_backdated(damaged, "sensor.two", valid_to=successor, successor_from=successor)
+    _repair(damaged)
+    assert _starts(damaged, "sensor.two") == [DEVICE_FROM, successor]
+    assert _violations(damaged) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+
+
+def test_alignment_preview_matches_apply_and_mutates_nothing(damaged):
+    _add_backdated(damaged, "sensor.no_states")
+    _add_backdated(damaged, "sensor.short", valid_to=DEVICE_FROM - timedelta(days=1),
+                   successor_from=DEVICE_FROM - timedelta(days=1))
+    before = _snapshot(damaged)
+    assert repair_scd2.pending_alignments(damaged) == 1
+    assert _snapshot(damaged) == before
+    _repair(damaged, "run1")
+    assert repair_scd2.pending_alignments(damaged) == 0, "a second run must be a no-op"
+
+
+def test_alignment_alone_makes_apply_mutate(damaged, monkeypatch):
+    """On an already-repaired database, a pending alignment still gets applied —
+    with a backup, since it rewrites rows."""
+    assert _run_main(monkeypatch, "--apply") == 0
+    _drop_backups(damaged)
+    _add_backdated(damaged, "sensor.no_states")
+
+    assert _run_main(monkeypatch, "--apply") == 0
+    assert _starts(damaged, "sensor.no_states") == [DEVICE_FROM]
+    with damaged.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_tables WHERE tablename LIKE %s",
+                    ("entities_prerepair_%",))
+        assert cur.fetchone()[0] == 1

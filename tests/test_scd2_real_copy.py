@@ -76,6 +76,7 @@ def baseline(conn):
         "violations": _violations(conn),
         "rows": _row_counts(conn),
         "valid_from": _valid_from_checksum(conn),
+        "starts": _starts(conn),
         "fanout": _fanout(conn),
         "states_flat": _states_flat_count(conn),
         "gaps": _gap_set(conn),
@@ -150,6 +151,16 @@ def _valid_from_checksum(conn) -> dict:
     return out
 
 
+def _starts(conn) -> dict:
+    """Every (id, valid_from) pair per table, for diffing what the repair moved."""
+    out = {}
+    with conn.cursor() as cur:
+        for table, key in const.SCD2_DIMENSIONS:
+            cur.execute(f"SELECT {key}::text, valid_from FROM {table}")
+            out[table] = sorted(cur.fetchall())
+    return out
+
+
 def _fanout(conn):
     """Entities whose `valid_to IS NULL` join returns more rows than they have.
 
@@ -200,9 +211,29 @@ def test_repair_converges_on_real_history(conn, baseline):
     assert _violations(conn) == _clean()
 
 
-def test_repair_wrote_no_valid_from(conn, baseline):
-    """The anchor the whole reconstruction trusts must come through untouched."""
-    assert _valid_from_checksum(conn) == baseline["valid_from"]
+def test_repair_moved_valid_from_only_to_align_entity_starts(conn, baseline):
+    """The anchor the reconstruction trusts comes through untouched, except for
+    entity first versions moved later to their device's start — each one
+    archived, and none past the entity's first state."""
+    after = _starts(conn)
+    for table, _key in const.SCD2_DIMENSIONS:
+        if table != "entities":
+            assert after[table] == baseline["starts"][table], table
+
+    removed = sorted(set(baseline["starts"]["entities"]) - set(after["entities"]))
+    added = dict(set(after["entities"]) - set(baseline["starts"]["entities"]))
+    with conn.cursor() as cur:
+        cur.execute("SELECT id_value, (row_data->>'valid_from')::timestamptz"
+                    " FROM scd2_repair_quarantine"
+                    " WHERE run_id = %s AND reason = 'start_aligned_to_device'", (_RUN,))
+        assert sorted(cur.fetchall()) == removed, "every moved start must be archived"
+        for entity_id, old_from in removed:
+            new_from = added[entity_id]
+            assert new_from > old_from, entity_id
+            cur.execute("SELECT min(last_updated) FROM states WHERE entity_id = %s",
+                        (entity_id,))
+            first_state = cur.fetchone()[0]
+            assert first_state is None or new_from <= first_state, entity_id
 
 
 def test_repair_deleted_nothing(conn, baseline):

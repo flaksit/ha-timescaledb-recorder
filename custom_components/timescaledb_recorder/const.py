@@ -594,14 +594,16 @@ SCD2_OPEN_UNIQUE_IDX_SQL = {
 # SCD2 repair SQL (issue #17) — consumed by repair_scd2.py
 # ----------------------------------------------------------------------------
 #
-# Anchor principle: TRUST valid_from, NEVER WRITE IT.
+# Anchor principle: TRUST valid_from, NEVER WRITE IT — with one exception, an
+# entity starting before its device (SCD2_ALIGN_START_SQL, below), which only
+# ever moves a start later and never past a recorded state.
 #
 # valid_from is stamped in the event loop at event time and is the one field both
 # defects leave intact — the close-timestamp bug corrupts only valid_to, and the
 # enqueue-ordering bug corrupts only arrival order, not the timestamp already
 # baked into the queued payload. So the repair reconstructs every interval from
-# valid_from ordering alone and writes valid_to only. It never invents, shifts,
-# or nudges a timestamp, and by default it never deletes a row.
+# valid_from ordering alone and writes valid_to only. It never invents or
+# extends a timestamp, and by default it never deletes a row.
 #
 # Why that converges, which matters because this runs once against real history:
 # after the rebuild, row i's valid_to is <= row i+1's valid_from (it is either
@@ -979,6 +981,72 @@ SCD2_DIM_UNCOVERED_REFS_SQL = {
     "areas": _SCD2_DIM_UNCOVERED_REFS_SQL.format(table="areas", key="area_id"),
     "devices": _SCD2_DIM_UNCOVERED_REFS_SQL.format(table="devices", key="device_id"),
 }
+
+# ---- Align an entity's first version to its device ---------------------------
+#
+# The one exception to "never write valid_from". An entity's first version can
+# start before its device's first version, typically because a one-off history
+# migration backdated entities to a sentinel (2000-01-01) but not their devices.
+# The entity cannot have existed under a device that did not yet exist, so its
+# start moves LATER, to the device's first valid_from — shrinking the interval,
+# never extending it.
+#
+# Bounded by `states`: the new start is least(device start, entity's first
+# state), so it never passes a recorded state and no state loses coverage. If
+# the first state precedes the device, the entity moves to that state and the
+# remainder stays reported under Coverage.
+#
+# Skipped, not guessed: a first version sharing its valid_from with another
+# (ambiguous), and any move that would empty the version. The end is taken as
+# least(valid_to, next valid_from) so the plan answers the same before and after
+# the rebuild — the dry-run preview runs on unrepaired data.
+#
+# The device subquery and the lateral states probe only run for first versions
+# that start before their device, which keeps the hypertable cost to a few
+# hundred index lookups.
+_SCD2_ALIGN_START_CTES = f"""
+ordered AS (
+    SELECT ctid AS rid, entity_id, device_id, valid_from, valid_to,
+           row_number() OVER w AS rn,
+           lead(valid_from) OVER w AS next_from,
+           count(*) OVER (PARTITION BY entity_id, valid_from) AS ties
+      FROM entities
+    WINDOW w AS (PARTITION BY entity_id
+                 ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid)),
+candidates AS (
+    SELECT o.*, d.device_from
+      FROM ordered o
+      JOIN (SELECT device_id, min(valid_from) AS device_from
+              FROM devices GROUP BY device_id) d ON d.device_id = o.device_id
+     WHERE o.rn = 1 AND o.ties = 1 AND d.device_from > o.valid_from),
+plan AS (
+    SELECT c.rid, c.entity_id, least(c.device_from, s.first_state) AS new_from
+      FROM candidates c
+      CROSS JOIN LATERAL (
+          SELECT min(st.last_updated) AS first_state
+            FROM {TABLE_NAME} st WHERE st.entity_id = c.entity_id) s
+     WHERE least(c.device_from, s.first_state) > c.valid_from
+       AND least(c.device_from, s.first_state)
+           < least(COALESCE(c.valid_to, 'infinity'::timestamptz),
+                   COALESCE(c.next_from, 'infinity'::timestamptz)))
+"""
+
+SCD2_ALIGN_START_PREVIEW_SQL = (
+    "WITH " + _SCD2_ALIGN_START_CTES + "SELECT count(*) FROM plan;"
+)
+
+# Archives the original row, then moves the start. Both CTEs read the same
+# pre-statement snapshot, so the archived row_data carries the old valid_from.
+SCD2_ALIGN_START_SQL = (
+    "WITH " + _SCD2_ALIGN_START_CTES + """,
+archived AS (
+    INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
+    SELECT %s, 'entities', p.entity_id, 'start_aligned_to_device', to_jsonb(t)
+      FROM plan p JOIN entities t ON t.ctid = p.rid)
+UPDATE entities t SET valid_from = p.new_from
+  FROM plan p WHERE t.ctid = p.rid;
+"""
+)
 
 
 def _per_dimension(template: str) -> dict[str, str]:

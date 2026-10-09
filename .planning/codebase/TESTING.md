@@ -251,7 +251,7 @@ The fixture builds its damage from issue #17's verbatim evidence rows plus every
 
 `pytest-socket` blocks sockets by default, so the module carries `pytest.mark.enable_socket`.
 
-`tests/test_scd2_real_copy.py` is the counterpart for a restored copy of a real instance. It assumes nothing about WHICH entities the copy contains — it measures the damage, repairs, and asserts the invariant holds, `valid_from` is byte-identical, no rows were deleted, every pre-repair gap is still uncovered, fan-out is gone, and a burst of registry changes keeps it clean. It does assume the copy is damaged, and fails loudly if it is not, since a clean copy makes the before/after comparisons vacuous. Its tests run in order against one connection.
+`tests/test_scd2_real_copy.py` is the counterpart for a restored copy of a real instance. It assumes nothing about WHICH entities the copy contains — it measures the damage, repairs, and asserts the invariant holds, `valid_from` is unchanged apart from archived entity-to-device start alignments, no rows were deleted, every pre-repair gap is still uncovered, fan-out is gone, and a burst of registry changes keeps it clean. It does assume the copy is damaged, and fails loudly if it is not, since a clean copy makes the before/after comparisons vacuous. Its tests run in order against one connection.
 
 Set `SCD2_REAL_COPY_DSN` to a **loopback** DSN. The guard checks where the client connected (`conn.info.host`), not what the server reports: a containerised Postgres answers with its bridge address whoever reached it, which is why an earlier version of this check had to allow the whole `172.16/12` range — exactly where a production container lives. No size limit applies here, because a large `states` is the point of this module.
 

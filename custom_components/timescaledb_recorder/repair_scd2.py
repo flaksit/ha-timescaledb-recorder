@@ -29,13 +29,16 @@ is the intended workflow, not an edge case.
 What it does
 ------------
 Reconstructs each dimension's version intervals from `valid_from` ordering alone,
-and writes `valid_to` only. It never writes `valid_from`, and by default it never
+and writes `valid_to` only — with one exception: an entity whose first version
+starts before its device's first version has its start moved later, to the
+device's start, but never past its first recorded state. By default it never
 deletes a row.
 
 Per table, in one all-or-nothing transaction under SHARE ROW EXCLUSIVE:
 
     backup -> [collapse duplicates] -> archive rows the clamp will rewrite
            -> rebuild valid_to -> clamp inverted intervals
+           -> (entities only) align first-version starts to their device
 
 then verify, then add the exclusion constraint if and only if verification is
 clean. Atomicity is per table, not per run: an interrupted run leaves earlier
@@ -59,8 +62,8 @@ Safety
 - A full copy of each table is written to `<table>_prerepair_<utc timestamp>`
   before anything is modified. That is the undo path, and the only complete
   record of the pre-repair `valid_to` values; drop them once satisfied.
-- `scd2_repair_quarantine` holds the rows that were deleted or clamped, with
-  their full payload. Rebuilt `valid_to` values are not archived there — the
+- `scd2_repair_quarantine` holds the rows that were deleted, clamped or
+  start-aligned, with their full original payload. Rebuilt `valid_to` values are not archived there — the
   backup tables carry those.
 - Re-running is safe and converges: a second --apply changes zero rows.
 - The DSN password is visible in the process list. Prefer PGPASSWORD or .pgpass.
@@ -78,6 +81,8 @@ from psycopg.types.json import Jsonb  # pyright: ignore[reportMissingImports]
 try:
     from .const import (
         SCD2_DIMENSIONS,
+        SCD2_ALIGN_START_PREVIEW_SQL,
+        SCD2_ALIGN_START_SQL,
         SCD2_BTREE_GIST_SQL,
         SCD2_CHECK_SKIPPED,
         SCD2_EXCLUDE_CONSTRAINT_SQL,
@@ -118,6 +123,8 @@ except ImportError:
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
     from const import (  # pyright: ignore[reportMissingImports]
         SCD2_DIMENSIONS,
+        SCD2_ALIGN_START_PREVIEW_SQL,
+        SCD2_ALIGN_START_SQL,
         SCD2_BTREE_GIST_SQL,
         SCD2_CHECK_SKIPPED,
         SCD2_EXCLUDE_CONSTRAINT_SQL,
@@ -406,8 +413,13 @@ def report_coverage(conn: psycopg.Connection) -> int:
         if refs:
             versions = sum(row[1] for row in refs)
             print(f"  {len(refs)} {table[:-1]} id(s) referenced by {versions} entity "
-                  f"version(s) have no {table[:-1]} version covering that period, so "
-                  f"states in it get NULL {table[:-1]} metadata.")
+                  f"version(s) have no {table[:-1]} version covering that version's "
+                  f"start. States recorded there, if any, get NULL {table[:-1]} "
+                  "metadata.")
+            if table == "devices":
+                print("  An entity whose first version starts before its device "
+                      "is moved to the device's start by --apply (see Would "
+                      "change); the rest stay as reported.")
             for ref_id, n in refs[:5]:
                 print(f"    {ref_id}: {n} entity version(s)")
             if len(refs) > 5:
@@ -423,6 +435,14 @@ def preview(conn: psycopg.Connection) -> None:
             rebuild = _scalar(cur, SCD2_REPAIR_REBUILD_PREVIEW_SQL[table])
             clamp = _scalar(cur, SCD2_REPAIR_CLAMP_PREVIEW_SQL[table])
         print(f"  {table}: {rebuild} interval(s) would be rebuilt, {clamp} clamped")
+    print(f"  entities: {pending_alignments(conn)} first version(s) would start at "
+          "their device's first version instead")
+
+
+def pending_alignments(conn: psycopg.Connection) -> int:
+    """Entity first versions that start before their device. Read-only."""
+    with conn.cursor() as cur:
+        return int(_scalar(cur, SCD2_ALIGN_START_PREVIEW_SQL) or 0)
 
 
 def _backup_name(table: str, stamp: str) -> str:
@@ -474,6 +494,14 @@ def repair_table(
             cur.execute(SCD2_REPAIR_CLAMP_SQL[table])
             clamped = cur.rowcount
 
+            # After the rebuild, inside the same transaction, so the backup above
+            # covers it. Reads `devices` without locking it: the repair never
+            # writes a device's valid_from, so the device start cannot move.
+            aligned = 0
+            if table == "entities":
+                cur.execute(SCD2_ALIGN_START_SQL, (run_id,))
+                aligned = cur.rowcount
+
     # Reported only after the commit. Announcing the backup from inside the
     # transaction told the operator a table existed that a later failure in the
     # same transaction would roll straight back — and the backup is the undo
@@ -482,6 +510,9 @@ def repair_table(
     if collapsed:
         print(f"  {table}: collapsed {collapsed} duplicate(s) sharing a start and payload")
     print(f"  {table}: rebuilt {rebuilt} interval(s), clamped {clamped}")
+    if aligned:
+        print(f"  {table}: {aligned} first version(s) now start at their device's "
+              "first version")
 
 
 def _id_column(table: str) -> str:
@@ -674,7 +705,7 @@ def main() -> int:
         print("\nFidelity — what the repair cannot decide")
         doubts = report_fidelity(conn)
 
-        print("\nCoverage (informational — nothing here is repairable)")
+        print("\nCoverage (informational)")
         uncovered = report_coverage(conn)
 
         # The opt-in flags act on data the invariant already accepts — duplicate
@@ -683,7 +714,10 @@ def main() -> int:
         # --apply succeeds, which is precisely when the operator has read the
         # Fidelity section above and decided to use them.
         extras = args.collapse_duplicates or args.merge_identical_gaps
-        mutating = not clean or extras
+        # Alignment acts on data the invariant accepts too, so like the extras
+        # it must make a run mutating on its own — but it is not opt-in.
+        aligning = pending_alignments(conn)
+        mutating = not clean or extras or aligning > 0
 
         if not mutating:
             print("\nNothing to repair.")

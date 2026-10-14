@@ -1070,3 +1070,84 @@ def test_alignment_alone_makes_apply_mutate(damaged, monkeypatch):
         cur.execute("SELECT count(*) FROM pg_tables WHERE tablename LIKE %s",
                     ("entities_prerepair_%",))
         assert cur.fetchone()[0] == 1
+
+
+# ---- Late first version extended back to the first state ---------------------
+#
+# A first version stamped after the entity's first state: the registry event
+# fires after the first state is written, and entities created during HA
+# startup are only recorded by the snapshot ~30 s later (#19).
+
+LATE_FROM = BASE + timedelta(days=60)
+
+
+def _created(ts: datetime) -> psycopg.types.json.Jsonb:
+    return psycopg.types.json.Jsonb({"created_at": ts.isoformat()})
+
+
+def _add_late(conn, entity_id: str, created_at: datetime, first_state: datetime,
+              device_id: str | None = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO entities (entity_id, ha_entity_uuid, name, domain, device_id,"
+            " valid_from, valid_to, extra) VALUES (%s,%s,'A','sensor',%s,%s,NULL,%s)",
+            (entity_id, f"uuid-{entity_id}", device_id, LATE_FROM, _created(created_at)))
+    _add_state(conn, entity_id, first_state)
+
+
+def _add_late_device(conn, device_id: str, created_at: datetime) -> None:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO devices (device_id, name, valid_from, valid_to, extra)"
+                    " VALUES (%s,'Late',%s,NULL,%s)",
+                    (device_id, LATE_FROM, _created(created_at)))
+
+
+def _device_starts(conn, device_id: str) -> list:
+    with conn.cursor() as cur:
+        cur.execute("SELECT valid_from FROM devices WHERE device_id = %s"
+                    " ORDER BY valid_from", (device_id,))
+        return [row[0] for row in cur.fetchall()]
+
+
+def test_late_first_version_moves_back_to_the_first_state(damaged):
+    first_state = LATE_FROM - timedelta(seconds=30)
+    _add_late(damaged, "sensor.late", first_state - timedelta(milliseconds=1), first_state)
+    _repair(damaged)
+    assert _starts(damaged, "sensor.late") == [first_state]
+    with damaged.cursor() as cur:
+        cur.execute(const.SCD2_STATES_UNCOVERED_SQL)
+        assert "sensor.late" not in {row[0] for row in cur.fetchall()}
+        cur.execute("SELECT count(*) FROM scd2_repair_quarantine"
+                    " WHERE reason = 'start_extended_to_first_state'")
+        assert cur.fetchone()[0] == 1
+
+
+def test_no_move_when_the_registry_entry_is_younger_than_the_state(damaged):
+    """created_at after the first state: the state does not prove this entry existed."""
+    first_state = LATE_FROM - timedelta(seconds=30)
+    _add_late(damaged, "sensor.younger", first_state + timedelta(seconds=1), first_state)
+    _repair(damaged)
+    assert _starts(damaged, "sensor.younger") == [LATE_FROM]
+
+
+def test_device_follows_its_extended_entity(damaged):
+    first_state = LATE_FROM - timedelta(seconds=30)
+    _add_late_device(damaged, "dev_lag", first_state - timedelta(seconds=1))
+    _add_late(damaged, "sensor.on_dev", first_state - timedelta(seconds=1), first_state,
+              device_id="dev_lag")
+    assert repair_scd2.pending_extensions(damaged) == (1, 1), (
+        "the device preview must project the entity move")
+    _repair(damaged)
+    assert _device_starts(damaged, "dev_lag") == [first_state]
+    assert repair_scd2.pending_extensions(damaged) == (0, 0), "a second run is a no-op"
+
+
+def test_device_never_moves_before_its_own_creation(damaged):
+    first_state = LATE_FROM - timedelta(seconds=30)
+    device_created = first_state + timedelta(seconds=10)
+    _add_late_device(damaged, "dev_young", device_created)
+    _add_late(damaged, "sensor.on_young", first_state - timedelta(seconds=1), first_state,
+              device_id="dev_young")
+    _repair(damaged)
+    assert _starts(damaged, "sensor.on_young") == [first_state]
+    assert _device_starts(damaged, "dev_young") == [device_created]

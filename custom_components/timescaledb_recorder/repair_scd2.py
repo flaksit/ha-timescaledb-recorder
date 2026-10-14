@@ -29,16 +29,23 @@ is the intended workflow, not an edge case.
 What it does
 ------------
 Reconstructs each dimension's version intervals from `valid_from` ordering alone,
-and writes `valid_to` only — with one exception: an entity whose first version
-starts before its device's first version has its start moved later, to the
-device's start, but never past its first recorded state. By default it never
-deletes a row.
+and writes `valid_to` only — with two exceptions, both for first versions only:
+
+- an entity whose first version starts before its device's first version is
+  moved later, to the device's start, but never past its first recorded state;
+- a first version that starts after the entity's first state, while the registry
+  entry's `created_at` shows it already existed, is moved back to that first
+  state; the entity's device follows, bounded by its own `created_at`.
+
+By default it never deletes a row.
 
 Per table, in one all-or-nothing transaction under SHARE ROW EXCLUSIVE:
 
     backup -> [collapse duplicates] -> archive rows the clamp will rewrite
            -> rebuild valid_to -> clamp inverted intervals
-           -> (entities only) align first-version starts to their device
+           -> entities: align first-version starts to their device,
+                        extend late first versions back to the first state
+           -> devices:  extend late first versions back to their entities
 
 then verify, then add the exclusion constraint if and only if verification is
 clean. Atomicity is per table, not per run: an interrupted run leaves earlier
@@ -62,8 +69,8 @@ Safety
 - A full copy of each table is written to `<table>_prerepair_<utc timestamp>`
   before anything is modified. That is the undo path, and the only complete
   record of the pre-repair `valid_to` values; drop them once satisfied.
-- `scd2_repair_quarantine` holds the rows that were deleted, clamped or
-  start-aligned, with their full original payload. Rebuilt `valid_to` values are not archived there — the
+- `scd2_repair_quarantine` holds the rows that were deleted, clamped or had
+  their start moved, with their full original payload. Rebuilt `valid_to` values are not archived there — the
   backup tables carry those.
 - Re-running is safe and converges: a second --apply changes zero rows.
 - The DSN password is visible in the process list. Prefer PGPASSWORD or .pgpass.
@@ -83,6 +90,10 @@ try:
         SCD2_DIMENSIONS,
         SCD2_ALIGN_START_PREVIEW_SQL,
         SCD2_ALIGN_START_SQL,
+        SCD2_EXTEND_DEVICE_PREVIEW_SQL,
+        SCD2_EXTEND_DEVICE_SQL,
+        SCD2_EXTEND_ENTITY_PREVIEW_SQL,
+        SCD2_EXTEND_ENTITY_SQL,
         SCD2_BTREE_GIST_SQL,
         SCD2_CHECK_SKIPPED,
         SCD2_EXCLUDE_CONSTRAINT_SQL,
@@ -125,6 +136,10 @@ except ImportError:
         SCD2_DIMENSIONS,
         SCD2_ALIGN_START_PREVIEW_SQL,
         SCD2_ALIGN_START_SQL,
+        SCD2_EXTEND_DEVICE_PREVIEW_SQL,
+        SCD2_EXTEND_DEVICE_SQL,
+        SCD2_EXTEND_ENTITY_PREVIEW_SQL,
+        SCD2_EXTEND_ENTITY_SQL,
         SCD2_BTREE_GIST_SQL,
         SCD2_CHECK_SKIPPED,
         SCD2_EXCLUDE_CONSTRAINT_SQL,
@@ -400,7 +415,9 @@ def report_coverage(conn: psycopg.Connection) -> int:
               "valid_from, after the last close, or inside a gap. Those come back "
               "from states_flat with NULL entity metadata. States before the first "
               "version are normal on an install whose history predates the "
-              "dimension; the rest are worth reading the Fidelity section for.")
+              "dimension; --apply moves a first version back to its first state "
+              "when the registry entry already existed then (see Would change). "
+              "The rest are worth reading the Fidelity section for.")
         for entity_id, states, first_seen, last_seen in uncovered[:5]:
             print(f"    {entity_id}: {states} states, {first_seen} -> {last_seen}")
         if len(uncovered) > 5:
@@ -437,12 +454,22 @@ def preview(conn: psycopg.Connection) -> None:
         print(f"  {table}: {rebuild} interval(s) would be rebuilt, {clamp} clamped")
     print(f"  entities: {pending_alignments(conn)} first version(s) would start at "
           "their device's first version instead")
+    entities, devices = pending_extensions(conn)
+    print(f"  entities: {entities} first version(s) would start at their first state")
+    print(f"  devices: {devices} first version(s) would start at their earliest entity")
 
 
 def pending_alignments(conn: psycopg.Connection) -> int:
     """Entity first versions that start before their device. Read-only."""
     with conn.cursor() as cur:
         return int(_scalar(cur, SCD2_ALIGN_START_PREVIEW_SQL) or 0)
+
+
+def pending_extensions(conn: psycopg.Connection) -> tuple[int, int]:
+    """(entity, device) first versions that start late. Read-only."""
+    with conn.cursor() as cur:
+        return (int(_scalar(cur, SCD2_EXTEND_ENTITY_PREVIEW_SQL) or 0),
+                int(_scalar(cur, SCD2_EXTEND_DEVICE_PREVIEW_SQL) or 0))
 
 
 def _backup_name(table: str, stamp: str) -> str:
@@ -495,12 +522,18 @@ def repair_table(
             clamped = cur.rowcount
 
             # After the rebuild, inside the same transaction, so the backup above
-            # covers it. Reads `devices` without locking it: the repair never
-            # writes a device's valid_from, so the device start cannot move.
-            aligned = 0
+            # covers them. Entities run first (SCD2_DIMENSIONS order) and read
+            # `devices` unlocked: devices only change in their own transaction,
+            # which comes later and reads the entity starts committed here.
+            aligned = extended = 0
             if table == "entities":
                 cur.execute(SCD2_ALIGN_START_SQL, (run_id,))
                 aligned = cur.rowcount
+                cur.execute(SCD2_EXTEND_ENTITY_SQL, (run_id,))
+                extended = cur.rowcount
+            elif table == "devices":
+                cur.execute(SCD2_EXTEND_DEVICE_SQL, (run_id,))
+                extended = cur.rowcount
 
     # Reported only after the commit. Announcing the backup from inside the
     # transaction told the operator a table existed that a later failure in the
@@ -513,6 +546,8 @@ def repair_table(
     if aligned:
         print(f"  {table}: {aligned} first version(s) now start at their device's "
               "first version")
+    if extended:
+        print(f"  {table}: {extended} late first version(s) moved back")
 
 
 def _id_column(table: str) -> str:
@@ -714,10 +749,10 @@ def main() -> int:
         # --apply succeeds, which is precisely when the operator has read the
         # Fidelity section above and decided to use them.
         extras = args.collapse_duplicates or args.merge_identical_gaps
-        # Alignment acts on data the invariant accepts too, so like the extras
-        # it must make a run mutating on its own — but it is not opt-in.
-        aligning = pending_alignments(conn)
-        mutating = not clean or extras or aligning > 0
+        # Start moves act on data the invariant accepts too, so like the extras
+        # they must make a run mutating on their own — but they are not opt-in.
+        moving = pending_alignments(conn) + sum(pending_extensions(conn))
+        mutating = not clean or extras or moving > 0
 
         if not mutating:
             print("\nNothing to repair.")

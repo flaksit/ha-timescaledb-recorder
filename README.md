@@ -296,7 +296,7 @@ An id's first version starts at the registry entry's `created_at` rather than th
 
 An entry removed while HA was down is not detected: its version stays open.
 
-The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates.
+The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates. Registry changes queue on disk until that setup has finished.
 
 ### When a change cannot be written
 

@@ -908,3 +908,24 @@ def test_backfill_wait_cleared_on_done():
     t = _make_thread()
     _run_backfill_once(t, BACKFILL_DONE)
     assert t.backfill_wait_since is None
+
+
+def test_schema_ready_is_set_after_schema_setup():
+    t = _make_thread()
+    t._schema_ready = MagicMock()
+    # Stop right after setup so the main loop exits.
+    t._setup_schema = MagicMock()
+    t._schema_ready.set.side_effect = t._stop_event.set
+
+    t._run_main_loop()
+    t._schema_ready.set.assert_called_once()
+
+
+def test_schema_ready_stays_unset_when_setup_is_interrupted():
+    t = _make_thread()
+    t._schema_ready = MagicMock()
+    # The retry wrapper returns None on shutdown, as it does on success.
+    t._setup_schema = MagicMock(side_effect=t._stop_event.set)
+
+    t._run_main_loop()
+    t._schema_ready.set.assert_not_called()

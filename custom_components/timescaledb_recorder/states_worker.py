@@ -101,6 +101,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         chunk_interval_days: int,
         compress_after_hours: int,
         stats: StatesWriteStats | None = None,
+        schema_ready: threading.Event | None = None,
     ) -> None:
         super().__init__(daemon=True, name="timescaledb_states_worker")
         self._hass = hass
@@ -113,6 +114,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._compress_after_hours = compress_after_hours
         self._conn: psycopg.Connection | None = None
         self.stats = stats if stats is not None else StatesWriteStats()
+        self._schema_ready = schema_ready if schema_ready is not None else threading.Event()
         # Watchdog-readable hang detection (issue #14): calls in flight, and
         # since when the worker has been waiting on the backfill queue (None
         # outside MODE_BACKFILL or while it is writing a slice).
@@ -339,6 +341,9 @@ class TimescaledbStateRecorderThread(threading.Thread):
         in run() can wrap it cleanly (MEDIUM-8 pattern)."""
         self._last_op = "schema_setup"
         self._setup_schema()
+        # None from the retry wrapper also means "interrupted by shutdown".
+        if not self._stop_event.is_set():
+            self._schema_ready.set()
 
         mode = MODE_INIT
         self._last_mode = mode

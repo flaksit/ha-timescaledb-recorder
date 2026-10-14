@@ -71,6 +71,7 @@ class _MockRuntime:
     chunk_interval_days: int = 7
     compress_after_hours: int = 2
     states_stats: object = None
+    schema_ready: threading.Event = field(default_factory=threading.Event)
 
 
 def _alive_worker():
@@ -682,6 +683,7 @@ def test_spawn_states_worker_uses_runtime_fields():
         chunk_interval_days=14,
         compress_after_hours=4,
         stats=runtime.states_stats,
+        schema_ready=runtime.schema_ready,
     )
     assert result is mock_instance
 
@@ -717,6 +719,7 @@ def test_spawn_meta_worker_uses_runtime_fields():
         meta_queue=meta_q,
         registry_listener=registry_listener,
         stop_event=stop_ev,
+        schema_ready=runtime.schema_ready,
     )
     assert result is mock_instance
 

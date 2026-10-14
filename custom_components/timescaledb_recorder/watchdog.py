@@ -81,6 +81,7 @@ def spawn_states_worker(
         chunk_interval_days=runtime.chunk_interval_days,
         compress_after_hours=runtime.compress_after_hours,
         stats=runtime.states_stats,
+        schema_ready=runtime.schema_ready,
     )
 
 
@@ -95,6 +96,7 @@ def spawn_meta_worker(
         meta_queue=runtime.meta_queue,
         registry_listener=runtime.registry_listener,
         stop_event=runtime.stop_event,
+        schema_ready=runtime.schema_ready,
     )
 
 

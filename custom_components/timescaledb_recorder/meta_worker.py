@@ -94,6 +94,9 @@ _SCD2_SQL = {
 
 _RECONCILE_ACTIONS = frozenset({"create", "update", "snapshot"})
 
+# How often a schema wait re-checks stop_event (it cannot wait on both events).
+_SCHEMA_WAIT_POLL_S = 1.0
+
 
 class TimescaledbMetaRecorderThread(threading.Thread):
     """Daemon thread draining PersistentQueue and dispatching SCD2 writes."""
@@ -105,6 +108,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         meta_queue: "PersistentQueue",
         registry_listener: "RegistryListener",
         stop_event: threading.Event,
+        schema_ready: threading.Event | None = None,
     ) -> None:
         super().__init__(daemon=True, name="timescaledb_meta_worker")
         self._hass = hass
@@ -112,6 +116,8 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         self._meta_queue = meta_queue
         self._registry_listener = registry_listener
         self._stop_event = stop_event
+        # Set by the states worker once the schema exists. None: no wait.
+        self._schema_ready = schema_ready
         self._conn: psycopg.Connection | None = None
         # Watchdog-readable hang detection (issue #14).
         self.db_calls = DbCallTracker()
@@ -286,6 +292,8 @@ class TimescaledbMetaRecorderThread(threading.Thread):
     def _run_main_loop(self) -> None:
         """Inner main loop extracted from run() so the outer try/except/finally
         in run() can wrap it cleanly (MEDIUM-8 pattern)."""
+        if not self._wait_for_schema():
+            return
         while not self._stop_event.is_set():
             item = self._meta_queue.get()  # blocks on Condition; None on wake
             if item is None or self._stop_event.is_set():
@@ -304,6 +312,21 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             self._meta_queue.task_done()
         # Connection is NOT closed here — the finally block in run() handles
         # teardown unconditionally (MEDIUM-8: single teardown path).
+
+    def _wait_for_schema(self) -> bool:
+        """Block until the states worker has created the schema; False on shutdown.
+
+        On a fresh install the tables, metadata_deadletter included, do not
+        exist until then, and every item would fail as poison.
+        """
+        if self._schema_ready is None or self._schema_ready.is_set():
+            return True
+        self._last_op = "wait_for_schema"
+        _LOGGER.debug("%s: waiting for the states worker to set up the schema", self.name)
+        while not self._schema_ready.wait(timeout=_SCHEMA_WAIT_POLL_S):
+            if self._stop_event.is_set():
+                return False
+        return not self._stop_event.is_set()
 
     # ------------------------------------------------------------------
     # Dispatch (D-05-c)

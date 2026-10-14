@@ -148,6 +148,9 @@ class TimescaledbRecorderData:
     entity_filter: Callable[[str], bool]    # entity filter for orchestrator relaunch kwargs
     # Shared with every states worker incarnation so "last write" survives a respawn.
     states_stats: StatesWriteStats = field(default_factory=StatesWriteStats)
+    # Set once by the first states worker to finish schema setup, never
+    # cleared; the meta worker writes nothing before it (fresh install).
+    schema_ready: threading.Event = field(default_factory=threading.Event)
 
 
 TimescaledbRecorderConfigEntry = ConfigEntry[TimescaledbRecorderData]

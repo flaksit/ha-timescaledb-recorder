@@ -708,3 +708,42 @@ def test_transient_failure_is_not_dropped(mock_psycopg_conn):
 
     assert w.poison_drops == 0
     meta_queue.task_done.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Fresh install: no writes before the states worker has created the schema
+# ---------------------------------------------------------------------------
+
+def test_meta_worker_waits_for_schema_before_reading_the_queue():
+    schema_ready = threading.Event()
+    meta_queue = MagicMock()
+    meta_queue.get.return_value = None  # wake → loop exits
+    w = TimescaledbMetaRecorderThread(
+        hass=MagicMock(), dsn="postgresql://", meta_queue=meta_queue,
+        registry_listener=MagicMock(), stop_event=threading.Event(),
+        schema_ready=schema_ready,
+    )
+    w.start()
+    w.join(timeout=0.2)
+    assert w.is_alive()
+    meta_queue.get.assert_not_called()
+
+    schema_ready.set()
+    w.join(timeout=5)
+    assert not w.is_alive()
+    meta_queue.get.assert_called_once()
+
+
+def test_meta_worker_schema_wait_ends_on_shutdown():
+    stop_event = threading.Event()
+    meta_queue = MagicMock()
+    w = TimescaledbMetaRecorderThread(
+        hass=MagicMock(), dsn="postgresql://", meta_queue=meta_queue,
+        registry_listener=MagicMock(), stop_event=stop_event,
+        schema_ready=threading.Event(),
+    )
+    w.start()
+    stop_event.set()
+    w.join(timeout=5)
+    assert not w.is_alive()
+    meta_queue.get.assert_not_called()

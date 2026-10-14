@@ -1,6 +1,6 @@
 """Database-backed checks that db.connect's bounds are in effect (issue #14).
 
-Runs idempotent schema setup and briefly locks `states`; drops nothing. Same
+Creates, locks and drops its own scratch table; touches nothing else. Same
 guard as the other *_db modules.
 """
 import os
@@ -14,7 +14,6 @@ import psycopg  # noqa: E402  pyright: ignore[reportMissingImports]
 
 from custom_components.timescaledb_recorder import db  # noqa: E402
 from custom_components.timescaledb_recorder.retry import is_transient  # noqa: E402
-from custom_components.timescaledb_recorder.schema import sync_setup_schema  # noqa: E402
 from tests.db_guard import assert_disposable  # noqa: E402
 
 DSN = os.environ.get("SCD2_TEST_DSN")
@@ -67,21 +66,24 @@ def test_schema_setup_window_has_no_statement_timeout(conn):
 
 
 def test_lock_wait_ends_as_transient_error():
+    """Uses its own table: `states` is whatever the previous DB module left, and
+    a plain non-empty one (test_scd2_invariant_db) makes schema setup fail."""
     setup = psycopg.connect(DSN, autocommit=True)
     try:
         assert_disposable(setup)
-        sync_setup_schema(setup)
+        setup.execute("CREATE TABLE IF NOT EXISTS lock_wait_probe (x int)")
+        with patch.object(db, "DB_STATEMENT_TIMEOUT_MS", 500):
+            c = db.connect(DSN)
+        locker = psycopg.connect(DSN)
+        try:
+            locker.execute("LOCK TABLE lock_wait_probe IN ACCESS EXCLUSIVE MODE")
+            with pytest.raises(psycopg.errors.QueryCanceled) as err:
+                c.execute("SELECT count(*) FROM lock_wait_probe")
+            assert is_transient(err.value)
+        finally:
+            locker.rollback()
+            locker.close()
+            c.close()
     finally:
+        setup.execute("DROP TABLE IF EXISTS lock_wait_probe")
         setup.close()
-    with patch.object(db, "DB_STATEMENT_TIMEOUT_MS", 500):
-        c = db.connect(DSN)
-    locker = psycopg.connect(DSN)
-    try:
-        locker.execute("LOCK TABLE states IN ACCESS EXCLUSIVE MODE")
-        with pytest.raises(psycopg.errors.QueryCanceled) as err:
-            c.execute("SELECT count(*) FROM states")
-        assert is_transient(err.value)
-    finally:
-        locker.rollback()
-        locker.close()
-        c.close()

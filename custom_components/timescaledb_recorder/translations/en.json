@@ -57,7 +57,7 @@
     },
     "metadata_dropped": {
       "title": "TimescaleDB recorder dropped a metadata change",
-      "description": "The TimescaleDB recorder gave up on a registry metadata change and dropped it so the metadata queue could keep moving. The full item is kept in the metadata_deadletter table in TimescaleDB, together with the reason it was dropped. This leaves a hole in the dimension history that does not heal on its own: inspect that table, fix the cause, and re-apply the change by editing the entity, device, area or label in Home Assistant. This issue does not clear automatically."
+      "description": "The TimescaleDB recorder gave up on a registry metadata change and dropped it so the metadata queue could keep moving. The full item is kept in the metadata_deadletter table in TimescaleDB, together with the reason it was dropped. This leaves a hole in the dimension history that does not heal on its own: inspect that table, fix the cause, and re-apply the change by editing the entity, device, area or label in Home Assistant. Reason sweep_refused means the startup check for entries removed while Home Assistant was down would have closed an implausible share of the open rows and closed none; rows of genuinely removed entries stay open until closed by hand. This issue does not clear automatically."
     },
     "ingestion_stalled": {
       "title": "TimescaleDB recorder ingestion stalled",

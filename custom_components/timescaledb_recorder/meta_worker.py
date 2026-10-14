@@ -6,10 +6,13 @@ PersistentQueue and dispatches via the Phase 1 SCD2 helpers on the syncer.
 Item-dict schema (D-15-c; produced by plan 09 syncer updates):
     {
         "registry": "entity" | "device" | "area" | "label",
-        "action":   "create" | "update" | "remove" | "snapshot",
+        "action":   "create" | "update" | "remove" | "snapshot" | "sweep",
                                        # "snapshot": startup registry read; same
                                        # reconcile semantics as create/update.
-        "registry_id": str,            # entity_id | device_id | area_id | label_id
+                                       # "sweep": one per registry after the
+                                       # snapshot; closes open rows not in live_ids.
+        "registry_id": str | None,     # entity_id | device_id | area_id | label_id;
+                                       # None on "sweep"
         "old_id": str | None,          # only non-None for entity renames
         "params": list | None,         # JSON-safe; None on remove actions.
                                        # Datetimes serialized as ISO strings;
@@ -22,6 +25,7 @@ Item-dict schema (D-15-c; produced by plan 09 syncer updates):
                                        # is the close time (see
                                        # _close_timestamp). Informational for
                                        # every other action.
+        "live_ids": list[str],         # "sweep" only: ids the registry holds
     }
 """
 from __future__ import annotations
@@ -42,6 +46,7 @@ from .const import (
     DEADLETTER_REASON_INTEGRITY,
     DEADLETTER_REASON_OUT_OF_ORDER,
     DEADLETTER_REASON_POISON,
+    DEADLETTER_REASON_SWEEP_REFUSED,
     METADATA_DEADLETTER_INSERT_SQL,
     SCD2_CLOSE_AREA_SQL,
     SCD2_CLOSE_DEVICE_SQL,
@@ -54,6 +59,10 @@ from .const import (
     SCD2_SNAPSHOT_DEVICE_SQL,
     SCD2_SNAPSHOT_ENTITY_SQL,
     SCD2_SNAPSHOT_LABEL_SQL,
+    SCD2_SWEEP_CLOSE_SQL,
+    SCD2_SWEEP_COUNT_SQL,
+    SCD2_SWEEP_FREE_CLOSES,
+    SCD2_SWEEP_MAX_CLOSE_FRACTION,
 )
 from .db import DbCallTracker, connect
 from .issues import (
@@ -157,8 +166,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         # on_poison dead-letters an item that keeps failing non-transiently; it
         # returns None, so run() task_done()s it like a success (issue #20).
         # No circuit breaker as in the states worker: the startup snapshot
-        # rewrites every live registry entry, so an environment fault that
-        # dead-letters items costs at most intermediate versions and removals.
+        # rewrites every live registry entry and sweeps removed ones, so an
+        # environment fault that dead-letters items costs at most intermediate
+        # versions and the exact time of removals.
         self._write_item = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
@@ -409,7 +419,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         params = self._rehydrate_params(registry, item.get("params"))
         close_ts = self._close_timestamp(registry, params, item.get("enqueued_at"))
 
-        if action == "remove":
+        if action == "sweep":
+            self._process_sweep(item, registry, item["live_ids"], close_ts)
+        elif action == "remove":
             self._process_remove(registry, registry_id, close_ts)
         elif action == "update" and old_id is not None:
             self._process_rename(registry, registry_id, old_id, params, close_ts)
@@ -596,6 +608,44 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         with conn.cursor() as cur:
             cur.execute(close_sql, (close_ts, registry_id, close_ts))
             self._note_removal_skipped(cur, registry, registry_id, close_ts)
+
+    def _process_sweep(self, item: dict, registry: str, live_ids: list[str],
+                       close_ts: datetime) -> None:
+        """Close every open row whose id the registry no longer holds, at close_ts.
+
+        Catches removals made while HA was not running, which no event reports.
+        Replay-safe: a second run finds nothing outside live_ids still open.
+        Refuses implausible sweeps rather than ending history wholesale.
+        """
+        conn = self.get_db_connection()
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(SCD2_SWEEP_COUNT_SQL[registry], (close_ts, live_ids))
+            open_rows, to_close = cur.fetchone()
+            if open_rows and not live_ids:
+                _LOGGER.warning(
+                    "%s: %s registry listed no entries but %d row(s) are open; "
+                    "not closing any", self.name, registry, open_rows,
+                )
+                return
+            refused = (to_close > SCD2_SWEEP_FREE_CLOSES
+                       and to_close > open_rows * SCD2_SWEEP_MAX_CLOSE_FRACTION)
+            if to_close and not refused:
+                cur.execute(SCD2_SWEEP_CLOSE_SQL[registry], (close_ts, close_ts, live_ids))
+                to_close = cur.rowcount
+        if refused:
+            why = (f"would close {to_close} of {open_rows} open {registry} rows, "
+                   f"more than {SCD2_SWEEP_MAX_CLOSE_FRACTION:.0%}")
+            _LOGGER.error(
+                "%s: refused the startup removal sweep: it %s. Rows of entries removed "
+                "while HA was down stay open; the item is in metadata_deadletter.",
+                self.name, why,
+            )
+            self._dead_letter(item, DEADLETTER_REASON_SWEEP_REFUSED, why)
+            return
+        _LOGGER.info(
+            "%s: closed %d open %s row(s) whose entry no longer exists in the registry",
+            self.name, to_close, registry,
+        )
 
     def _process_rename(self, registry: str, registry_id: str, old_id: str,
                         params: tuple, close_ts: datetime) -> None:

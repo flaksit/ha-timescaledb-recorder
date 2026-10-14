@@ -82,15 +82,33 @@ def snapshot_listener(listener, mock_area_registry, mock_label_registry,
 def test_snapshot_items_cover_every_registry_in_dependency_order(snapshot_listener):
     snapshot_listener.enqueue_snapshot()
 
-    items = snapshot_listener._buffer
+    items = [i for i in snapshot_listener._buffer if i["action"] == "snapshot"]
     assert [(i["registry"], i["registry_id"]) for i in items] == [
         ("area", "area-living-room"), ("area", "area-kitchen"),
         ("label", "indoor"), ("label", "climate"),
         ("entity", "sensor.living_room_temp"), ("entity", "switch.plug_kettle_power"),
         ("device", "device-001"), ("device", "device-002"),
     ]
-    assert {i["action"] for i in items} == {"snapshot"}
     assert snapshot_listener._buffer_ready.is_set()
+
+
+def test_snapshot_ends_with_one_sweep_per_registry(snapshot_listener):
+    """Sweeps follow every snapshot item and carry the live ids, JSON-safe."""
+    import json
+
+    snapshot_listener.enqueue_snapshot()
+
+    buffer = snapshot_listener._buffer
+    sweeps = buffer[-4:]
+    assert all(i["action"] == "snapshot" for i in buffer[:-4])
+    assert [(i["action"], i["registry"], i["live_ids"]) for i in sweeps] == [
+        ("sweep", "area", ["area-kitchen", "area-living-room"]),
+        ("sweep", "label", ["climate", "indoor"]),
+        ("sweep", "entity", ["sensor.living_room_temp", "switch.plug_kettle_power"]),
+        ("sweep", "device", ["device-001", "device-002"]),
+    ]
+    assert {i["enqueued_at"] for i in sweeps} == {buffer[0]["enqueued_at"]}
+    assert json.loads(json.dumps(sweeps)) == sweeps
 
 
 def test_snapshot_items_share_one_stamp(snapshot_listener):
@@ -98,7 +116,8 @@ def test_snapshot_items_share_one_stamp(snapshot_listener):
     snapshot_listener.enqueue_snapshot()
     from custom_components.timescaledb_recorder.meta_worker import _VALID_FROM_INDEX
 
-    stamps = {i["params"][_VALID_FROM_INDEX[i["registry"]]] for i in snapshot_listener._buffer}
+    stamps = {i["params"][_VALID_FROM_INDEX[i["registry"]]] for i in snapshot_listener._buffer
+              if i["action"] == "snapshot"}
     assert stamps == {snapshot_listener._buffer[0]["enqueued_at"]}
 
 
@@ -118,7 +137,7 @@ def test_snapshot_lands_between_earlier_and_later_events(snapshot_listener):
 
     actions = [i["action"] for i in snapshot_listener._buffer]
     assert actions[0] == "update" and actions[-1] == "update"
-    assert set(actions[1:-1]) == {"snapshot"}
+    assert set(actions[1:-1]) == {"snapshot", "sweep"}
     stamps = [datetime.fromisoformat(i["enqueued_at"]) for i in snapshot_listener._buffer]
     assert stamps == sorted(stamps)
 

@@ -186,6 +186,93 @@ def test_device_first_version_starts_at_created_at(mock_psycopg_conn):
     assert probe.args[1] == ("dev-1",)
 
 
+# ---------------------------------------------------------------------------
+# Startup removal sweep (issue #19)
+# ---------------------------------------------------------------------------
+
+def _sweep_item(live_ids, registry="entity"):
+    return {"registry": registry, "action": "sweep", "registry_id": None, "old_id": None,
+            "params": None, "live_ids": live_ids, "enqueued_at": EVENT_TS}
+
+
+def _sweep_worker(mock_psycopg_conn, open_rows, to_close):
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    cur.fetchone.return_value = (open_rows, to_close)
+    cur.rowcount = to_close
+    return w, cur
+
+
+def _sqls(cur):
+    return [c.args[0] for c in cur.execute.call_args_list]
+
+
+def test_sweep_closes_rows_missing_from_the_registry(mock_psycopg_conn, caplog):
+    from custom_components.timescaledb_recorder.const import (
+        SCD2_SWEEP_CLOSE_SQL, SCD2_SWEEP_COUNT_SQL)
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=10, to_close=3)
+    with caplog.at_level("INFO"):
+        w._write_item_raw(_sweep_item(["sensor.a"]))
+
+    ts = datetime.fromisoformat(EVENT_TS)
+    assert cur.execute.call_args_list == [
+        call(SCD2_SWEEP_COUNT_SQL["entity"], (ts, ["sensor.a"])),
+        call(SCD2_SWEEP_CLOSE_SQL["entity"], (ts, ts, ["sensor.a"])),
+    ]
+    assert "closed 3 open entity row(s)" in caplog.text
+    w._hass.add_job.assert_not_called()
+
+
+def test_sweep_allows_a_few_closes_on_a_small_table(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import SCD2_SWEEP_CLOSE_SQL
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=3, to_close=2)
+    w._write_item_raw(_sweep_item(["l1"], registry="label"))
+    assert SCD2_SWEEP_CLOSE_SQL["label"] in _sqls(cur)
+
+
+def test_sweep_with_nothing_to_close_writes_nothing(mock_psycopg_conn):
+    """A replayed sweep, or a restart with no removals."""
+    from custom_components.timescaledb_recorder.const import SCD2_SWEEP_CLOSE_SQL
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=5, to_close=0)
+    w._write_item_raw(_sweep_item(["a", "b", "c", "d", "e"]))
+    assert SCD2_SWEEP_CLOSE_SQL["entity"] not in _sqls(cur)
+
+
+def test_sweep_skips_an_empty_registry_listing(mock_psycopg_conn, caplog):
+    from custom_components.timescaledb_recorder.const import (
+        METADATA_DEADLETTER_INSERT_SQL, SCD2_SWEEP_CLOSE_SQL)
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=4, to_close=4)
+    with caplog.at_level("WARNING"):
+        w._write_item_raw(_sweep_item([], registry="area"))
+    assert SCD2_SWEEP_CLOSE_SQL["area"] not in _sqls(cur)
+    assert METADATA_DEADLETTER_INSERT_SQL not in _sqls(cur)
+    assert "area registry listed no entries but 4 row(s) are open" in caplog.text
+
+
+def test_sweep_refuses_to_close_most_open_rows(mock_psycopg_conn, caplog):
+    from custom_components.timescaledb_recorder.const import (
+        DEADLETTER_REASON_SWEEP_REFUSED, METADATA_DEADLETTER_INSERT_SQL, SCD2_SWEEP_CLOSE_SQL)
+    from custom_components.timescaledb_recorder.issues import create_metadata_dropped_issue
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=100, to_close=51)
+    item = _sweep_item(["sensor.a"])
+    with caplog.at_level("ERROR"):
+        w._write_item_raw(item)
+
+    assert SCD2_SWEEP_CLOSE_SQL["entity"] not in _sqls(cur)
+    dl = [c for c in cur.execute.call_args_list if c.args[0] == METADATA_DEADLETTER_INSERT_SQL]
+    reason, registry, registry_id, error, _item = dl[0].args[1]
+    assert (reason, registry, registry_id) == (DEADLETTER_REASON_SWEEP_REFUSED, "entity", None)
+    assert "51 of 100" in error
+    assert "refused the startup removal sweep" in caplog.text
+    assert call(create_metadata_dropped_issue, w._hass) in w._hass.add_job.call_args_list
+
+
 def test_unknown_action_is_ignored(mock_psycopg_conn):
     w, cur = _first_version_worker(mock_psycopg_conn)
     w._write_item_raw(_entity("frobnicate"))

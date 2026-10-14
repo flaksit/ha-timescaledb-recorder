@@ -182,7 +182,7 @@ class RegistryListener:
     Lifecycle:
     - async_start(): register event listeners; every event is enqueued from here on.
     - enqueue_snapshot(): called once HA has started, to append the startup
-      registry snapshot to the same ordered stream.
+      registry snapshot and removal sweeps to the same ordered stream.
     - async_stop(): cancel all event subscriptions and flush.
 
     Design boundary (D-08): registry param extraction MUST happen in @callback context
@@ -194,8 +194,9 @@ class RegistryListener:
     remove with no open row closes nothing. So an event processed before the
     snapshot is safe, and the snapshot repairs whatever drifted while HA was not
     running. A change made while HA was down is therefore stamped with the
-    snapshot time, not the time it happened. A removal while HA was down is not
-    reconciled: the snapshot only sees entries that exist.
+    snapshot time, not the time it happened. So is a removal while HA was down:
+    the sweep after the snapshot closes every open row whose id the registry no
+    longer has.
 
     Event ordering (issue #17): handlers append to an in-memory buffer synchronously
     and a single drain task moves the buffer to the PersistentQueue. Each handler
@@ -242,13 +243,16 @@ class RegistryListener:
 
     @callback
     def enqueue_snapshot(self) -> None:
-        """Append one "snapshot" item per registry entry, in event order.
+        """Append one "snapshot" item per registry entry, then one "sweep" per registry.
 
         Read, stamped and buffered in one synchronous step, so every event item
         already buffered is stamped earlier and every later one later: the
         worker sees them in timestamp order. Going straight to the queue instead
         would race the drain task and could put an earlier event behind the
         snapshot, where the ordering guard would refuse it as out of order.
+
+        A sweep carries the registry's live ids; the worker closes every open
+        row outside them, i.e. entries removed while HA was not running.
 
         Area → label → entity → device: referenced rows land before referencing ones.
         """
@@ -264,20 +268,32 @@ class RegistryListener:
             ("device", _iter_device_entries(self._device_reg), self._extract_device_params,
              lambda e: e.id),
         )
-        items = [
-            {
+        items: list[dict] = []
+        sweeps: list[dict] = []
+        for registry, entries, extract, key in sources:
+            entries = list(entries)
+            items.extend(
+                {
+                    "registry": registry,
+                    "action": "snapshot",
+                    "registry_id": key(entry),
+                    "old_id": None,
+                    "params": _to_json_safe(extract(entry, now)),
+                    "enqueued_at": now_iso,
+                }
+                for entry in entries
+            )
+            sweeps.append({
                 "registry": registry,
-                "action": "snapshot",
-                "registry_id": key(entry),
+                "action": "sweep",
+                "registry_id": None,
                 "old_id": None,
-                "params": _to_json_safe(extract(entry, now)),
+                "params": None,
+                "live_ids": sorted({key(entry) for entry in entries}),
                 "enqueued_at": now_iso,
-            }
-            for registry, entries, extract, key in sources
-            for entry in entries
-        ]
+            })
         # One buffer append → one put_many_async → one fsync (issue #11).
-        self._buffer.extend(items)
+        self._buffer.extend(items + sweeps)
         self._buffer_ready.set()
 
     @callback

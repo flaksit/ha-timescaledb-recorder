@@ -669,6 +669,85 @@ def test_rename_while_down_keeps_snapshot_time(worker, clean_db):
     _clean(worker, clean_db)
 
 
+def _sweep(registry, live_ids, ts=SNAP):
+    return {"registry": registry, "action": "sweep", "registry_id": None, "old_id": None,
+            "params": None, "live_ids": live_ids, "enqueued_at": ts.isoformat()}
+
+
+def _open_ids(conn) -> list:
+    with conn.cursor() as cur:
+        cur.execute("SELECT entity_id FROM entities WHERE valid_to IS NULL ORDER BY 1")
+        return [r[0] for r in cur.fetchall()]
+
+
+def test_removed_while_down_is_closed_at_snapshot_time(worker, clean_db):
+    for eid in ("sensor.kept", "sensor.gone"):
+        worker._write_item_raw(_entity_item("create", eid, "n", BASE, uuid=f"uuid-{eid}"))
+    # Starts after the snapshot: the ordering guard keeps it open.
+    worker._write_item_raw(_entity_item("create", "sensor.later", "n", SNAP + timedelta(seconds=1),
+                                        uuid="uuid-later"))
+    worker._write_item_raw({
+        "registry": "device", "action": "create", "registry_id": "dev-gone", "old_id": None,
+        "params": ["dev-gone", "d", None, None, None, [], BASE.isoformat(), "{}"],
+        "enqueued_at": BASE.isoformat(),
+    })
+    worker._write_item_raw(_entity_item("snapshot", "sensor.kept", "n", SNAP, uuid="uuid-sensor.kept"))
+    worker._write_item_raw(_sweep("entity", ["sensor.kept"]))
+    worker._write_item_raw(_sweep("device", []))
+
+    assert _rows(clean_db, "sensor.gone") == [("n", BASE, SNAP)]
+    assert _open_ids(clean_db) == ["sensor.kept", "sensor.later"]
+    with clean_db.cursor() as cur:
+        # Empty device listing with an open device row: skipped, not closed.
+        cur.execute("SELECT valid_to FROM devices WHERE device_id = 'dev-gone'")
+        assert cur.fetchall() == [(None,)]
+    worker._write_item_raw(_sweep("device", ["dev-other"]))
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT valid_to FROM devices WHERE device_id = 'dev-gone'")
+        assert cur.fetchall() == [(SNAP,)]
+    _clean(worker, clean_db)
+
+
+def test_sweep_replay_is_a_no_op(worker, clean_db):
+    for eid in ("sensor.kept", "sensor.gone"):
+        worker._write_item_raw(_entity_item("create", eid, "n", BASE, uuid=f"uuid-{eid}"))
+    sweep = _sweep("entity", ["sensor.kept"])
+    worker._write_item_raw(sweep)
+    before = _snapshot(clean_db)
+    worker._write_item_raw(sweep)
+    # A later restart's sweep must not move the close time either.
+    worker._write_item_raw(_sweep("entity", ["sensor.kept"], SNAP + timedelta(days=1)))
+
+    assert _snapshot(clean_db) == before
+    assert _rows(clean_db, "sensor.gone") == [("n", BASE, SNAP)]
+    _clean(worker, clean_db)
+
+
+def test_rename_while_down_closes_the_old_id(worker, clean_db):
+    """Snapshot opens the new id at snapshot time; the sweep ends the old one there."""
+    worker._write_item_raw(_entity_item("create", "sensor.before", "n", BASE, uuid="uuid-d"))
+    worker._write_item_raw(_entity_item("create", "sensor.other", "n", BASE, uuid="uuid-o"))
+    worker._write_item_raw(_entity_item("snapshot", "sensor.after", "n", SNAP,
+                                        created_at=BASE, uuid="uuid-d"))
+    worker._write_item_raw(_entity_item("snapshot", "sensor.other", "n", SNAP, uuid="uuid-o"))
+    worker._write_item_raw(_sweep("entity", ["sensor.after", "sensor.other"]))
+
+    assert _rows(clean_db, "sensor.before") == [("n", BASE, SNAP)]
+    assert _rows(clean_db, "sensor.after") == [("n", SNAP, None)]
+    _clean(worker, clean_db)
+
+
+def test_sweep_refuses_to_close_most_open_rows(worker, clean_db):
+    for i in range(4):
+        worker._write_item_raw(_entity_item("create", f"sensor.e{i}", "n", BASE, uuid=f"u{i}"))
+    worker._write_item_raw(_sweep("entity", ["sensor.e0"]))
+
+    assert _open_ids(clean_db) == [f"sensor.e{i}" for i in range(4)]
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT reason, registry, item->'live_ids' FROM metadata_deadletter")
+        assert cur.fetchall() == [(const.DEADLETTER_REASON_SWEEP_REFUSED, "entity", ["sensor.e0"])]
+
+
 def test_states_flat_leaves_a_gap_unlabelled(damaged):
     """A state inside a gap must come back with NULL metadata, not a guess.
 

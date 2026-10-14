@@ -518,6 +518,40 @@ SCD2_ANY_VERSION_SQL = {
     "label": "SELECT 1 FROM labels WHERE label_id = %s LIMIT 1;",
 }
 
+# Startup sweep (issue #19): close open rows whose id is no longer in the
+# registry, i.e. removed while HA was not running. Same `valid_from < close_ts`
+# ordering guard as SCD2_CLOSE_*. The ::text[] cast lets an empty id list adapt.
+# Count: %s = close_ts, %s = live ids → (open rows, rows the sweep would close).
+# Close: %s = close_ts (valid_to), %s = close_ts (guard), %s = live ids.
+_SCD2_SWEEP_COUNT_SQL = (
+    "SELECT count(*), count(*) FILTER (WHERE valid_from < %s AND {key} <> ALL(%s::text[]))"
+    " FROM {table} WHERE valid_to IS NULL;"
+)
+_SCD2_SWEEP_CLOSE_SQL = (
+    "UPDATE {table} SET valid_to = %s"
+    " WHERE valid_to IS NULL AND valid_from < %s AND {key} <> ALL(%s::text[]);"
+)
+_SCD2_REGISTRY_TABLES = {
+    "entity": ("entities", "entity_id"),
+    "device": ("devices", "device_id"),
+    "area": ("areas", "area_id"),
+    "label": ("labels", "label_id"),
+}
+SCD2_SWEEP_COUNT_SQL = {
+    registry: _SCD2_SWEEP_COUNT_SQL.format(table=table, key=key)
+    for registry, (table, key) in _SCD2_REGISTRY_TABLES.items()
+}
+SCD2_SWEEP_CLOSE_SQL = {
+    registry: _SCD2_SWEEP_CLOSE_SQL.format(table=table, key=key)
+    for registry, (table, key) in _SCD2_REGISTRY_TABLES.items()
+}
+# A sweep that would close more than this fraction of a table's open rows is
+# refused and dead-lettered: an incompletely loaded registry must not end the
+# history of everything it failed to list. Closing at most SCD2_SWEEP_FREE_CLOSES
+# rows is always allowed, so small tables (areas, labels) are not stuck.
+SCD2_SWEEP_MAX_CLOSE_FRACTION = 0.5
+SCD2_SWEEP_FREE_CLOSES = 2
+
 # Session statement_timeout handling (see DB_STATEMENT_TIMEOUT_MS). The default
 # is applied only when nothing else configured one, i.e. the value is still '0'.
 # %s = timeout in ms, as text.
@@ -910,6 +944,7 @@ SELECT reason, count(*) AS rows, max(detected_at) AS latest
 DEADLETTER_REASON_INTEGRITY = "scd2_constraint_rejected"
 DEADLETTER_REASON_OUT_OF_ORDER = "arrived_after_newer_version"
 DEADLETTER_REASON_POISON = "non_transient_error"
+DEADLETTER_REASON_SWEEP_REFUSED = "sweep_refused"
 
 # States counterpart (issue #20): rows the states worker gave up on after a
 # chunk failed non-transiently and the row still failed on its own. `row_data`

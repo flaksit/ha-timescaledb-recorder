@@ -19,7 +19,6 @@ import pytest
 
 from custom_components.timescaledb_recorder import (
     TimescaledbRecorderData,
-    _async_initial_registry_backfill,
     _iter_device_entries,
     async_setup_entry,
     async_unload_entry,
@@ -75,18 +74,12 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
     Expected order in async_setup_entry: meta_worker.start (step2), states_worker.start
     (step3), registry_listener.async_start (step6), state_listener.async_start (step7),
     async_at_started registration (step8 — issue #11: replaces async_listen_once).
-
-    Steps 4+5 (persistent queue drain + registry backfill) run inside _async_meta_init
-    background task — not awaited in async_setup_entry, so not in this sequence.
     """
     sequence: list[str] = []
 
     with patch(
         "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.timescaledb_recorder._async_meta_init",
-        new=AsyncMock(),
-    ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
         "custom_components.timescaledb_recorder.StateListener"
@@ -132,7 +125,7 @@ async def test_async_setup_entry_runs_d12_steps_in_order(hass, mock_entry):
         await async_setup_entry(hass, mock_entry)
 
     # async_at_started is called TWICE in async_setup_entry — once to defer
-    # meta_init, once to defer the orchestrator. Both fire after step7.
+    # the registry snapshot, once to defer the orchestrator. Both fire after step7.
     assert sequence == ["step2", "step3", "step6", "step7", "step8", "step8"], (
         f"D-12 steps must fire in order. Got: {sequence}"
     )
@@ -143,9 +136,6 @@ async def test_setup_entry_returns_true(hass, mock_entry):
     with patch(
         "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
-    ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
         "custom_components.timescaledb_recorder.StateListener"
@@ -196,9 +186,6 @@ async def test_setup_entry_runtime_data_has_all_fields(hass, mock_entry):
     with patch(
         "custom_components.timescaledb_recorder.PersistentQueue"
     ) as MockPQ, patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
-    ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
         "custom_components.timescaledb_recorder.StateListener"
@@ -411,9 +398,6 @@ async def test_setup_spawns_workers_via_factories(hass, mock_entry):
     ), patch(
         "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
-    ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
         "custom_components.timescaledb_recorder.StateListener"
@@ -472,9 +456,6 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
         "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
         "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
-    ), patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
     ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
@@ -555,9 +536,6 @@ async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entr
     ), patch(
         "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
-    ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
         "custom_components.timescaledb_recorder.StateListener"
@@ -600,16 +578,20 @@ async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entr
 
         await async_setup_entry(hass, mock_entry)
 
-        # async_at_started was registered twice: once for meta_init, once for
+        # async_at_started was registered twice: once for the registry snapshot, once for
         # the orchestrator. Fire BOTH callbacks (order matches setup_entry).
         # The orchestrator callback ultimately calls backfill_orchestrator.
         assert len(registered_callbacks) == 2, (
-            f"Expected 2 async_at_started registrations (meta_init + orchestrator), "
+            f"Expected 2 async_at_started registrations (registry snapshot + orchestrator), "
             f"got {len(registered_callbacks)}"
         )
+        MockRL.return_value.enqueue_snapshot.assert_not_called()
         for cb in registered_callbacks:
             cb(hass)  # simulate HA reaching RUNNING
 
+    # Snapshot only once HA is RUNNING (issue #11), straight into the listener's
+    # ordered buffer (issue #19).
+    MockRL.return_value.enqueue_snapshot.assert_called_once_with()
     assert mock_orch.called, "backfill_orchestrator not called"
     _, call_kwargs = mock_orch.call_args
     assert "threading_stop_event" in call_kwargs, (
@@ -929,9 +911,6 @@ async def test_recorder_disabled_check_fires_issue_on_keyerror(hass, mock_entry)
     ), patch(
         "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
     ), patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
-    ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
         "custom_components.timescaledb_recorder.StateListener"
@@ -978,9 +957,6 @@ async def test_recorder_disabled_check_fires_issue_when_enabled_false(hass, mock
         "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
         "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
-    ), patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
     ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
@@ -1029,9 +1005,6 @@ async def test_recorder_disabled_check_silent_when_enabled_true(hass, mock_entry
         "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
         "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
-    ), patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
     ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
@@ -1089,9 +1062,6 @@ async def test_recorder_disabled_spawns_wait_task_on_issue_raised(hass, mock_ent
         "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
     ), patch(
         "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
-    ), patch(
-        "custom_components.timescaledb_recorder._async_initial_registry_backfill",
-        new=AsyncMock(),
     ), patch(
         "custom_components.timescaledb_recorder.RegistryListener"
     ) as MockRL, patch(
@@ -1359,29 +1329,3 @@ def test_iter_device_entries_resolves_ids_on_older_ha():
     reg.async_get = MagicMock(side_effect=devices.get)
 
     assert list(_iter_device_entries(reg)) == entries
-
-
-async def test_initial_registry_backfill_enqueues_devices(
-    mock_area_registry, mock_label_registry, mock_entity_registry, mock_device_registry,
-):
-    """Initial snapshot enqueues one create item per device entry."""
-    meta_queue = MagicMock()
-    meta_queue.put_many_async = AsyncMock()
-    with patch(
-        "custom_components.timescaledb_recorder.ar.async_get",
-        return_value=mock_area_registry,
-    ), patch(
-        "custom_components.timescaledb_recorder.lr.async_get",
-        return_value=mock_label_registry,
-    ), patch(
-        "custom_components.timescaledb_recorder.er.async_get",
-        return_value=mock_entity_registry,
-    ), patch(
-        "custom_components.timescaledb_recorder.dr.async_get",
-        return_value=mock_device_registry,
-    ):
-        await _async_initial_registry_backfill(MagicMock(), meta_queue)
-
-    items = meta_queue.put_many_async.await_args.args[0]
-    device_ids = [i["registry_id"] for i in items if i["registry"] == "device"]
-    assert device_ids == ["device-001", "device-002"]

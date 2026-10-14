@@ -10,6 +10,7 @@ from custom_components.timescaledb_recorder.const import (
     SCD2_CLOSE_AREA_SQL,
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
+    SCD2_ANY_VERSION_SQL,
     SCD2_CLOSE_LABEL_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
     SCD2_SNAPSHOT_DEVICE_SQL,
@@ -68,12 +69,127 @@ def test_write_item_entity_create_uses_snapshot_sql(mock_psycopg_conn):
     }
     w._write_item_raw(item)
     args = cur.execute.call_args_list
-    # First execute is the snapshot SQL
-    sql, params = args[0].args
-    assert sql == SCD2_SNAPSHOT_ENTITY_SQL
+    # Reconcile: close whatever differs, then the guarded insert.
+    assert [a.args[0] for a in args] == [SCD2_CLOSE_ENTITY_SQL, SCD2_SNAPSHOT_ENTITY_SQL]
+    sql, params = args[1].args
     assert params[0] == "sensor.x"
     # entity_id appears twice: once in SELECT, once in WHERE NOT EXISTS
     assert params[-1] == "sensor.x"
+
+
+# ---------------------------------------------------------------------------
+# Reconcile path and first-version start (issue #19)
+# ---------------------------------------------------------------------------
+
+EVENT_TS = "2026-04-21T12:00:00+00:00"
+CREATED = "2026-04-21 11:59:30.500000+00:00"  # str(datetime), as _build_extra writes it
+
+
+def _entity(action="snapshot", extra='{"created_at": "%s"}' % CREATED, old_id=None,
+            entity_id="sensor.x"):
+    return {
+        "registry": "entity", "action": action,
+        "registry_id": entity_id, "old_id": old_id,
+        "params": [entity_id, "uuid-x", "n", "sensor", "zha", None, None,
+                   [], None, None, None, EVENT_TS, extra],
+        "enqueued_at": EVENT_TS,
+    }
+
+
+def _first_version_worker(mock_psycopg_conn, *, closed: int = 0, history=None, changed=True):
+    """Worker whose close touched `closed` rows and whose history probe returns `history`."""
+    conn, cur = mock_psycopg_conn
+    rl = MagicMock()
+    for name in ("_entity_row_changed", "_device_row_changed",
+                 "_area_row_changed", "_label_row_changed"):
+        getattr(rl, name).return_value = changed
+    w = _make_worker(registry_listener=rl)
+    w._conn = conn
+    rowcounts = iter([closed, 1])  # close, then insert
+    type(cur).rowcount = property(lambda _self: next(rowcounts, 1))
+    cur.fetchone.return_value = history
+    return w, cur
+
+
+def _inserted_valid_from(cur, sql=SCD2_SNAPSHOT_ENTITY_SQL, idx=11):
+    params = next(c.args[1] for c in cur.execute.call_args_list if c.args[0] == sql)
+    return params[idx]
+
+
+@pytest.mark.parametrize("action", ["create", "update", "snapshot"])
+def test_reconcile_actions_write_nothing_when_the_open_row_matches(mock_psycopg_conn, action):
+    """Replaying a snapshot, or any already-applied change, must be a no-op."""
+    w, cur = _first_version_worker(mock_psycopg_conn, changed=False)
+    w._write_item_raw(_entity(action))
+    cur.execute.assert_not_called()
+    assert w.out_of_order_skips == 0
+
+
+def test_snapshot_closes_and_inserts_on_drift(mock_psycopg_conn):
+    """A registry that drifted while HA was down is stamped at snapshot time."""
+    w, cur = _first_version_worker(mock_psycopg_conn, closed=1)
+    w._write_item_raw(_entity())
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert sqls == [SCD2_CLOSE_ENTITY_SQL, SCD2_SNAPSHOT_ENTITY_SQL]
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+
+
+def test_first_version_starts_at_created_at(mock_psycopg_conn):
+    w, cur = _first_version_worker(mock_psycopg_conn, history=None)
+    w._write_item_raw(_entity())
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(CREATED)
+    probe = next(c for c in cur.execute.call_args_list
+                 if c.args[0] == SCD2_ANY_VERSION_SQL["entity"])
+    # The uuid is checked too: a rename while HA was down keeps created_at.
+    assert probe.args[1] == ("sensor.x", "uuid-x")
+
+
+def test_id_with_history_keeps_event_time(mock_psycopg_conn):
+    """A gap after a removal is real; created_at must not paper over it."""
+    w, cur = _first_version_worker(mock_psycopg_conn, history=(1,))
+    w._write_item_raw(_entity("create"))
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+
+
+@pytest.mark.parametrize("extra", [
+    "{}",                                                    # persisted by an older version
+    '{"created_at": "1970-01-01 00:00:00+00:00"}',           # HA's migration sentinel
+    '{"created_at": "2026-04-21 12:00:01+00:00"}',           # after the event: LEAST
+    '{"created_at": "garbage"}',
+])
+def test_unusable_created_at_keeps_event_time_without_probing(mock_psycopg_conn, extra):
+    w, cur = _first_version_worker(mock_psycopg_conn)
+    w._write_item_raw(_entity(extra=extra))
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+    assert SCD2_ANY_VERSION_SQL["entity"] not in [c.args[0] for c in cur.execute.call_args_list]
+
+
+def test_rename_never_uses_created_at(mock_psycopg_conn):
+    """The registry entry predates the new entity_id."""
+    w, cur = _first_version_worker(mock_psycopg_conn, history=None)
+    w._write_item_raw(_entity("update", old_id="sensor.old", entity_id="sensor.new"))
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+    assert SCD2_ANY_VERSION_SQL["entity"] not in [c.args[0] for c in cur.execute.call_args_list]
+
+
+def test_device_first_version_starts_at_created_at(mock_psycopg_conn):
+    w, cur = _first_version_worker(mock_psycopg_conn, history=None)
+    w._write_item_raw({
+        "registry": "device", "action": "snapshot", "registry_id": "dev-1", "old_id": None,
+        "params": ["dev-1", "n", "m", "mo", None, [], EVENT_TS,
+                   '{"created_at": "%s"}' % CREATED],
+        "enqueued_at": EVENT_TS,
+    })
+    assert _inserted_valid_from(cur, SCD2_SNAPSHOT_DEVICE_SQL, 6) == datetime.fromisoformat(CREATED)
+    probe = next(c for c in cur.execute.call_args_list
+                 if c.args[0] == SCD2_ANY_VERSION_SQL["device"])
+    assert probe.args[1] == ("dev-1",)
+
+
+def test_unknown_action_is_ignored(mock_psycopg_conn):
+    w, cur = _first_version_worker(mock_psycopg_conn)
+    w._write_item_raw(_entity("frobnicate"))
+    cur.execute.assert_not_called()
 
 
 def test_write_item_entity_remove_uses_close_sql(mock_psycopg_conn):

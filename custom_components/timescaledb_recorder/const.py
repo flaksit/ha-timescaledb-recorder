@@ -411,9 +411,7 @@ WHERE label_id = %s AND valid_to IS NULL AND valid_from < %s;
 
 # Idempotent guarded inserts — the ONLY insert path for all four dimensions.
 #
-# WHERE NOT EXISTS(open row) serves two purposes. On the "create" path it means
-# re-running the startup snapshot does not duplicate rows for entities already
-# present. On the "update" paths it makes the close+insert pair replay-safe:
+# WHERE NOT EXISTS(open row) makes the close+insert pair replay-safe:
 # task_done() runs only after the write (meta_worker), so a crash between commit
 # and task_done replays the item. On replay the close matches nothing (its
 # valid_from < guard excludes the row just inserted) and this insert sees that
@@ -496,6 +494,19 @@ SCD2_OPEN_VERSION_SQL = {
     "device": "SELECT valid_from FROM devices WHERE device_id = %s AND valid_to IS NULL;",
     "area": "SELECT valid_from FROM areas WHERE area_id = %s AND valid_to IS NULL;",
     "label": "SELECT valid_from FROM labels WHERE label_id = %s AND valid_to IS NULL;",
+}
+
+# Has this id ever had a version, open or closed? Gates stamping a first version
+# with the registry entry's created_at (issue #19). The entity variant also
+# matches the registry uuid: an entity renamed while HA was down, or restored
+# from deleted_entities under a new entity_id, keeps its entry and created_at,
+# which then predates the new entity_id.
+# %s = id (entity: then %s = ha_entity_uuid).
+SCD2_ANY_VERSION_SQL = {
+    "entity": "SELECT 1 FROM entities WHERE entity_id = %s OR ha_entity_uuid = %s LIMIT 1;",
+    "device": "SELECT 1 FROM devices WHERE device_id = %s LIMIT 1;",
+    "area": "SELECT 1 FROM areas WHERE area_id = %s LIMIT 1;",
+    "label": "SELECT 1 FROM labels WHERE label_id = %s LIMIT 1;",
 }
 
 # Session statement_timeout handling (see DB_STATEMENT_TIMEOUT_MS). The default
@@ -1130,11 +1141,11 @@ UPDATE entities t SET valid_from = p.new_from
 # ---- Extend a late first version back to the first state ---------------------
 #
 # The mirror of the alignment above, and the one place the repair moves a start
-# EARLIER. A first version is stamped when the integration hears of the entity:
-# the registry event fires after HA has already written the first state
-# (sub-millisecond), and an entity created during HA startup is only recorded by
+# EARLIER. Up to 2.4.1 a first version was stamped when the integration heard of
+# the entity: the registry event fires after HA has written the first state
+# (sub-millisecond), and an entity created during HA startup was only recorded by
 # the snapshot, ~30 s later (#19). Those first states fall before every version
-# and get NULL metadata.
+# and get NULL metadata. New first versions start at created_at instead.
 #
 # Two pieces of evidence, both required: a recorded state for this entity_id,
 # and the registry entry's own `created_at` at or before it — the entry existed

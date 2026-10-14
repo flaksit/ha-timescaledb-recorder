@@ -405,12 +405,15 @@ def worker(clean_db):
     return w
 
 
-def _entity_item(action, entity_id, name, valid_from, old_id=None):
+def _entity_item(action, entity_id, name, valid_from, old_id=None,
+                 created_at=None, uuid="uuid-1"):
+    # Same shape _build_extra writes: str(datetime) under "created_at".
+    extra = "{}" if created_at is None else '{"created_at": "%s"}' % created_at
     return {
         "registry": "entity", "action": action,
         "registry_id": entity_id, "old_id": old_id,
-        "params": [entity_id, "uuid-1", name, entity_id.split(".")[0], "zha",
-                   None, None, [], None, None, None, valid_from.isoformat(), "{}"],
+        "params": [entity_id, uuid, name, entity_id.split(".")[0], "zha",
+                   None, None, [], None, None, None, valid_from.isoformat(), extra],
         "enqueued_at": valid_from.isoformat(),
     }
 
@@ -537,6 +540,133 @@ def test_remove_then_recreate_produces_no_overlap(worker, clean_db):
         _entity_item("create", "sensor.rm", "n2", datetime.now(timezone.utc)))
 
     assert _violations(clean_db) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+
+
+# ---------------------------------------------------------------------------
+# Startup window and snapshot reconcile (issue #19)
+# ---------------------------------------------------------------------------
+#
+# Restart timeline used below: the previous session left `old` open at BASE;
+# events during startup are stamped T1, T2; the snapshot runs at SNAP.
+
+T1 = BASE + timedelta(days=1)
+T2 = T1 + timedelta(seconds=5)
+SNAP = T1 + timedelta(seconds=30)
+
+
+def _rows(conn, entity_id: str) -> list:
+    with conn.cursor() as cur:
+        cur.execute("SELECT name, valid_from, valid_to FROM entities"
+                    " WHERE entity_id = %s ORDER BY valid_from", (entity_id,))
+        return cur.fetchall()
+
+
+def _clean(worker, conn) -> None:
+    assert _violations(conn) == {t: 0 for t, _k in const.SCD2_DIMENSIONS}
+    assert worker.out_of_order_skips == 0
+    assert worker.integrity_drops == 0
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM metadata_deadletter")
+        assert cur.fetchone()[0] == 0
+
+
+def test_update_during_startup_is_recorded(worker, clean_db):
+    worker._write_item_raw(_entity_item("create", "sensor.s", "old", BASE))
+    worker._write_item_raw(_entity_item("update", "sensor.s", "new", T1))
+    worker._write_item_raw(_entity_item("snapshot", "sensor.s", "new", SNAP))
+
+    assert _rows(clean_db, "sensor.s") == [("old", BASE, T1), ("new", T1, None)]
+    _clean(worker, clean_db)
+
+
+def test_create_and_delete_during_startup_are_recorded(worker, clean_db):
+    """Gone before the snapshot runs, so only the events can record it."""
+    created = T1 - timedelta(milliseconds=300)
+    worker._write_item_raw(_entity_item("create", "sensor.brief", "n", T1,
+                                        created_at=created, uuid="uuid-brief"))
+    worker._write_item_raw({
+        "registry": "entity", "action": "remove", "registry_id": "sensor.brief",
+        "old_id": None, "params": None, "enqueued_at": T2.isoformat(),
+    })
+
+    assert _rows(clean_db, "sensor.brief") == [("n", created, T2)]
+    _clean(worker, clean_db)
+
+
+def test_restart_snapshot_reconciles_drift(worker, clean_db):
+    """Changed while HA was down: closed and replaced at snapshot time."""
+    worker._write_item_raw(_entity_item("create", "sensor.drift", "old", BASE))
+    worker._write_item_raw(_entity_item("snapshot", "sensor.drift", "new", SNAP))
+
+    assert _rows(clean_db, "sensor.drift") == [("old", BASE, SNAP), ("new", SNAP, None)]
+    _clean(worker, clean_db)
+
+
+def test_snapshot_replay_is_a_no_op(worker, clean_db):
+    """An unacknowledged snapshot item is replayed on the next start."""
+    worker._write_item_raw(_entity_item("create", "sensor.rp", "old", BASE))
+    snap = _entity_item("snapshot", "sensor.rp", "new", SNAP)
+    worker._write_item_raw(snap)
+    worker._write_item_raw(snap)
+    # And an unchanged entity on a later restart writes nothing either.
+    worker._write_item_raw(_entity_item("snapshot", "sensor.rp", "new", SNAP + timedelta(days=1)))
+
+    assert _rows(clean_db, "sensor.rp") == [("old", BASE, SNAP), ("new", SNAP, None)]
+    _clean(worker, clean_db)
+
+
+def test_first_version_starts_at_created_at(worker, clean_db):
+    """States HA wrote before the event (or the snapshot) get metadata."""
+    created = SNAP - timedelta(seconds=29)
+    worker._write_item_raw(_entity_item("snapshot", "sensor.kona", "n", SNAP,
+                                        created_at=created, uuid="uuid-kona"))
+    worker._write_item_raw({
+        "registry": "device", "action": "create", "registry_id": "dev-kona", "old_id": None,
+        "params": ["dev-kona", "d", None, None, None, [], T1.isoformat(),
+                   '{"created_at": "%s"}' % (T1 - timedelta(milliseconds=1))],
+        "enqueued_at": T1.isoformat(),
+    })
+
+    assert _rows(clean_db, "sensor.kona") == [("n", created, None)]
+    with clean_db.cursor() as cur:
+        cur.execute("SELECT valid_from FROM devices WHERE device_id = 'dev-kona'")
+        assert cur.fetchall() == [(T1 - timedelta(milliseconds=1),)]
+    _clean(worker, clean_db)
+
+
+def test_recreated_id_keeps_event_time(worker, clean_db):
+    """A gap after a removal is real; created_at must not fill it."""
+    worker._write_item_raw(_entity_item("create", "sensor.back", "n", BASE, uuid="uuid-b"))
+    worker._write_item_raw({
+        "registry": "entity", "action": "remove", "registry_id": "sensor.back",
+        "old_id": None, "params": None, "enqueued_at": T1.isoformat(),
+    })
+    worker._write_item_raw(_entity_item("create", "sensor.back", "n2", T2,
+                                        created_at=BASE, uuid="uuid-b2"))
+
+    assert _rows(clean_db, "sensor.back") == [("n", BASE, T1), ("n2", T2, None)]
+    _clean(worker, clean_db)
+
+
+def test_rename_keeps_event_time(worker, clean_db):
+    """The registry entry, and its created_at, predate the new entity_id."""
+    worker._write_item_raw(_entity_item("create", "sensor.before", "n", BASE, uuid="uuid-r"))
+    worker._write_item_raw(_entity_item("update", "sensor.after", "n", T1,
+                                        old_id="sensor.before", created_at=BASE,
+                                        uuid="uuid-r"))
+
+    assert _rows(clean_db, "sensor.after") == [("n", T1, None)]
+    _clean(worker, clean_db)
+
+
+def test_rename_while_down_keeps_snapshot_time(worker, clean_db):
+    """No rename event exists for this one; the uuid gives it away."""
+    worker._write_item_raw(_entity_item("create", "sensor.before", "n", BASE, uuid="uuid-d"))
+    worker._write_item_raw(_entity_item("snapshot", "sensor.after", "n", SNAP,
+                                        created_at=BASE, uuid="uuid-d"))
+
+    assert _rows(clean_db, "sensor.after") == [("n", SNAP, None)]
+    _clean(worker, clean_db)
 
 
 def test_states_flat_leaves_a_gap_unlabelled(damaged):

@@ -6,7 +6,9 @@ PersistentQueue and dispatches via the Phase 1 SCD2 helpers on the syncer.
 Item-dict schema (D-15-c; produced by plan 09 syncer updates):
     {
         "registry": "entity" | "device" | "area" | "label",
-        "action":   "create" | "update" | "remove",
+        "action":   "create" | "update" | "remove" | "snapshot",
+                                       # "snapshot": startup registry read; same
+                                       # reconcile semantics as create/update.
         "registry_id": str,            # entity_id | device_id | area_id | label_id
         "old_id": str | None,          # only non-None for entity renames
         "params": list | None,         # JSON-safe; None on remove actions.
@@ -24,6 +26,7 @@ Item-dict schema (D-15-c; produced by plan 09 syncer updates):
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -44,6 +47,7 @@ from .const import (
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
     SCD2_CLOSE_LABEL_SQL,
+    SCD2_ANY_VERSION_SQL,
     SCD2_OPEN_VERSION_AT_SQL,
     SCD2_OPEN_VERSION_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
@@ -79,6 +83,16 @@ _VALID_FROM_INDEX = {
     "area": 2,
     "label": 3,
 }
+
+# (close, guarded insert) per registry.
+_SCD2_SQL = {
+    "entity": (SCD2_CLOSE_ENTITY_SQL, SCD2_SNAPSHOT_ENTITY_SQL),
+    "device": (SCD2_CLOSE_DEVICE_SQL, SCD2_SNAPSHOT_DEVICE_SQL),
+    "area": (SCD2_CLOSE_AREA_SQL, SCD2_SNAPSHOT_AREA_SQL),
+    "label": (SCD2_CLOSE_LABEL_SQL, SCD2_SNAPSHOT_LABEL_SQL),
+}
+
+_RECONCILE_ACTIONS = frozenset({"create", "update", "snapshot"})
 
 
 class TimescaledbMetaRecorderThread(threading.Thread):
@@ -361,21 +375,22 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         """Route one item to the per-registry SCD2 path."""
         registry = item["registry"]
         action = item["action"]
+        if registry not in _SCD2_SQL:
+            _LOGGER.warning("Unknown registry type in metadata item: %s", registry)
+            return
         registry_id = item["registry_id"]
         old_id = item.get("old_id")
         params = self._rehydrate_params(registry, item.get("params"))
         close_ts = self._close_timestamp(registry, params, item.get("enqueued_at"))
 
-        if registry == "entity":
-            self._process_entity(action, registry_id, old_id, params, close_ts)
-        elif registry == "device":
-            self._process_device(action, registry_id, params, close_ts)
-        elif registry == "area":
-            self._process_area(action, registry_id, params, close_ts)
-        elif registry == "label":
-            self._process_label(action, registry_id, params, close_ts)
+        if action == "remove":
+            self._process_remove(registry, registry_id, close_ts)
+        elif action == "update" and old_id is not None:
+            self._process_rename(registry, registry_id, old_id, params, close_ts)
+        elif action in _RECONCILE_ACTIONS:
+            self._process_reconcile(registry, registry_id, params, close_ts)
         else:
-            _LOGGER.warning("Unknown registry type in metadata item: %s", registry)
+            _LOGGER.warning("Unknown action in metadata item: %s", action)
 
     def _note_version_skipped(self, cur, registry: str, registry_id: str,
                           close_ts: datetime, params: tuple[object, ...] | None) -> None:
@@ -432,15 +447,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             # replay. Treat it as a real skip: over-reporting a lost change is
             # recoverable, under-reporting one is what issue #17 was.
             return True
-        comparators = {
-            "entity": self._registry_listener._entity_row_changed,
-            "device": self._registry_listener._device_row_changed,
-            "area": self._registry_listener._area_row_changed,
-            "label": self._registry_listener._label_row_changed,
-        }
         conn = self.get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-            return comparators[registry](dict_cur, registry_id, params)
+            return self._row_changed(registry, dict_cur, registry_id, params)
 
     def _note_removal_skipped(self, cur, registry: str, registry_id: str,
                               close_ts: datetime) -> None:
@@ -540,165 +549,104 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         return tuple(rehydrated)
 
     # ------------------------------------------------------------------
-    # Per-registry dispatch — entity (D-05-c). Port Phase 1 worker.py:256-294
-    # verbatim with s/cmd.*/params|registry_id|old_id/g.
+    # SCD2 writes (D-05-c). One shape for all four registries; only entities
+    # can be renamed, so only entity items ever carry an old_id.
     # ------------------------------------------------------------------
 
-    def _process_entity(
-        self,
-        action: str,
-        registry_id: str,
-        old_id: str | None,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for an entity registry change.
+    def _row_changed(self, registry: str, dict_cur, registry_id: str, params: tuple) -> bool:
+        """The registry listener's change detection — the one definition of "same version"."""
+        comparators = {
+            "entity": self._registry_listener._entity_row_changed,
+            "device": self._registry_listener._device_row_changed,
+            "area": self._registry_listener._area_row_changed,
+            "label": self._registry_listener._label_row_changed,
+        }
+        return comparators[registry](dict_cur, registry_id, params)
 
-        "create": snapshot SQL with idempotent WHERE NOT EXISTS guard.
-        "remove": close the open row; no new row (entry already gone).
-        "update" rename (old_id is not None): close old entity_id + insert new, atomically.
-        "update" field change (old_id is None): change-detection gate, then close+insert.
-
-        Both update paths close with the incoming valid_from and insert through the
-        guarded snapshot statement, which together make a replayed item a no-op.
-        """
+    def _process_remove(self, registry: str, registry_id: str, close_ts: datetime) -> None:
+        """Close the open row; nothing replaces it (the registry entry is gone)."""
+        close_sql, _insert_sql = _SCD2_SQL[registry]
         conn = self.get_db_connection()
         with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = entity_id; appears twice per SCD2_SNAPSHOT_ENTITY_SQL.
-                cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "entity", registry_id, close_ts)
-            elif action == "update":
-                if old_id is not None:
-                    # Rename path — atomic close of the old id + insert under the new.
-                    with conn.transaction():
-                        cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, old_id, close_ts))
-                        cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "entity", registry_id, close_ts, params)
-                else:
-                    # Field-change path. The change-detection read runs inside the
-                    # transaction so it and the close+insert see one snapshot.
-                    with conn.transaction():
-                        with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                            changed = self._registry_listener._entity_row_changed(
-                                dict_cur, registry_id, params
-                            )
-                        if changed:
-                            cur.execute(
-                                SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts)
-                            )
-                            cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                            self._note_version_skipped(cur, "entity", registry_id, close_ts, params)
+            cur.execute(close_sql, (close_ts, registry_id, close_ts))
+            self._note_removal_skipped(cur, registry, registry_id, close_ts)
 
-    # ------------------------------------------------------------------
-    # Per-registry dispatch — device/area/label (D-05-c). Mechanical copies
-    # of _process_entity without the rename path (devices, areas, and labels
-    # cannot be renamed in HA — old_id is always None for these registries).
-    # ------------------------------------------------------------------
+    def _process_rename(self, registry: str, registry_id: str, old_id: str,
+                        params: tuple, close_ts: datetime) -> None:
+        """Close the old id and insert under the new one, atomically.
 
-    def _process_device(
-        self,
-        action: str,
-        registry_id: str,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for a device registry change.
-
-        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
-        "remove": close the open row.
-        "update": change-detection gate via syncer helper; close+insert if changed.
-        No rename path — devices cannot be renamed in HA.
+        Always stamped at event time, never created_at: the registry entry
+        predates the new id.
         """
+        close_sql, insert_sql = _SCD2_SQL[registry]
         conn = self.get_db_connection()
-        with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = device_id; appears twice per SCD2_SNAPSHOT_DEVICE_SQL.
-                cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "device", registry_id, close_ts)
-            elif action == "update":
-                with conn.transaction():
-                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._registry_listener._device_row_changed(
-                            dict_cur, registry_id, params
-                        )
-                    if changed:
-                        cur.execute(
-                            SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts)
-                        )
-                        cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "device", registry_id, close_ts, params)
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(close_sql, (close_ts, old_id, close_ts))
+            cur.execute(insert_sql, (*params, params[0]))
+            self._note_version_skipped(cur, registry, registry_id, close_ts, params)
 
-    def _process_area(
-        self,
-        action: str,
-        registry_id: str,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for an area registry change.
+    def _process_reconcile(self, registry: str, registry_id: str,
+                           params: tuple, close_ts: datetime) -> None:
+        """Make the open version match `params`: create, update and snapshot.
 
-        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
-        "remove": close the open row.
-        "update": change-detection gate via syncer helper; close+insert if changed.
-        No rename path — areas cannot be renamed by entity_id in HA.
+        No open row → insert; open row equal → nothing; differs → close+insert at
+        the item's valid_from. Each is therefore safe whether or not an open row
+        exists, which is what lets the listener enqueue from startup on and the
+        snapshot repair drift instead of only filling gaps (issue #19).
+
+        The change-detection read runs inside the transaction so it and the
+        close+insert see one snapshot.
         """
+        close_sql, insert_sql = _SCD2_SQL[registry]
         conn = self.get_db_connection()
-        with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = area_id; appears twice per SCD2_SNAPSHOT_AREA_SQL.
-                cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "area", registry_id, close_ts)
-            elif action == "update":
-                with conn.transaction():
-                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._registry_listener._area_row_changed(
-                            dict_cur, registry_id, params
-                        )
-                    if changed:
-                        cur.execute(
-                            SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts)
-                        )
-                        cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "area", registry_id, close_ts, params)
+        with conn.transaction(), conn.cursor() as cur:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                if not self._row_changed(registry, dict_cur, registry_id, params):
+                    return
+            cur.execute(close_sql, (close_ts, registry_id, close_ts))
+            if not cur.rowcount:
+                # Nothing closed: possibly the id's first version ever.
+                params = self._first_version_params(cur, registry, registry_id, params)
+            cur.execute(insert_sql, (*params, params[0]))
+            self._note_version_skipped(cur, registry, registry_id, close_ts, params)
 
-    def _process_label(
-        self,
-        action: str,
-        registry_id: str,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for a label registry change.
+    def _first_version_params(self, cur, registry: str, registry_id: str,
+                              params: tuple) -> tuple:
+        """Start an id's first version at its registry entry's created_at.
 
-        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
-        "remove": close the open row.
-        "update": change-detection gate via syncer helper; close+insert if changed.
-        No rename path — labels cannot be renamed by label_id in HA.
+        The event, and even more so the startup snapshot, arrives after HA has
+        written the entity's first states; a first version stamped then leaves
+        those states without metadata (issue #19). Only for an id with no
+        version at all: once one exists, earlier history is already described,
+        and a gap after a removal is real.
+
+        Never later than the item's own valid_from. created_at is read from the
+        `extra` blob (last param), so items persisted by older versions get it too.
         """
-        conn = self.get_db_connection()
-        with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = label_id; appears twice per SCD2_SNAPSHOT_LABEL_SQL.
-                cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "label", registry_id, close_ts)
-            elif action == "update":
-                with conn.transaction():
-                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._registry_listener._label_row_changed(
-                            dict_cur, registry_id, params
-                        )
-                    if changed:
-                        cur.execute(
-                            SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts)
-                        )
-                        cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "label", registry_id, close_ts, params)
+        idx = _VALID_FROM_INDEX[registry]
+        created_at = _created_at(params[-1])
+        if created_at is None or created_at >= params[idx]:
+            return params
+        args = (registry_id, params[1]) if registry == "entity" else (registry_id,)
+        cur.execute(SCD2_ANY_VERSION_SQL[registry], args)
+        if cur.fetchone() is not None:
+            return params
+        return (*params[:idx], created_at, *params[idx + 1:])
+
+
+def _created_at(extra: object) -> datetime | None:
+    """Registry entry's created_at from the serialized extra blob, if usable.
+
+    HA's storage migrations set created_at to the Unix epoch for entries that
+    predate the field. That means "unknown", not 1970, so it is ignored.
+    """
+    try:
+        data = json.loads(extra) if isinstance(extra, str) else extra
+        raw = data.get("created_at") if isinstance(data, dict) else None
+        ts = datetime.fromisoformat(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return None
+    if ts is None or ts.tzinfo is None or ts.timestamp() <= 0:
+        return None
+    return ts
+

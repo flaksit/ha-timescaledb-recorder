@@ -115,8 +115,8 @@ class PersistentQueue:
     async def put_many_async(self, items: list[dict]) -> None:
         """Async batched producer — parity with put_async, single fsync.
 
-        Used by _async_initial_registry_backfill to enqueue all four registry
-        snapshots without blocking the event loop on per-item fsyncs.
+        Used by RegistryListener._flush_buffer to write each drained batch,
+        including the startup registry snapshot, with one fsync.
         """
         if not items:
             # Skip the executor round-trip when there is nothing to do.

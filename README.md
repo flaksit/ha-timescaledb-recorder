@@ -281,16 +281,20 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 
 ### How it works
 
-On integration load, a full snapshot of all four registries is taken and inserted into the dimension tables. The snapshot uses idempotent `WHERE NOT EXISTS` inserts so restarting the integration never creates duplicate open rows.
-
-After the snapshot, the integration subscribes to four HA registry events:
+On integration load, the integration subscribes to four HA registry events:
 
 - `EVENT_ENTITY_REGISTRY_UPDATED`
 - `EVENT_DEVICE_REGISTRY_UPDATED`
 - `EVENT_AREA_REGISTRY_UPDATED`
 - `EVENT_LABEL_REGISTRY_UPDATED`
 
-Each event triggers the SCD2 close-and-insert cycle: the open row is closed and a new row inserted, both stamped with the time the event fired, so each interval ends exactly where its successor begins. Events are written in arrival order. Entity renames (entity_id changes) close the old entity_id row and open one under the new entity_id.
+Each event triggers the SCD2 close-and-insert cycle: the open row is closed and a new row inserted, both stamped with the time the event fired, so each interval ends exactly where its successor begins. Events are written in arrival order. Entity renames (entity_id changes) close the old entity_id row and open one under the new entity_id. A change that leaves the stored metadata unchanged writes nothing.
+
+Once HA has started, a snapshot of all four registries is queued behind the events received so far, stamped with the snapshot time. Each entry is reconciled against its open row: missing → inserted, equal → nothing, different → closed and replaced. So a restart repairs any drift, and a change made while HA was down is recorded at the restart time, not when it happened. Events are recorded from integration load on, so changes during startup are not lost.
+
+An id's first version starts at the registry entry's `created_at` rather than the event or snapshot time, so the states HA writes before announcing a new entity are covered. This only applies when the id has no earlier version (for entities: neither the entity_id nor the registry uuid), never to a rename, and never to entries whose `created_at` is HA's 1970 placeholder for "unknown".
+
+An entry removed while HA was down is not detected: its version stays open.
 
 The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates.
 
@@ -303,8 +307,6 @@ SELECT detected_at, reason, registry_id, error FROM metadata_deadletter ORDER BY
 ```
 
 The table is normally empty. Each row is a gap in the dimension history, shown as NULL metadata in `states_flat`.
-
-Registry changes during startup, before the initial snapshot completes, are discarded. Creates and updates are picked up by the snapshot; a **removal** is lost and the row stays open ([#19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19)).
 
 ### The invariant
 
@@ -475,7 +477,7 @@ Each version's `valid_to` is set to the next version's `valid_from`. Only `valid
 Two exceptions write `valid_from`, both for first versions only:
 
 - An entity whose first version starts before its device's first version, typically left by a history import that backdated entities but not devices, is moved later to the device's start — but never past the entity's first recorded state, and not if that would empty the version.
-- A first version that starts after the entity's first state is moved back to that state, if the registry entry's `created_at` shows it already existed then. This happens because the version is stamped when the integration hears of the entity, which is just after the first state, or ~30 s later for entities created during HA startup ([#19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19)). The entity's device follows, but never before its own `created_at`.
+- A first version that starts after the entity's first state is moved back to that state, if the registry entry's `created_at` shows it already existed then. Up to 2.4.1 the version was stamped when the integration heard of the entity, just after the first state, or ~30 s later for entities created during HA startup ([#19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19)); first versions now start at `created_at`. The entity's device follows, but never before its own `created_at`.
 
 Each table is first copied to `<table>_prerepair_<utc timestamp>`, the only full record of the old values; drop those once satisfied. Deleted or clamped rows, and rows whose start moved, are also archived as JSONB in `scd2_repair_quarantine`, tagged with the run id.
 

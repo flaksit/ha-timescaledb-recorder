@@ -52,6 +52,38 @@ POISON_MAX_ATTEMPTS: int = 3
 WATCHDOG_INTERVAL_S: float = 10.0
 DB_UNREACHABLE_THRESHOLD_SECONDS: float = 300.0
 
+# Bounds on every blocking worker DB call (issue #14). A call that never returns
+# raises nothing, so neither the watchdog (thread still alive) nor the retry
+# decorator (no exception) notices it. Hypothesis for #14: a half-open TCP
+# connection (libpq's keepalive default is the OS one, 7200 s idle) or a lock
+# wait with no statement_timeout.
+#
+# libpq connection parameters, applied only where the user's DSN does not set
+# them. An idle connection whose peer vanished is declared dead after
+# 30 + 3 * 10 = 60 s; tcp_user_timeout covers the case keepalives cannot, unacked
+# data in flight (Linux only, ignored elsewhere). Neither applies to Unix sockets.
+DB_CONNECT_DEFAULTS: dict[str, int] = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 60_000,  # ms
+}
+# Session statement_timeout for worker reads and writes, so a lock wait becomes
+# QueryCanceled, which the retry decorator treats as transient (logged, stall
+# issue after STALL_THRESHOLD). Applied only when the session has none (DSN
+# options, role or database setting win). Generous: the slowest normal statement
+# is the backfill entity scan, whose full-scan worst case is noted at ~27 s at
+# SELECT_ALL_KNOWN_ENTITIES_SQL.
+# Lifted for schema setup, whose DDL and index builds can legitimately run long.
+DB_STATEMENT_TIMEOUT_MS: int = 300_000
+# A worker DB call in flight this long is reported as ingestion_stalled by the
+# watchdog. Comfortably above DB_STATEMENT_TIMEOUT_MS plus the TCP timeouts
+# above, so it fires only when those bounds failed. The same threshold applies
+# to the states worker waiting for backfill data that never comes.
+INGESTION_STALL_THRESHOLD_S: float = 600.0
+
 # Config keys
 CONF_DSN = "dsn"
 CONF_BATCH_SIZE = "write_batch_size_records"
@@ -465,6 +497,18 @@ SCD2_OPEN_VERSION_SQL = {
     "area": "SELECT valid_from FROM areas WHERE area_id = %s AND valid_to IS NULL;",
     "label": "SELECT valid_from FROM labels WHERE label_id = %s AND valid_to IS NULL;",
 }
+
+# Session statement_timeout handling (see DB_STATEMENT_TIMEOUT_MS). The default
+# is applied only when nothing else configured one, i.e. the value is still '0'.
+# %s = timeout in ms, as text.
+STATEMENT_TIMEOUT_DEFAULT_SQL = (
+    "SELECT set_config('statement_timeout', %s, false)"
+    " WHERE current_setting('statement_timeout') = '0';"
+)
+STATEMENT_TIMEOUT_SHOW_SQL = "SELECT current_setting('statement_timeout');"
+STATEMENT_TIMEOUT_DISABLE_SQL = "SET statement_timeout = 0;"
+# %s = the value STATEMENT_TIMEOUT_SHOW_SQL returned.
+STATEMENT_TIMEOUT_RESTORE_SQL = "SELECT set_config('statement_timeout', %s, false);"
 
 # D-08-d step 4: watermark read (orchestrator → states worker connection).
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"

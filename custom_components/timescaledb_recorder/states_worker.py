@@ -20,6 +20,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,7 @@ from psycopg.types.json import Jsonb
 from homeassistant.core import HomeAssistant
 
 from .backfill import BACKFILL_DONE
+from .db import DbCallTracker, connect, statement_timeout_lifted
 from .const import (
     BATCH_FLUSH_SIZE,
     DEADLETTER_REASON_POISON,
@@ -66,6 +68,13 @@ def _json_default(obj: object) -> str:
     return str(obj)
 
 
+@dataclass
+class StatesWriteStats:
+    """Write progress that must outlive a respawned worker (kept on runtime data)."""
+
+    last_write_at: datetime | None = None  # wall clock of the last successful insert
+
+
 # State-machine modes (D-04-b). String-valued for log readability.
 MODE_INIT = "init"
 MODE_BACKFILL = "backfill"
@@ -90,6 +99,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         *,
         chunk_interval_days: int,
         compress_after_hours: int,
+        stats: StatesWriteStats | None = None,
     ) -> None:
         super().__init__(daemon=True, name="timescaledb_states_worker")
         self._hass = hass
@@ -101,6 +111,12 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._chunk_interval_days = chunk_interval_days
         self._compress_after_hours = compress_after_hours
         self._conn: psycopg.Connection | None = None
+        self.stats = stats if stats is not None else StatesWriteStats()
+        # Watchdog-readable hang detection (issue #14): calls in flight, and
+        # since when the worker has been waiting on the backfill queue (None
+        # outside MODE_BACKFILL or while it is writing a slice).
+        self.db_calls = DbCallTracker()
+        self.backfill_wait_since: float | None = None
 
         # D-06-b: watchdog-readable post-mortem context. Initialized to safe defaults
         # so watchdog can always read these attributes even if run() never executes.
@@ -132,7 +148,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
             on_recovery=self._recovery_hook,
             on_sustained_fail=self._sustained_fail_hook,
             on_poison=self._insert_rows_individually,
-        )(self._insert_chunk_raw)
+        )(self.db_calls.track(self._insert_chunk_raw))
 
         # D-03-c: watermark read uses same retry shape as writes (owns a connection,
         # so on_transient resets it). No stall/recovery hooks — a persistently
@@ -143,7 +159,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self.read_watermark = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-        )(self._read_watermark_raw)
+        )(self.db_calls.track(self._read_watermark_raw))
 
         # Schema setup: retry on transient DB failure at startup (Issue #12).
         # No stall/recovery hooks — schema setup is a one-time startup op; a
@@ -152,7 +168,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._setup_schema = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-        )(self._setup_schema_raw)
+        )(self.db_calls.track(self._setup_schema_raw))
 
         # read_all_known_entities: called by orchestrator via executor job at backfill
         # start; must retry on transient errors to avoid a bare DB failure escaping
@@ -160,7 +176,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self.read_all_known_entities = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-        )(self._read_all_known_entities_raw)
+        )(self.db_calls.track(self._read_all_known_entities_raw))
 
         # Per-row fallback for a poison chunk (issue #20): same hooks, so a
         # transient failure here still retries and stalls like a chunk would;
@@ -172,17 +188,17 @@ class TimescaledbStateRecorderThread(threading.Thread):
             on_recovery=self._recovery_hook,
             on_sustained_fail=self._sustained_fail_hook,
             on_poison=self._drop_row,
-        )(self._insert_row_raw)
+        )(self.db_calls.track(self._insert_row_raw))
 
     # ------------------------------------------------------------------
     # Connection management (D-07-g)
     # ------------------------------------------------------------------
 
     def get_db_connection(self) -> psycopg.Connection:
-        """Lazily open the psycopg3 connection. Reconnect handled by the
-        retry decorator via reset_db_connection → next call reopens."""
+        """Lazily open the connection via db.connect (bounded waits). Reconnect
+        handled by the retry decorator via reset_db_connection → next call reopens."""
         if self._conn is None:
-            self._conn = psycopg.connect(self._dsn, autocommit=True)
+            self._conn = connect(self._dsn)
         return self._conn
 
     def reset_db_connection(self) -> None:
@@ -263,11 +279,14 @@ class TimescaledbStateRecorderThread(threading.Thread):
     def _setup_schema_raw(self) -> None:
         """Raw schema setup — wrapped by retry_until_success in __init__."""
         conn = self.get_db_connection()
-        sync_setup_schema(
-            conn,
-            chunk_interval_days=self._chunk_interval_days,
-            compress_after_hours=self._compress_after_hours,
-        )
+        # DDL and index builds on a large hypertable can outlast
+        # DB_STATEMENT_TIMEOUT_MS; a timeout here would retry them forever.
+        with statement_timeout_lifted(conn):
+            sync_setup_schema(
+                conn,
+                chunk_interval_days=self._chunk_interval_days,
+                compress_after_hours=self._compress_after_hours,
+            )
 
     def run(self) -> None:
         """Thread entry point.
@@ -332,6 +351,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 mode = MODE_BACKFILL
                 self._last_mode = mode
                 last_flush = time.monotonic()
+                self.backfill_wait_since = last_flush
                 continue
 
             if mode == MODE_BACKFILL:
@@ -340,6 +360,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 except queue.Empty:
                     continue  # D-04-f: timeout allows stop_event check
                 if item is BACKFILL_DONE:
+                    self.backfill_wait_since = None
                     if buffer:
                         self._last_op = "flush_backfill_done"
                         self._flush(buffer)
@@ -349,11 +370,14 @@ class TimescaledbStateRecorderThread(threading.Thread):
                     last_flush = time.monotonic()
                     continue
                 # item is dict[entity_id, list[HA State]] (D-04-d)
+                # Writing is not waiting: a slow write is the in-flight check's job.
+                self.backfill_wait_since = None
                 rows = self._slice_to_rows(item)
                 buffer.extend(rows)
                 self._last_op = "flush_backfill_chunk"
                 self._flush(buffer)
                 buffer.clear()
+                self.backfill_wait_since = time.monotonic()
                 continue
 
             # MODE_LIVE: adaptive-timeout flushing (D-04-e fix)
@@ -414,6 +438,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         conn = self.get_db_connection()
         with conn.cursor() as cur:
             cur.executemany(sql, params)
+        self.stats.last_write_at = datetime.now(timezone.utc)
 
     def _insert_row_raw(self, row: StateRow) -> None:
         """Raw single-row insert. Wrapped by retry_until_success in __init__."""
@@ -454,13 +479,14 @@ class TimescaledbStateRecorderThread(threading.Thread):
             default=_json_default,
         )
         try:
-            conn = self.get_db_connection()
-            with conn.cursor() as cur:
-                cur.execute(
-                    STATES_DEADLETTER_INSERT_SQL,
-                    (DEADLETTER_REASON_POISON, row.entity_id, row.last_updated,
-                     repr(exc), row_data),
-                )
+            with self.db_calls.call("dead_letter"):
+                conn = self.get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        STATES_DEADLETTER_INSERT_SQL,
+                        (DEADLETTER_REASON_POISON, row.entity_id, row.last_updated,
+                         repr(exc), row_data),
+                    )
         except Exception:  # noqa: BLE001 — the row is already given up on
             _LOGGER.error(
                 "%s: could not dead-letter the dropped row; it now exists only in "

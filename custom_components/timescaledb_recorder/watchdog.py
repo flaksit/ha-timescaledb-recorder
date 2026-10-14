@@ -11,6 +11,14 @@ D-05-b: orchestrator crash recovery uses a different mechanism
 (asyncio.Task.add_done_callback — see __init__.py). This watchdog covers
 ONLY the worker threads.
 
+Issue #14: a worker stuck inside a DB call is alive and raises nothing, so
+neither check above sees it. Each tick also reads the workers' in-flight DB
+calls (and the states worker's backfill wait) and raises the
+ingestion_stalled repair issue past INGESTION_STALL_THRESHOLD_S. Detection
+only: a thread cannot be killed, and cancelling its query from this thread is
+not documented as safe for psycopg's cancel_safe(); the statement and TCP
+timeouts in db.connect are what end such a call.
+
 Robustness: the entire poll body runs inside try/except Exception so a bug
 in one monitoring cycle cannot kill the watchdog task. (Review MEDIUM-9.)
 
@@ -18,21 +26,30 @@ Assumptions:
 - runtime.loop_stop_event is an asyncio.Event used as interruptible sleep.
 - runtime.stop_event is the threading.Event shared with workers.
 - runtime has fields dsn, live_queue, backfill_queue, backfill_request,
-  meta_queue, registry_listener, chunk_interval_days, compress_after_hours — added
+  meta_queue, registry_listener, chunk_interval_days, compress_after_hours,
+  states_stats — added
   to TimescaledbRecorderData by Plan 07. See PATTERNS.md __init__.py section.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from homeassistant.components import persistent_notification
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import SIGNAL_WORKER_STATE_CHANGE, WATCHDOG_INTERVAL_S
+from .const import (
+    INGESTION_STALL_THRESHOLD_S,
+    SIGNAL_WORKER_STATE_CHANGE,
+    WATCHDOG_INTERVAL_S,
+)
+from .issues import clear_ingestion_stalled_issue, create_ingestion_stalled_issue
 from .meta_worker import TimescaledbMetaRecorderThread
 from .notifications import notify_watchdog_recovery
 from .states_worker import TimescaledbStateRecorderThread
@@ -63,6 +80,7 @@ def spawn_states_worker(
         stop_event=runtime.stop_event,
         chunk_interval_days=runtime.chunk_interval_days,
         compress_after_hours=runtime.compress_after_hours,
+        stats=runtime.states_stats,
     )
 
 
@@ -113,6 +131,86 @@ async def _watchdog_respawn(
     async_dispatcher_send(hass, SIGNAL_WORKER_STATE_CHANGE)
 
 
+@dataclass
+class _StallTracker:
+    """Watchdog-local state for ingestion stall detection."""
+
+    # Monotonic time HA was first seen RUNNING. The backfill orchestrator only
+    # starts then, so the states worker's backfill wait counts from here.
+    running_since: float | None = None
+    # component -> (details, monotonic time first reported)
+    stalled: dict[str, tuple[str, float]] = field(default_factory=dict)
+
+
+def _stall_details(
+    component: str, worker, now: float, running_since: float | None,
+) -> str | None:
+    """Describe why `worker` counts as stalled, or None if it does not."""
+    if worker is None or not worker.is_alive():
+        return None  # dead threads are the respawn path's job
+    in_flight = worker.db_calls.oldest()
+    if in_flight is not None:
+        op, started = in_flight
+        if now - started >= INGESTION_STALL_THRESHOLD_S:
+            return (
+                f"{component} DB call {op} in flight for {(now - started) / 60:.0f} min "
+                f"(last_op {getattr(worker, '_last_op', 'unknown')})"
+            )
+    waiting_since = getattr(worker, "backfill_wait_since", None)
+    if waiting_since is not None and running_since is not None:
+        waited = now - max(waiting_since, running_since)
+        if waited >= INGESTION_STALL_THRESHOLD_S:
+            return (
+                f"{component} waiting {waited / 60:.0f} min for backfill data "
+                "while live state changes queue up"
+            )
+    return None
+
+
+def _check_stalls(
+    hass: HomeAssistant, runtime: "TimescaledbRecorderData", tracker: _StallTracker,
+) -> None:
+    """Raise, update or clear ingestion_stalled from the workers' current state.
+
+    Details are captured when a worker is first found stalled and kept until it
+    recovers, so the repair issue is rewritten only when the set changes.
+    """
+    now = time.monotonic()
+    if tracker.running_since is None and hass.state is CoreState.running:
+        tracker.running_since = now
+    changed = False
+    for component in ("states_worker", "meta_worker"):
+        details = _stall_details(
+            component, getattr(runtime, component), now, tracker.running_since,
+        )
+        if details is not None and component not in tracker.stalled:
+            tracker.stalled[component] = (details, now)
+            changed = True
+            _LOGGER.error("Ingestion stalled: %s", details)
+            persistent_notification.async_create(
+                hass,
+                f"{details}. Nothing is being written by this worker and it reported "
+                "no error. See the ingestion_stalled repair issue.",
+                "TimescaleDB recorder: ingestion stalled",
+                f"timescaledb_recorder.ingestion_stalled_{component}",
+            )
+        elif details is None and component in tracker.stalled:
+            _, since = tracker.stalled.pop(component)
+            changed = True
+            _LOGGER.info(
+                "Ingestion resumed: %s is making progress again after being reported "
+                "stalled for %.0f s", component, now - since,
+            )
+    if not changed:
+        return
+    if tracker.stalled:
+        create_ingestion_stalled_issue(
+            hass, "; ".join(d for d, _ in tracker.stalled.values()),
+        )
+    else:
+        clear_ingestion_stalled_issue(hass)
+
+
 async def watchdog_loop(
     hass: HomeAssistant,
     runtime: "TimescaledbRecorderData",
@@ -142,6 +240,7 @@ async def watchdog_loop(
         runtime.loop_stop_event.set()
 
     cancel_stop_listener = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_ha_stop)
+    stall_tracker = _StallTracker()
 
     try:
         while not runtime.loop_stop_event.is_set():
@@ -186,6 +285,15 @@ async def watchdog_loop(
             except Exception:  # noqa: BLE001
                 _LOGGER.warning(
                     "Watchdog poll cycle raised unexpected exception — loop continues",
+                    exc_info=True,
+                )
+            # Separate guard: a bug here must not cost the respawn check, and
+            # vice versa.
+            try:
+                _check_stalls(hass, runtime, stall_tracker)
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Watchdog stall check raised unexpected exception — loop continues",
                     exc_info=True,
                 )
     finally:

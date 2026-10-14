@@ -14,6 +14,7 @@ from custom_components.timescaledb_recorder.sensor import (
     TimescaledbDbStatusSensor,
     TimescaledbEventsDroppedSensor,
     TimescaledbHealthSensor,
+    TimescaledbLastWriteSensor,
     TimescaledbMetaQueueDepthSensor,
     TimescaledbQueueDepthSensor,
 )
@@ -211,6 +212,21 @@ def test_db_status_disconnected():
     assert sensor._attr_native_value == "disconnected"
 
 
+@pytest.mark.parametrize("issue_id", ["ingestion_stalled"])
+def test_health_sensor_error_on_ingestion_stalled(issue_id):
+    hass = _make_hass(active_issue_ids={issue_id})
+    with patch(
+        "custom_components.timescaledb_recorder.sensor.ir.async_get",
+        return_value=hass._mock_issue_registry,
+    ):
+        health = TimescaledbHealthSensor(hass, _make_entry())
+        health._update_state()
+        status = TimescaledbDbStatusSensor(hass, _make_entry())
+        status._update_state()
+    assert health._attr_native_value == "error"
+    assert status._attr_native_value == "stalled"
+
+
 def test_db_status_stalled():
     """states_worker_stalled issue active → 'stalled'."""
     hass = _make_hass(active_issue_ids={"states_worker_stalled"})
@@ -288,3 +304,47 @@ async def test_meta_queue_depth():
     await sensor.async_update()
 
     assert sensor._attr_native_value == 3
+
+
+# ---------------------------------------------------------------------------
+# TimescaledbLastWriteSensor
+# ---------------------------------------------------------------------------
+
+def test_last_write_sensor_is_diagnostic_timestamp():
+    from homeassistant.components.sensor import SensorDeviceClass
+    from homeassistant.const import EntityCategory
+
+    sensor = TimescaledbLastWriteSensor(_make_entry())
+    assert sensor.device_class == SensorDeviceClass.TIMESTAMP
+    assert sensor.entity_category == EntityCategory.DIAGNOSTIC
+    assert sensor.should_poll is False
+    assert sensor.unique_id == "test_entry_id_last_write"
+    assert sensor.device_info["identifiers"] == {("timescaledb_recorder", "test_entry_id")}
+
+
+@pytest.mark.asyncio
+async def test_last_write_sensor_reads_runtime_stats_on_timer():
+    from datetime import datetime, timedelta, timezone
+
+    from custom_components.timescaledb_recorder.sensor import REFRESH_INTERVAL_LAST_WRITE
+    from custom_components.timescaledb_recorder.states_worker import StatesWriteStats
+
+    entry = _make_entry()
+    entry.runtime_data.states_stats = StatesWriteStats()
+    sensor = TimescaledbLastWriteSensor(entry)
+    sensor.hass = MagicMock()
+    sensor.async_write_ha_state = MagicMock()
+
+    with patch(
+        "custom_components.timescaledb_recorder.sensor.async_track_time_interval",
+    ) as track:
+        await sensor.async_added_to_hass()
+    assert sensor.native_value is None
+    _hass, refresh, interval = track.call_args.args
+    assert interval == REFRESH_INTERVAL_LAST_WRITE == timedelta(seconds=60)
+
+    written = datetime(2026, 6, 29, 10, 37, 8, tzinfo=timezone.utc)
+    entry.runtime_data.states_stats.last_write_at = written
+    refresh(datetime.now(timezone.utc))
+    assert sensor.native_value == written
+    sensor.async_write_ha_state.assert_called_once()

@@ -1,11 +1,12 @@
 """Diagnostic sensor entities for the TimescaleDB Recorder integration.
 
-Five SensorEntity subclasses exposing internal health state:
+Six SensorEntity subclasses exposing internal health state:
 - TimescaledbHealthSensor        — overall health rollup (ok/degraded/error), push
 - TimescaledbDbStatusSensor      — database connectivity (connected/disconnected/stalled), push
 - TimescaledbQueueDepthSensor    — peak live queue depth since last poll, 10s
 - TimescaledbEventsDroppedSensor — delta events dropped since last poll, 10s
 - TimescaledbMetaQueueDepthSensor — current metadata queue depth, 30s
+- TimescaledbLastWriteSensor     — time of the last successful states insert, 60s
 
 Health and db_status are push-updated via SIGNAL_HEALTH_CHANGE, which is dispatched
 by every create_*/clear_* issue helper in issues.py at the moment the issue state
@@ -13,16 +14,21 @@ changes — no polling delay.
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers import issue_registry as ir
 
 from .const import DOMAIN, SIGNAL_HEALTH_CHANGE
@@ -32,11 +38,16 @@ if TYPE_CHECKING:
 
 SCAN_INTERVAL_METRICS = timedelta(seconds=10)
 SCAN_INTERVAL_META = timedelta(seconds=30)
+# Inserts happen every few seconds; refreshing that often would mostly fill HA's
+# recorder with timestamps.
+REFRESH_INTERVAL_LAST_WRITE = timedelta(seconds=60)
 
 # Issue IDs that indicate error-level health (mirrors issues.py constants).
 # Duplicated here rather than imported to keep sensor logic self-contained and
 # avoid coupling the sensor module to internal issue-registry constants.
-_ERROR_ISSUES = frozenset({"db_unreachable", "states_worker_stalled", "meta_worker_stalled"})
+_ERROR_ISSUES = frozenset(
+    {"db_unreachable", "states_worker_stalled", "meta_worker_stalled", "ingestion_stalled"}
+)
 # *_dropped: data was lost but both workers keep running. Health returns to ok
 # after a restart (the issues are non-persistent); the dead-letter tables keep
 # the record.
@@ -170,7 +181,7 @@ class TimescaledbDbStatusSensor(SensorEntity):
 
     def _update_state(self) -> None:
         active = _all_domain_issue_ids(self._hass)
-        if "states_worker_stalled" in active:
+        if "states_worker_stalled" in active or "ingestion_stalled" in active:
             self._attr_native_value = "stalled"
         elif "db_unreachable" in active:
             self._attr_native_value = "disconnected"
@@ -255,6 +266,43 @@ class TimescaledbMetaQueueDepthSensor(SensorEntity):
         self._attr_native_value = len(self._entry.runtime_data.meta_queue)
 
 
+class TimescaledbLastWriteSensor(SensorEntity):
+    """Wall-clock time of the states worker's last successful insert.
+
+    The heartbeat for alerting on a silent stall (issue #14): an automation can
+    compare it with now(). Read from runtime data, so it survives worker respawn.
+    Refreshed on its own timer because the platform poll interval is shared by
+    every sensor of the platform.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Last Write"
+    _attr_icon = "mdi:database-arrow-down"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_should_poll = False
+
+    def __init__(self, entry: "TimescaledbRecorderConfigEntry") -> None:
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_last_write"
+        self._attr_device_info = _device_info(entry)
+
+    async def async_added_to_hass(self) -> None:
+        """Set initial state and refresh every REFRESH_INTERVAL_LAST_WRITE."""
+        self._update_state()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._handle_refresh, REFRESH_INTERVAL_LAST_WRITE)
+        )
+
+    @callback
+    def _handle_refresh(self, _now: datetime) -> None:
+        self._update_state()
+        self.async_write_ha_state()
+
+    def _update_state(self) -> None:
+        self._attr_native_value = self._entry.runtime_data.states_stats.last_write_at
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: "TimescaledbRecorderConfigEntry",
@@ -267,4 +315,5 @@ async def async_setup_entry(
         TimescaledbQueueDepthSensor(entry),
         TimescaledbEventsDroppedSensor(entry),
         TimescaledbMetaQueueDepthSensor(entry),
+        TimescaledbLastWriteSensor(entry),
     ])

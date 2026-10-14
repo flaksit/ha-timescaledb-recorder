@@ -23,6 +23,7 @@ _DB_UNREACHABLE_ID = "db_unreachable"
 _RECORDER_DISABLED_ID = "recorder_disabled"
 _METADATA_DROPPED_ID = "metadata_dropped"
 _STATES_DROPPED_ID = "states_dropped"
+_INGESTION_STALLED_ID = "ingestion_stalled"
 
 
 @callback
@@ -212,4 +213,32 @@ def create_states_dropped_issue(hass: HomeAssistant) -> None:
         severity=ir.IssueSeverity.ERROR,
         translation_key=_STATES_DROPPED_ID,
     )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
+
+
+@callback
+def create_ingestion_stalled_issue(hass: HomeAssistant, details: str) -> None:
+    """Register or update the ingestion_stalled repair issue (issue #14).
+
+    Raised by the watchdog when a worker is stuck without failing: a DB call in
+    flight past INGESTION_STALL_THRESHOLD_S, or the states worker waiting that
+    long for backfill data. `details` names each stuck worker and what it is
+    doing; re-creating with new details updates the issue in place.
+    """
+    ir.async_create_issue(
+        hass,
+        domain=DOMAIN,
+        issue_id=_INGESTION_STALLED_ID,
+        is_fixable=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key=_INGESTION_STALLED_ID,
+        translation_placeholders={"details": details},
+    )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
+
+
+@callback
+def clear_ingestion_stalled_issue(hass: HomeAssistant) -> None:
+    """Delete the ingestion_stalled repair issue once no worker is stuck."""
+    ir.async_delete_issue(hass, DOMAIN, _INGESTION_STALLED_ID)
     async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)

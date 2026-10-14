@@ -705,3 +705,140 @@ def test_dropped_row_survives_failed_dead_letter(mock_psycopg_conn):
         t._flush([_sample_state_row("x.y")])
 
     assert t.rows_dropped == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #14: bounded DB calls, hang detection inputs, last-write heartbeat
+# ---------------------------------------------------------------------------
+
+
+def test_setup_schema_runs_without_statement_timeout(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import (
+        STATEMENT_TIMEOUT_DISABLE_SQL,
+        STATEMENT_TIMEOUT_RESTORE_SQL,
+    )
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = ("5min",)
+    t = _make_thread()
+    t._conn = conn
+    executed_before_ddl = []
+
+    def fake_setup(*_args, **_kwargs):
+        executed_before_ddl.extend(c.args[0] for c in cur.execute.call_args_list)
+
+    with patch(
+        "custom_components.timescaledb_recorder.states_worker.sync_setup_schema",
+        side_effect=fake_setup,
+    ):
+        t._setup_schema_raw()
+
+    assert executed_before_ddl[-1] == STATEMENT_TIMEOUT_DISABLE_SQL
+    assert cur.execute.call_args_list[-1] == call(STATEMENT_TIMEOUT_RESTORE_SQL, ("5min",))
+
+
+def test_insert_keeps_statement_timeout(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import STATEMENT_TIMEOUT_DISABLE_SQL
+
+    conn, cur = mock_psycopg_conn
+    t = _make_thread()
+    t._conn = conn
+    t._insert_chunk([_sample_state_row()])
+    assert call(STATEMENT_TIMEOUT_DISABLE_SQL) not in cur.execute.call_args_list
+
+
+def test_reconnect_goes_through_db_connect():
+    t = _make_thread()
+    with patch(
+        "custom_components.timescaledb_recorder.states_worker.connect",
+    ) as db_connect:
+        t.get_db_connection()
+        t.reset_db_connection()
+        t.get_db_connection()
+    assert db_connect.call_count == 2
+    db_connect.assert_called_with("postgresql://")
+
+
+def test_insert_is_tracked_while_in_flight(mock_psycopg_conn):
+    conn, cur = mock_psycopg_conn
+    t = _make_thread()
+    t._conn = conn
+    seen = []
+    cur.executemany.side_effect = lambda *_a: seen.append(t.db_calls.oldest())
+    t._insert_chunk([_sample_state_row()])
+    assert seen[0][0] == "insert_chunk"
+    assert t.db_calls.oldest() is None
+
+
+def test_successful_insert_records_last_write(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.states_worker import StatesWriteStats
+
+    conn, cur = mock_psycopg_conn
+    stats = StatesWriteStats()
+    t = TimescaledbStateRecorderThread(
+        hass=MagicMock(), dsn="postgresql://",
+        live_queue=OverflowQueue(maxsize=10), backfill_queue=queue.Queue(maxsize=2),
+        backfill_request=MagicMock(), stop_event=threading.Event(),
+        chunk_interval_days=7, compress_after_hours=2, stats=stats,
+    )
+    t._conn = conn
+
+    cur.executemany.side_effect = RuntimeError("boom")
+    with pytest.raises(RuntimeError):
+        t._insert_chunk_raw([_sample_state_row()])
+    assert stats.last_write_at is None
+
+    cur.executemany.side_effect = None
+    before = datetime.now(timezone.utc)
+    t._insert_chunk_raw([_sample_state_row()])
+    assert stats.last_write_at is not None
+    assert stats.last_write_at >= before
+
+
+def _run_backfill_once(t, item):
+    """Run the main loop until `item` from the backfill queue has been handled."""
+    t._setup_schema = MagicMock()
+    t._backfill_queue.put(item)
+    observed = {}
+
+    def flush(_rows):
+        observed["during_flush"] = t.backfill_wait_since
+
+    t._flush = flush
+    real_get = t._backfill_queue.get
+
+    def get(timeout):
+        if t._backfill_queue.empty():
+            t._stop_event.set()
+            raise queue.Empty
+        observed["before_get"] = t.backfill_wait_since
+        return real_get(timeout=timeout)
+
+    t._backfill_queue.get = get
+
+    def live_get(timeout):  # after BACKFILL_DONE the loop moves on to live mode
+        t._stop_event.set()
+        raise queue.Empty
+
+    t._live_queue.get = live_get
+    t._run_main_loop()
+    return observed
+
+
+def test_backfill_wait_tracks_waiting_not_writing():
+    t = _make_thread()
+    state = MagicMock(entity_id="x.y", state="on", attributes={},
+                      last_updated=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                      last_changed=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    observed = _run_backfill_once(t, {"x.y": [state]})
+    assert observed["before_get"] is not None
+    assert observed["during_flush"] is None
+    assert t.backfill_wait_since is not None  # back to waiting after the write
+
+
+def test_backfill_wait_cleared_on_done():
+    from custom_components.timescaledb_recorder.backfill import BACKFILL_DONE
+
+    t = _make_thread()
+    _run_backfill_once(t, BACKFILL_DONE)
+    assert t.backfill_wait_since is None

@@ -16,6 +16,8 @@ from custom_components.timescaledb_recorder.issues import (
     create_recorder_disabled_issue,
     clear_recorder_disabled_issue,
     create_states_dropped_issue,
+    create_ingestion_stalled_issue,
+    clear_ingestion_stalled_issue,
 )
 
 
@@ -248,3 +250,20 @@ def test_create_states_dropped_issue():
     assert kwargs["issue_id"] == "states_dropped"
     assert kwargs["translation_key"] == "states_dropped"
     assert kwargs["severity"] == ir.IssueSeverity.ERROR
+
+
+def test_create_ingestion_stalled_issue_carries_details():
+    hass = MagicMock()
+    kwargs = _ir_create_kwargs(
+        hass, lambda h: create_ingestion_stalled_issue(h, "states_worker DB call x"),
+    )
+    from homeassistant.helpers import issue_registry as ir
+    assert kwargs["issue_id"] == "ingestion_stalled"
+    assert kwargs["translation_key"] == "ingestion_stalled"
+    assert kwargs["severity"] == ir.IssueSeverity.ERROR
+    assert kwargs["translation_placeholders"] == {"details": "states_worker DB call x"}
+
+
+def test_clear_ingestion_stalled_issue():
+    hass = MagicMock()
+    assert _ir_delete_args(hass, clear_ingestion_stalled_issue) == (hass, DOMAIN, "ingestion_stalled")

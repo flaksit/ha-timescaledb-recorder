@@ -332,6 +332,51 @@ A hand-written inner join on the dimensions drops state rows no version covers (
 
 This integration runs alongside the built-in recorder — it does not replace it. Both can have independent entity filter configurations.
 
+## Monitoring
+
+### Diagnostic entities
+
+All on the "TimescaleDB Recorder" device:
+
+| Entity | Shows |
+|--------|-------|
+| Health | `ok` / `degraded` / `error` rollup of the repair issues below and worker liveness |
+| DB Status | `connected` / `disconnected` / `stalled` |
+| Last Write | Timestamp of the last successful states insert, refreshed every 60 s. Alert on it: it keeps moving only while data is actually written |
+| Queue Depth Peak, Events Dropped, Meta Queue Depth | Buffer pressure |
+| States Worker, Metadata Worker | Worker thread alive |
+| Buffer Overflow | Live buffer full and dropping (recovered by backfill) |
+
+Example alert when nothing was written for 15 minutes:
+
+```yaml
+template:
+  - trigger:
+      - trigger: time_pattern
+        minutes: "/5"
+    binary_sensor:
+      - name: TimescaleDB writes stale
+        state: >
+          {{ now() - states('sensor.timescaledb_recorder_last_write') | as_datetime(now()) > timedelta(minutes=15) }}
+```
+
+### Repair issues
+
+| Issue | Severity | Raised when | Clears |
+|-------|----------|-------------|--------|
+| `states_worker_stalled`, `meta_worker_stalled` | error | 5 consecutive failed writes | on next success |
+| `db_unreachable` | error | writes failing for 5 min | on next success |
+| `ingestion_stalled` | error | a worker made no progress for 10 min without an error: a DB call still in flight, or the states worker waiting for backfill data | when the worker moves again |
+| `buffer_dropping` | warning | live buffer full | when the catch-up backfill starts |
+| `states_dropped`, `metadata_dropped` | error | data rejected and dead-lettered | never (inspect the dead-letter table) |
+| `recorder_disabled` | warning | HA recorder not loaded | when it loads |
+
+A worker thread that dies is restarted by the watchdog with a persistent notification.
+
+### Database timeouts
+
+Every worker connection bounds its waits so a hang turns into a logged, retried error: TCP keepalives (dead connection detected after ~60 s idle), `tcp_user_timeout` 60 s, `connect_timeout` 10 s, and `statement_timeout` 5 min for reads and writes (schema setup at startup runs without it, since DDL on a large table can take longer). Values you set in the DSN win, e.g. `postgresql://...?keepalives_idle=120&options=-c%20statement_timeout%3D600000`. A `statement_timeout` configured on the role or database is kept too.
+
 ## Troubleshooting
 
 **Cannot connect to TimescaleDB**
@@ -345,6 +390,13 @@ This integration runs alongside the built-in recorder — it does not replace it
 - Open the HA log viewer and filter for `custom_components.timescaledb_recorder` — any connection errors appear here
 - Check your entity filter: if you added an `include` block, only listed domains/entities are written
 - The default `flush_interval` is 10 seconds — wait at least 10 seconds after a state change before querying
+
+**Writes stopped (`ingestion_stalled` repair issue, Last Write not advancing)**
+
+- The issue and the log line `Ingestion stalled: ...` name the worker and the DB call or wait. A call should end within the timeouts above; one that does not points at the network path or a server-side wait the timeouts did not cover
+- Look for the worker's session on the server: `SELECT pid, state, wait_event_type, wait_event, now() - query_start AS running, query FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() ORDER BY query_start;`
+- `schema_setup` on a large table after an upgrade can legitimately take this long — wait for it
+- Otherwise reload the integration. The gap is backfilled from HA's recorder as long as it still holds the data (`purge_keep_days`)
 
 **Slow writes or high latency**
 

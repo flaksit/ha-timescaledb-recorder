@@ -16,6 +16,8 @@ Tests cover:
 - spawn_states_worker constructs thread from runtime fields
 - spawn_meta_worker constructs thread from runtime fields
 - Factories return unstarted threads
+- Ingestion stall detection: in-flight DB call / backfill wait past the
+  threshold raises ingestion_stalled once, clears on progress (issue #14)
 """
 from __future__ import annotations
 
@@ -27,11 +29,18 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from homeassistant.core import CoreState
+
+from custom_components.timescaledb_recorder.const import INGESTION_STALL_THRESHOLD_S
 from custom_components.timescaledb_recorder.watchdog import (
+    _check_stalls,
+    _StallTracker,
     spawn_meta_worker,
     spawn_states_worker,
     watchdog_loop,
 )
+
+_WD = "custom_components.timescaledb_recorder.watchdog"
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +70,7 @@ class _MockRuntime:
     registry_listener: object = None
     chunk_interval_days: int = 7
     compress_after_hours: int = 2
+    states_stats: object = None
 
 
 def _alive_worker():
@@ -69,6 +79,8 @@ def _alive_worker():
     w.is_alive.return_value = True
     w._last_exception = None
     w._last_context = {}
+    w.db_calls.oldest.return_value = None
+    w.backfill_wait_since = None
     return w
 
 
@@ -669,6 +681,7 @@ def test_spawn_states_worker_uses_runtime_fields():
         stop_event=stop_ev,
         chunk_interval_days=14,
         compress_after_hours=4,
+        stats=runtime.states_stats,
     )
     assert result is mock_instance
 
@@ -735,3 +748,130 @@ def test_spawn_factories_do_not_start_thread():
     # .start() must NOT have been called by the factory
     mock_states_instance.start.assert_not_called()
     mock_meta_instance.start.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Ingestion stall detection (issue #14)
+# ---------------------------------------------------------------------------
+
+
+def _run_check(hass, runtime, tracker, now):
+    with patch(f"{_WD}.time.monotonic", return_value=now), patch(
+        f"{_WD}.persistent_notification"
+    ) as pn, patch(f"{_WD}.create_ingestion_stalled_issue") as create, patch(
+        f"{_WD}.clear_ingestion_stalled_issue"
+    ) as clear:
+        _check_stalls(hass, runtime, tracker)
+    return pn, create, clear
+
+
+def test_hung_db_call_raises_once_then_clears(caplog):
+    hass = MagicMock()
+    states_w = _alive_worker()
+    states_w._last_op = "flush_live_timeout"
+    runtime = _MockRuntime(states_worker=states_w, meta_worker=_alive_worker())
+    tracker = _StallTracker()
+    states_w.db_calls.oldest.return_value = ("insert_chunk", 1000.0)
+
+    pn, create, _ = _run_check(hass, runtime, tracker, 1000.0 + INGESTION_STALL_THRESHOLD_S - 1)
+    create.assert_not_called()
+    pn.async_create.assert_not_called()
+
+    with caplog.at_level("ERROR"):
+        pn, create, _ = _run_check(hass, runtime, tracker, 1000.0 + INGESTION_STALL_THRESHOLD_S + 1)
+    pn.async_create.assert_called_once()
+    create.assert_called_once()
+    details = create.call_args.args[1]
+    assert "states_worker" in details
+    assert "insert_chunk" in details
+    assert "flush_live_timeout" in details
+    assert "Ingestion stalled" in caplog.text
+
+    # Still hung on later ticks: reported once, not every tick.
+    pn, create, clear = _run_check(hass, runtime, tracker, 1000.0 + 2 * INGESTION_STALL_THRESHOLD_S)
+    create.assert_not_called()
+    pn.async_create.assert_not_called()
+    clear.assert_not_called()
+
+    states_w.db_calls.oldest.return_value = None
+    with caplog.at_level("INFO"):
+        _, _, clear = _run_check(hass, runtime, tracker, 1000.0 + 2 * INGESTION_STALL_THRESHOLD_S + 10)
+    clear.assert_called_once_with(hass)
+    assert "Ingestion resumed" in caplog.text
+
+
+def test_issue_keeps_other_stalled_worker_when_one_recovers():
+    hass = MagicMock()
+    states_w, meta_w = _alive_worker(), _alive_worker()
+    runtime = _MockRuntime(states_worker=states_w, meta_worker=meta_w)
+    tracker = _StallTracker()
+    states_w.db_calls.oldest.return_value = ("insert_chunk", 0.0)
+    meta_w.db_calls.oldest.return_value = ("write_item", 0.0)
+    now = INGESTION_STALL_THRESHOLD_S + 1
+
+    _, create, _ = _run_check(hass, runtime, tracker, now)
+    assert "states_worker" in create.call_args.args[1]
+    assert "meta_worker" in create.call_args.args[1]
+
+    states_w.db_calls.oldest.return_value = None
+    _, create, clear = _run_check(hass, runtime, tracker, now + 10)
+    clear.assert_not_called()
+    assert "meta_worker" in create.call_args.args[1]
+    assert "states_worker" not in create.call_args.args[1]
+
+
+def test_dead_worker_is_not_reported_as_stalled():
+    hass = MagicMock()
+    dead = _dead_worker()
+    dead.db_calls.oldest.return_value = ("insert_chunk", 0.0)
+    runtime = _MockRuntime(states_worker=dead, meta_worker=_alive_worker())
+    _, create, _ = _run_check(hass, runtime, _StallTracker(), INGESTION_STALL_THRESHOLD_S * 10)
+    create.assert_not_called()
+
+
+def test_backfill_wait_counts_only_from_ha_running():
+    """The orchestrator starts at homeassistant_started: a long HA startup must
+    not count as the states worker waiting for backfill data."""
+    hass = MagicMock()
+    states_w = _alive_worker()
+    states_w.backfill_wait_since = 0.0
+    runtime = _MockRuntime(states_worker=states_w, meta_worker=_alive_worker())
+    tracker = _StallTracker()
+
+    hass.state = CoreState.starting
+    _, create, _ = _run_check(hass, runtime, tracker, 2 * INGESTION_STALL_THRESHOLD_S)
+    create.assert_not_called()
+
+    hass.state = CoreState.running
+    t_running = 2 * INGESTION_STALL_THRESHOLD_S + 1
+    _, create, _ = _run_check(hass, runtime, tracker, t_running)
+    create.assert_not_called()
+    _, create, _ = _run_check(hass, runtime, tracker, t_running + INGESTION_STALL_THRESHOLD_S - 1)
+    create.assert_not_called()
+    _, create, _ = _run_check(hass, runtime, tracker, t_running + INGESTION_STALL_THRESHOLD_S + 1)
+    create.assert_called_once()
+    assert "backfill" in create.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_stall_check_exception_does_not_kill_loop():
+    hass = MagicMock()
+    runtime = _MockRuntime(
+        states_worker=_alive_worker(), meta_worker=_alive_worker(), stop_event=threading.Event(),
+    )
+    calls = 0
+
+    async def _patched_wait_for(coro, timeout):
+        nonlocal calls
+        coro.close()
+        calls += 1
+        if calls >= 3:
+            runtime.loop_stop_event.set()
+            return
+        raise asyncio.TimeoutError
+
+    with patch(f"{_WD}._check_stalls", side_effect=RuntimeError("bug")) as check, patch(
+        "asyncio.wait_for", side_effect=_patched_wait_for
+    ):
+        await watchdog_loop(hass, runtime)
+    assert check.call_count == 2

@@ -51,6 +51,7 @@ from .const import (
     SCD2_SNAPSHOT_ENTITY_SQL,
     SCD2_SNAPSHOT_LABEL_SQL,
 )
+from .db import DbCallTracker, connect
 from .issues import (
     clear_db_unreachable_issue,
     clear_meta_worker_stalled_issue,
@@ -98,6 +99,8 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         self._registry_listener = registry_listener
         self._stop_event = stop_event
         self._conn: psycopg.Connection | None = None
+        # Watchdog-readable hang detection (issue #14).
+        self.db_calls = DbCallTracker()
 
         # D-06-b: watchdog-readable post-mortem context. Safe defaults in __init__
         # so watchdog can read these even if run() never executes. (MEDIUM-8)
@@ -140,16 +143,16 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             on_recovery=self._recovery_hook,
             on_sustained_fail=self._sustained_fail_hook,
             on_poison=self._drop_poison_item,
-        )(self._write_item_raw)
+        )(self.db_calls.track(self._write_item_raw))
 
     # ------------------------------------------------------------------
     # Connection management (D-07-g) — identical shape to states_worker.
     # ------------------------------------------------------------------
 
     def get_db_connection(self) -> psycopg.Connection:
-        """Return the current connection, opening a new one lazily if needed."""
+        """Return the current connection, opening one lazily via db.connect."""
         if self._conn is None:
-            self._conn = psycopg.connect(self._dsn, autocommit=True)
+            self._conn = connect(self._dsn)
         return self._conn
 
     def reset_db_connection(self) -> None:
@@ -339,13 +342,14 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         than pretending the item was captured.
         """
         try:
-            conn = self.get_db_connection()
-            with conn.transaction(), conn.cursor() as cur:
-                cur.execute(
-                    METADATA_DEADLETTER_INSERT_SQL,
-                    (reason, item.get("registry"), item.get("registry_id"),
-                     error, Jsonb(item)),
-                )
+            with self.db_calls.call("dead_letter"):
+                conn = self.get_db_connection()
+                with conn.transaction(), conn.cursor() as cur:
+                    cur.execute(
+                        METADATA_DEADLETTER_INSERT_SQL,
+                        (reason, item.get("registry"), item.get("registry_id"),
+                         error, Jsonb(item)),
+                    )
         except Exception:  # noqa: BLE001 — the caller has already given up on this item
             _LOGGER.error(
                 "%s: could not dead-letter the dropped item; it now exists only in "

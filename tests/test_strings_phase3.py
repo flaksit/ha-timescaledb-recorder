@@ -24,6 +24,7 @@ def test_strings_json_has_every_issue_key():
         "recorder_disabled",
         "metadata_dropped",
         "states_dropped",
+        "ingestion_stalled",
     }
     assert set(data["issues"].keys()) == expected
 
@@ -37,6 +38,7 @@ def test_new_issue_entries_have_nonempty_title_and_description():
         "recorder_disabled",
         "metadata_dropped",
         "states_dropped",
+        "ingestion_stalled",
     ]
     for key in new_keys:
         entry = data["issues"][key]

@@ -23,7 +23,7 @@ import asyncio
 import logging
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections.abc import Iterator
 from typing import Callable
@@ -69,7 +69,7 @@ from .meta_worker import TimescaledbMetaRecorderThread
 from .notifications import notify_watchdog_recovery
 from .overflow_queue import OverflowQueue
 from .persistent_queue import PersistentQueue
-from .states_worker import TimescaledbStateRecorderThread
+from .states_worker import StatesWriteStats, TimescaledbStateRecorderThread
 from .registry_listener import RegistryListener, _to_json_safe
 from .watchdog import spawn_meta_worker, spawn_states_worker, watchdog_loop
 
@@ -151,6 +151,8 @@ class TimescaledbRecorderData:
     chunk_interval_days: int                # TimescaleDB chunk interval
     compress_after_hours: int               # TimescaleDB compression policy
     entity_filter: Callable[[str], bool]    # entity filter for orchestrator relaunch kwargs
+    # Shared with every states worker incarnation so "last write" survives a respawn.
+    states_stats: StatesWriteStats = field(default_factory=StatesWriteStats)
 
 
 TimescaledbRecorderConfigEntry = ConfigEntry[TimescaledbRecorderData]

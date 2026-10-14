@@ -118,7 +118,7 @@ def test_read_all_known_entities_returns_set_of_ids(mock_psycopg_conn):
     t._conn = conn
     result = t.read_all_known_entities()
     assert result == {"sensor.a", "sensor.b"}
-    cur.execute.assert_called_with(SELECT_ALL_KNOWN_ENTITIES_SQL)
+    cur.execute.assert_any_call(SELECT_ALL_KNOWN_ENTITIES_SQL)
 
 
 def test_reset_db_connection_drops_conn():

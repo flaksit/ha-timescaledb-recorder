@@ -37,7 +37,12 @@ SCAN_INTERVAL_META = timedelta(seconds=30)
 # Duplicated here rather than imported to keep sensor logic self-contained and
 # avoid coupling the sensor module to internal issue-registry constants.
 _ERROR_ISSUES = frozenset({"db_unreachable", "states_worker_stalled", "meta_worker_stalled"})
-_DEGRADED_ISSUES = frozenset({"buffer_dropping", "recorder_disabled"})
+# *_dropped: data was lost but both workers keep running. Health returns to ok
+# after a restart (the issues are non-persistent); the dead-letter tables keep
+# the record.
+_DEGRADED_ISSUES = frozenset(
+    {"buffer_dropping", "recorder_disabled", "metadata_dropped", "states_dropped"}
+)
 
 
 def _device_info(entry: ConfigEntry) -> DeviceInfo:
@@ -69,12 +74,17 @@ def _active_issue_ids(hass: HomeAssistant) -> frozenset[str]:
 
 
 def _all_domain_issue_ids(hass: HomeAssistant) -> frozenset[str]:
-    """Return the set of issue_ids currently raised (not dismissed) for this domain."""
+    """Return the set of issue_ids currently raised for this domain.
+
+    `active` filters out entries HA restored from storage: the registry keeps
+    every non-persistent issue across a restart, inactive, until it is deleted.
+    Never-cleared issues (*_dropped) would otherwise pin health forever.
+    """
     registry = ir.async_get(hass)
     return frozenset(
         issue.issue_id
         for issue in registry.issues.values()
-        if issue.domain == DOMAIN
+        if issue.domain == DOMAIN and issue.active
     )
 
 

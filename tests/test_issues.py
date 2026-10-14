@@ -15,6 +15,7 @@ from custom_components.timescaledb_recorder.issues import (
     clear_db_unreachable_issue,
     create_recorder_disabled_issue,
     clear_recorder_disabled_issue,
+    create_states_dropped_issue,
 )
 
 
@@ -237,3 +238,13 @@ def test_strings_json_has_matching_translation_key():
     assert "buffer_dropping" in data["issues"]
     assert "title" in data["issues"]["buffer_dropping"]
     assert "description" in data["issues"]["buffer_dropping"]
+
+
+def test_create_states_dropped_issue():
+    hass = MagicMock()
+    kwargs = _ir_create_kwargs(hass, create_states_dropped_issue)
+    from homeassistant.helpers import issue_registry as ir
+    assert kwargs["domain"] == DOMAIN
+    assert kwargs["issue_id"] == "states_dropped"
+    assert kwargs["translation_key"] == "states_dropped"
+    assert kwargs["severity"] == ir.IssueSeverity.ERROR

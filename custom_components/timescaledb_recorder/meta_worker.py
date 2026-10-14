@@ -38,6 +38,7 @@ from homeassistant.core import HomeAssistant
 from .const import (
     DEADLETTER_REASON_INTEGRITY,
     DEADLETTER_REASON_OUT_OF_ORDER,
+    DEADLETTER_REASON_POISON,
     METADATA_DEADLETTER_INSERT_SQL,
     SCD2_CLOSE_AREA_SQL,
     SCD2_CLOSE_DEVICE_SQL,
@@ -123,16 +124,22 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         # broke. Replays of an already-applied item also write nothing, but they
         # lose no history and are excluded — see _note_version_skipped.
         self.out_of_order_skips: int = 0
+        # Items given up on after repeated non-transient errors (issue #20).
+        # Same durability story as integrity_drops.
+        self.poison_drops: int = 0
 
         # retry_until_success is applied to the bound method at __init__ time so
         # on_transient / notify_stall can reference self. D-07 wiring.
         # Phase 3: extended with on_recovery and on_sustained_fail (D-03, D-11).
+        # on_poison dead-letters an item that keeps failing non-transiently; it
+        # returns None, so run() task_done()s it like a success (issue #20).
         self._write_item = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
             notify_stall=self._stall_hook,
             on_recovery=self._recovery_hook,
             on_sustained_fail=self._sustained_fail_hook,
+            on_poison=self._drop_poison_item,
         )(self._write_item_raw)
 
     # ------------------------------------------------------------------
@@ -285,15 +292,15 @@ class TimescaledbMetaRecorderThread(threading.Thread):
     def _write_item_raw(self, item: dict) -> None:
         """Dispatch one item, dropping items the SCD2 invariant refuses.
 
-        Raises on any DB error — retry_until_success handles transient failure.
-        Called as self._write_item (the retry-wrapped version) from run().
+        Raises on any other error. Called as self._write_item (the
+        retry-wrapped version) from run(): transient errors are retried, and an
+        item that keeps failing otherwise ends up in _drop_poison_item.
 
-        Integrity violations are the exception: they are not transient, so
-        retrying replays the same conflicting row forever. retry_until_success
-        never gives up, so one bad item would wedge every later metadata write
-        and silently stop the dimension tables from tracking anything. Dropping
-        it keeps ingestion alive; the constraint has already done its job by
-        refusing the write.
+        Integrity violations are caught here rather than left to that generic
+        path: they are known to be permanent, so retrying them only delays the
+        queue by the poison backoff, and they keep their own dead-letter reason
+        and counter. Dropping it keeps ingestion alive; the constraint has
+        already done its job by refusing the write.
 
         Dropping is not forgetting. The item goes to the dead-letter table
         first, so the change survives the restart that erases the counter and
@@ -311,6 +318,16 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 self.name, self.integrity_drops, item, exc_info=True,
             )
             self._dead_letter(item, DEADLETTER_REASON_INTEGRITY, str(err))
+
+    def _drop_poison_item(self, exc: Exception, item: dict) -> None:
+        """retry_until_success on_poison hook: give up on an item that cannot be written."""
+        self.poison_drops += 1
+        _LOGGER.error(
+            "%s: metadata write kept failing with a non-transient error; dropping "
+            "the item to keep the queue moving (total dropped: %d). Item: %r",
+            self.name, self.poison_drops, item, exc_info=exc,
+        )
+        self._dead_letter(item, DEADLETTER_REASON_POISON, repr(exc))
 
     def _dead_letter(self, item: dict, reason: str, error: str) -> None:
         """Record an item the worker is about to stop trying to write.

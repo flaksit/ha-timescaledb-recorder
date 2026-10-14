@@ -23,6 +23,7 @@ def test_strings_json_has_every_issue_key():
         "db_unreachable",
         "recorder_disabled",
         "metadata_dropped",
+        "states_dropped",
     }
     assert set(data["issues"].keys()) == expected
 
@@ -35,6 +36,7 @@ def test_new_issue_entries_have_nonempty_title_and_description():
         "db_unreachable",
         "recorder_disabled",
         "metadata_dropped",
+        "states_dropped",
     ]
     for key in new_keys:
         entry = data["issues"][key]
@@ -49,3 +51,12 @@ def test_buffer_dropping_entry_unchanged():
     entry = data["issues"]["buffer_dropping"]
     assert entry["title"] == "TimescaleDB recorder buffer overflow"
     assert "dropping state events" in entry["description"]
+
+
+def test_en_translation_issues_match_strings_json():
+    """Custom integrations are translated from translations/en.json only;
+    strings.json is the source. An issue missing there renders without text."""
+    en = json.loads(
+        pathlib.Path("custom_components/timescaledb_recorder/translations/en.json").read_text()
+    )
+    assert en["issues"] == _load_strings()["issues"]

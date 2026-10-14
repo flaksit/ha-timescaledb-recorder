@@ -514,3 +514,81 @@ def test_last_op_updated_before_write_item():
     assert w._last_op == "unknown"
     assert isinstance(w._last_op, str)
     assert isinstance(w._last_retry_attempt, (int, type(None)))
+
+
+# ---------------------------------------------------------------------------
+# Issue #20: poison items are dead-lettered and task_done()d
+# ---------------------------------------------------------------------------
+
+
+def test_poison_item_is_dropped_and_queue_moves_on(mock_psycopg_conn):
+    """An item that keeps failing non-transiently must not wedge the queue:
+    it is dead-lettered, counted, surfaced, and task_done()d so the next item
+    is written."""
+    from custom_components.timescaledb_recorder.const import (
+        DEADLETTER_REASON_POISON,
+        METADATA_DEADLETTER_INSERT_SQL,
+        POISON_MAX_ATTEMPTS,
+    )
+    from custom_components.timescaledb_recorder.issues import create_metadata_dropped_issue
+
+    conn, cur = mock_psycopg_conn
+    bad = {"registry": "entity", "action": "create", "registry_id": "bad.one"}
+    good = {"registry": "entity", "action": "create", "registry_id": "good.one"}
+    meta_queue = MagicMock()
+    meta_queue.get = MagicMock(side_effect=[bad, good, None])
+    w = _make_worker(meta_queue=meta_queue)
+    # Skip the real backoff sleeps; the decorator holds this same Event.
+    w._stop_event.wait = MagicMock(return_value=False)
+    attempts = []
+
+    def dispatch(item):
+        attempts.append(item["registry_id"])
+        if item is bad:
+            raise ValueError("cannot serialise")
+
+    w._dispatch_item = dispatch
+    with patch(
+        "custom_components.timescaledb_recorder.meta_worker.psycopg.connect",
+        return_value=conn,
+    ):
+        w._run_main_loop()
+
+    assert attempts == ["bad.one"] * POISON_MAX_ATTEMPTS + ["good.one"]
+    assert meta_queue.task_done.call_count == 2
+    assert w.poison_drops == 1
+    dl = [c for c in cur.execute.call_args_list if c.args[0] == METADATA_DEADLETTER_INSERT_SQL]
+    assert len(dl) == 1
+    reason, registry, registry_id, error, _item = dl[0].args[1]
+    assert (reason, registry, registry_id) == (DEADLETTER_REASON_POISON, "entity", "bad.one")
+    assert "cannot serialise" in error
+    assert call(create_metadata_dropped_issue, w._hass) in w._hass.add_job.call_args_list
+
+
+def test_transient_failure_is_not_dropped(mock_psycopg_conn):
+    """A transient error keeps the item: retried until it succeeds."""
+    import psycopg
+
+    from custom_components.timescaledb_recorder.const import POISON_MAX_ATTEMPTS
+
+    conn, _cur = mock_psycopg_conn
+    item = {"registry": "entity", "action": "create", "registry_id": "x.y"}
+    meta_queue = MagicMock()
+    meta_queue.get = MagicMock(side_effect=[item, None])
+    w = _make_worker(meta_queue=meta_queue)
+    w._stop_event.wait = MagicMock(return_value=False)
+    errors = [psycopg.OperationalError("down")] * (POISON_MAX_ATTEMPTS + 2)
+
+    def dispatch(_item):
+        if errors:
+            raise errors.pop(0)
+
+    w._dispatch_item = dispatch
+    with patch(
+        "custom_components.timescaledb_recorder.meta_worker.psycopg.connect",
+        return_value=conn,
+    ):
+        w._run_main_loop()
+
+    assert w.poison_drops == 0
+    meta_queue.task_done.assert_called_once()

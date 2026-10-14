@@ -72,6 +72,10 @@
     "metadata_dropped": {
       "title": "TimescaleDB recorder dropped a metadata change",
       "description": "The TimescaleDB recorder gave up on a registry metadata change and dropped it so the metadata queue could keep moving. The full item is kept in the metadata_deadletter table in TimescaleDB, together with the reason it was dropped. This leaves a hole in the dimension history that does not heal on its own: inspect that table, fix the cause, and re-apply the change by editing the entity, device, area or label in Home Assistant. This issue does not clear automatically."
+    },
+    "states_dropped": {
+      "title": "TimescaleDB recorder dropped state rows",
+      "description": "The TimescaleDB recorder could not write one or more state rows because the database kept rejecting them with a non-transient error, so it dropped them to keep the states queue moving. Each dropped row is kept in the states_deadletter table in TimescaleDB, together with the error. The states table has a gap for those rows: inspect the dead-letter table, fix the cause, and re-insert the rows by hand if you need them. This issue does not clear automatically."
     }
   }
 }

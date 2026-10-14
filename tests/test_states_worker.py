@@ -414,12 +414,17 @@ def test_read_watermark_retry_wiring_captures_on_transient(mock_psycopg_conn):
 
     def fake_retry(*, stop_event, on_transient=None, on_recovery=None,
                    on_sustained_fail=None, notify_stall=None, **kwargs):
-        captured["on_transient"] = on_transient
-        captured["on_recovery"] = on_recovery
-        captured["on_sustained_fail"] = on_sustained_fail
-        captured["notify_stall"] = notify_stall
+        hooks = {
+            "on_transient": on_transient,
+            "on_recovery": on_recovery,
+            "on_sustained_fail": on_sustained_fail,
+            "notify_stall": notify_stall,
+            "on_poison": kwargs.get("on_poison"),
+        }
 
         def decorator(fn):
+            if fn.__name__ == "_read_watermark_raw":
+                captured.update(hooks)
             return fn
         return decorator
 
@@ -440,6 +445,8 @@ def test_read_watermark_retry_wiring_captures_on_transient(mock_psycopg_conn):
     assert captured.get("on_recovery") is None
     assert captured.get("on_sustained_fail") is None
     assert captured.get("notify_stall") is None
+    # A read has no item to give up on — it must retry forever.
+    assert captured.get("on_poison") is None
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +499,8 @@ def test_setup_schema_retries_on_transient_error(mock_psycopg_conn):
 def test_setup_schema_retry_wiring_captures_on_transient():
     """Issue #12: retry_until_success for _setup_schema_raw must receive
     on_transient=reset_db_connection and no stall/recovery hooks.
-    __init__ calls retry_until_success four times (insert, watermark, schema,
-    read_all_known_entities); this test captures all calls and inspects index 2."""
+    __init__ calls retry_until_success five times (insert, watermark, schema,
+    read_all_known_entities, per-row insert); this test captures all calls and inspects index 2."""
     all_calls = []
 
     def fake_retry(*, stop_event, on_transient=None, on_recovery=None,
@@ -514,8 +521,8 @@ def test_setup_schema_retry_wiring_captures_on_transient():
     ):
         t = _make_thread()
 
-    # Four retry_until_success calls: insert(0), watermark(1), schema(2), read_all(3).
-    assert len(all_calls) == 4, f"Expected 4 calls to retry_until_success, got {len(all_calls)}"
+    # insert(0), watermark(1), schema(2), read_all(3), insert_row(4).
+    assert len(all_calls) == 5, f"Expected 5 calls to retry_until_success, got {len(all_calls)}"
     schema_call = all_calls[2]
     on_transient = schema_call["on_transient"]
     assert on_transient is not None
@@ -589,11 +596,112 @@ def test_read_all_known_entities_retry_wiring_captures_on_transient():
     ):
         t = _make_thread()
 
-    # Four retry_until_success calls: insert(0), watermark(1), schema(2), read_all(3).
-    assert len(all_calls) == 4, f"Expected 4 calls to retry_until_success, got {len(all_calls)}"
+    # insert(0), watermark(1), schema(2), read_all(3), insert_row(4).
+    assert len(all_calls) == 5, f"Expected 5 calls to retry_until_success, got {len(all_calls)}"
     read_all_call = all_calls[3]
     on_transient = read_all_call["on_transient"]
     assert on_transient is not None
     assert on_transient.__func__ is TimescaledbStateRecorderThread.reset_db_connection
     assert read_all_call["on_recovery"] is None
     assert read_all_call["on_sustained_fail"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #20: a poison chunk falls back to row-by-row; only bad rows are dropped
+# ---------------------------------------------------------------------------
+
+
+def _fallback_thread(conn):
+    t = _make_thread()
+    t._conn = conn
+    # Skip the real backoff sleeps; the decorator holds this same Event.
+    t._stop_event.wait = MagicMock(return_value=False)
+    return t
+
+
+def _inserted_entity_ids(cur):
+    return [p[0] for c in cur.executemany.call_args_list for p in c.args[1]]
+
+
+def test_poison_chunk_drops_only_bad_rows(mock_psycopg_conn):
+    import psycopg
+
+    from custom_components.timescaledb_recorder.const import (
+        DEADLETTER_REASON_POISON,
+        POISON_MAX_ATTEMPTS,
+        STATES_DEADLETTER_INSERT_SQL,
+    )
+    from custom_components.timescaledb_recorder.issues import create_states_dropped_issue
+
+    conn, cur = mock_psycopg_conn
+    succeeded = []
+
+    def executemany(sql, params):
+        if any(p[0] == "bad.row" for p in params):
+            raise psycopg.errors.UntranslatableCharacter("\\u0000 cannot be converted")
+        succeeded.extend(p[0] for p in params)
+
+    cur.executemany.side_effect = executemany
+    t = _fallback_thread(conn)
+    rows = [_sample_state_row("good.a"), _sample_state_row("bad.row"),
+            _sample_state_row("good.b")]
+
+    with patch("custom_components.timescaledb_recorder.states_worker.psycopg.connect",
+               return_value=conn):
+        t._flush(rows)
+
+    assert succeeded == ["good.a", "good.b"]
+    # Chunk tried POISON_MAX_ATTEMPTS times, then each row on its own.
+    assert _inserted_entity_ids(cur).count("good.a") == POISON_MAX_ATTEMPTS + 1
+    assert _inserted_entity_ids(cur).count("bad.row") == 2 * POISON_MAX_ATTEMPTS
+    assert t.rows_dropped == 1
+    dl = [c for c in cur.execute.call_args_list if c.args[0] == STATES_DEADLETTER_INSERT_SQL]
+    assert len(dl) == 1
+    reason, entity_id, last_updated, error, row_data = dl[0].args[1]
+    assert (reason, entity_id, last_updated) == (
+        DEADLETTER_REASON_POISON, "bad.row", rows[1].last_updated,
+    )
+    assert "UntranslatableCharacter" in error
+    assert '"entity_id": "bad.row"' in row_data
+    assert call(create_states_dropped_issue, t._hass) in t._hass.add_job.call_args_list
+
+
+def test_transient_error_in_row_fallback_retries_instead_of_dropping(mock_psycopg_conn):
+    import psycopg
+
+    conn, cur = mock_psycopg_conn
+    succeeded = []
+    outage = [psycopg.OperationalError("down")] * 10
+
+    def executemany(sql, params):
+        if len(params) > 1:
+            raise ValueError("chunk is poison")
+        if outage:
+            raise outage.pop(0)
+        succeeded.extend(p[0] for p in params)
+
+    cur.executemany.side_effect = executemany
+    t = _fallback_thread(conn)
+    rows = [_sample_state_row("a.a"), _sample_state_row("b.b")]
+
+    with patch("custom_components.timescaledb_recorder.states_worker.psycopg.connect",
+               return_value=conn):
+        t._flush(rows)
+
+    assert succeeded == ["a.a", "b.b"]
+    assert t.rows_dropped == 0
+
+
+def test_dropped_row_survives_failed_dead_letter(mock_psycopg_conn):
+    """A failing dead-letter insert is logged, not raised: the row is already
+    given up on, and raising would kill the worker."""
+    conn, cur = mock_psycopg_conn
+    cur.executemany.side_effect = ValueError("bad")
+    cur.execute.side_effect = RuntimeError("dead-letter insert failed too")
+    t = _fallback_thread(conn)
+
+    with patch("custom_components.timescaledb_recorder.states_worker.psycopg.connect",
+               return_value=conn):
+        t._flush([_sample_state_row("x.y")])
+
+    assert t.rows_dropped == 1

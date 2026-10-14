@@ -31,17 +31,20 @@ from homeassistant.core import HomeAssistant
 from .backfill import BACKFILL_DONE
 from .const import (
     BATCH_FLUSH_SIZE,
+    DEADLETTER_REASON_POISON,
     FLUSH_INTERVAL,
     INSERT_CHUNK_SIZE,
     INSERT_LIVE_SQL,
     INSERT_SQL,
     SELECT_ALL_KNOWN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
+    STATES_DEADLETTER_INSERT_SQL,
 )
 from .issues import (
     clear_db_unreachable_issue,
     clear_states_worker_stalled_issue,
     create_db_unreachable_issue,
+    create_states_dropped_issue,
     create_states_worker_stalled_issue,
 )
 from .retry import retry_until_success
@@ -115,6 +118,9 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._last_op: str = "unknown"
         self._last_mode: str = "init"
         self._last_retry_attempt: int | None = None
+        # Rows given up on after repeated non-transient errors (issue #20).
+        # In-process only; states_deadletter is the durable record.
+        self.rows_dropped: int = 0
 
         # D-03 / D-07 wiring: retry_until_success with full Phase 3 hook set.
         # Wrapping at class-body time would fix `self` too early; __init__ ensures
@@ -125,6 +131,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
             notify_stall=self._stall_hook,
             on_recovery=self._recovery_hook,
             on_sustained_fail=self._sustained_fail_hook,
+            on_poison=self._insert_rows_individually,
         )(self._insert_chunk_raw)
 
         # D-03-c: watermark read uses same retry shape as writes (owns a connection,
@@ -154,6 +161,18 @@ class TimescaledbStateRecorderThread(threading.Thread):
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
         )(self._read_all_known_entities_raw)
+
+        # Per-row fallback for a poison chunk (issue #20): same hooks, so a
+        # transient failure here still retries and stalls like a chunk would;
+        # only a row that keeps failing non-transiently is dropped.
+        self._insert_row = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+            notify_stall=self._stall_hook,
+            on_recovery=self._recovery_hook,
+            on_sustained_fail=self._sustained_fail_hook,
+            on_poison=self._drop_row,
+        )(self._insert_row_raw)
 
     # ------------------------------------------------------------------
     # Connection management (D-07-g)
@@ -395,6 +414,59 @@ class TimescaledbStateRecorderThread(threading.Thread):
         conn = self.get_db_connection()
         with conn.cursor() as cur:
             cur.executemany(sql, params)
+
+    def _insert_row_raw(self, row: StateRow) -> None:
+        """Raw single-row insert. Wrapped by retry_until_success in __init__."""
+        self._insert_chunk_raw([row])
+
+    def _insert_rows_individually(self, exc: Exception, chunk: list[StateRow]) -> None:
+        """on_poison hook for a chunk: retry its rows one at a time.
+
+        executemany fails the whole chunk for one bad row, so this isolates the
+        bad rows instead of dropping their neighbours.
+        """
+        _LOGGER.warning(
+            "%s: chunk of %d rows failed non-transiently (%r); inserting row by row",
+            self.name, len(chunk), exc,
+        )
+        for row in chunk:
+            if self._stop_event.is_set():
+                return
+            self._insert_row(row)
+
+    def _drop_row(self, exc: Exception, row: StateRow) -> None:
+        """on_poison hook for a row: count, log, dead-letter and surface it."""
+        self.rows_dropped += 1
+        _LOGGER.error(
+            "%s: dropping state row entity_id=%s last_updated=%s after repeated "
+            "non-transient errors (total dropped: %d): %r",
+            self.name, row.entity_id, row.last_updated.isoformat(),
+            self.rows_dropped, exc,
+        )
+        row_data = json.dumps(
+            {
+                "entity_id": row.entity_id,
+                "state": row.state,
+                "attributes": row.attributes,
+                "last_updated": row.last_updated,
+                "last_changed": row.last_changed,
+            },
+            default=_json_default,
+        )
+        try:
+            conn = self.get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    STATES_DEADLETTER_INSERT_SQL,
+                    (DEADLETTER_REASON_POISON, row.entity_id, row.last_updated,
+                     repr(exc), row_data),
+                )
+        except Exception:  # noqa: BLE001 — the row is already given up on
+            _LOGGER.error(
+                "%s: could not dead-letter the dropped row; it now exists only in "
+                "this log: %s", self.name, row_data, exc_info=True,
+            )
+        self._hass.add_job(create_states_dropped_issue, self._hass)
 
     def _slice_to_rows(self, slice_dict: dict) -> list[StateRow]:
         """Merge per-entity lists, sort by last_updated, convert to StateRow (D-04-d)."""

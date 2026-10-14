@@ -117,6 +117,14 @@ CREATE TABLE IF NOT EXISTS states (
 
 **Index** — `idx_states_entity_time ON states (entity_id, last_updated DESC)` for fast per-entity time-series lookups.
 
+### When a state row cannot be written
+
+Connection loss, timeouts, deadlocks and other transient database errors are retried until they succeed. Any other error means the data itself is rejected (for example a NUL character in an attribute). After 3 failed attempts the batch is retried row by row, and each row that still fails goes to the **`states_deadletter`** table (entity, timestamp, error, full row as JSON text) and raises a `states_dropped` repair issue, so ingestion carries on. The issue does not clear itself:
+
+```sql
+SELECT detected_at, entity_id, last_updated, error FROM states_deadletter ORDER BY detected_at DESC;
+```
+
 ### Convenience views
 
 `state` is TEXT because HA states are untyped — the same column holds `"23.5"`, `"on"`, and `"unavailable"`. Two views are created alongside the tables so queries don't have to re-derive the numeric cast:
@@ -288,7 +296,7 @@ The dimension tables are created idempotently on every integration startup (same
 
 ### When a change cannot be written
 
-A registry change is dropped instead of retried when the exclusion constraint rejects it, or when a newer version of the same id is already stored. The item goes to the **`metadata_deadletter`** table (reason, registry, id, full item as JSONB) and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
+A registry change is dropped instead of retried when the exclusion constraint rejects it, when a newer version of the same id is already stored, or when it fails 3 times with a non-transient error (anything other than connection loss, timeouts, deadlocks and similar, which are retried until they succeed). The item goes to the **`metadata_deadletter`** table (reason, registry, id, full item as JSONB) and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
 
 ```sql
 SELECT detected_at, reason, registry_id, error FROM metadata_deadletter ORDER BY detected_at DESC;

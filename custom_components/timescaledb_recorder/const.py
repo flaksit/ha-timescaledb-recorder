@@ -43,6 +43,12 @@ BACKFILL_QUEUE_MAXSIZE: int = 2   # D-01-b: backpressure cap for backfill_queue
 #   db_unreachable repair issue is raised via retry decorator's
 #   on_sustained_fail hook (D-11).
 STALL_THRESHOLD: int = 5
+# POISON_MAX_ATTEMPTS — consecutive non-transient failures after which a
+#   retry_until_success wrapper with an on_poison hook gives up on its input
+#   (issue #20). Retries still back off, so a misclassified transient error gets
+#   a few seconds to clear. Must stay below STALL_THRESHOLD: a poison item is not
+#   a stall and should not raise the stalled repair issue on its way out.
+POISON_MAX_ATTEMPTS: int = 3
 WATCHDOG_INTERVAL_S: float = 10.0
 DB_UNREACHABLE_THRESHOLD_SECONDS: float = 300.0
 
@@ -795,11 +801,12 @@ SELECT table_name, reason, count(*) AS rows
 
 # ---- Dead letter (issue #17, #20) --------------------------------------------
 #
-# Where the meta worker puts an item it is about to stop retrying. Two kinds
+# Where the meta worker puts an item it is about to stop retrying. Three kinds
 # reach it: a write the SCD2 constraints refuse (retrying replays the same
-# conflicting row forever, so the queue would wedge) and a registry change that
+# conflicting row forever, so the queue would wedge), a registry change that
 # arrived after a newer version already landed (splicing it in blind is how the
-# intervals got corrupted in the first place).
+# intervals got corrupted in the first place), and any other item that kept
+# failing with a non-transient error (retry.is_transient).
 #
 # Both used to exist only as an in-memory counter and a log line, which meant a
 # restart erased the evidence that anything had been dropped at all. A table
@@ -838,6 +845,33 @@ SELECT reason, count(*) AS rows, max(detected_at) AS latest
 # Reasons, so the writer and the reader cannot drift apart.
 DEADLETTER_REASON_INTEGRITY = "scd2_constraint_rejected"
 DEADLETTER_REASON_OUT_OF_ORDER = "arrived_after_newer_version"
+DEADLETTER_REASON_POISON = "non_transient_error"
+
+# States counterpart (issue #20): rows the states worker gave up on after a
+# chunk failed non-transiently and the row still failed on its own. `row_data`
+# is TEXT holding JSON, not JSONB: a NUL character in the attributes is a
+# typical reason a row is poison, and jsonb rejects \u0000 just like the
+# states table did — the record of the failure must not fail the same way.
+STATES_DEADLETTER_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS states_deadletter (
+    detected_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reason       TEXT        NOT NULL,
+    entity_id    TEXT,
+    last_updated TIMESTAMPTZ,
+    error        TEXT,
+    row_data     TEXT        NOT NULL
+);
+"""
+
+STATES_DEADLETTER_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_states_deadletter_detected_at
+    ON states_deadletter (detected_at DESC);
+"""
+
+STATES_DEADLETTER_INSERT_SQL = """
+INSERT INTO states_deadletter (reason, entity_id, last_updated, error, row_data)
+VALUES (%s, %s, %s, %s, %s);
+"""
 
 # Undo helper for a quarantined row, documented in the repair script's --help.
 _SCD2_QUARANTINE_RESTORE_SQL = """

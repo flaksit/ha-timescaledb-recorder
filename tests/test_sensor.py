@@ -114,6 +114,39 @@ def test_health_sensor_degraded():
     assert sensor._attr_native_value == "degraded"
 
 
+@pytest.mark.parametrize("issue_id", ["metadata_dropped", "states_dropped"])
+def test_health_sensor_degraded_on_dropped_data(issue_id):
+    hass = _make_hass(active_issue_ids={issue_id})
+    entry = _make_entry()
+
+    with patch(
+        "custom_components.timescaledb_recorder.sensor.ir.async_get",
+        return_value=hass._mock_issue_registry,
+    ):
+        sensor = TimescaledbHealthSensor(hass, entry)
+        sensor._update_state()
+
+    assert sensor._attr_native_value == "degraded"
+
+
+def test_health_sensor_ignores_inactive_issues():
+    """HA restores non-persistent issues as inactive after a restart; they must
+    not pin health to a past state."""
+    hass = _make_hass(active_issue_ids={"states_dropped"})
+    for issue in hass._mock_issue_registry.issues.values():
+        issue.active = False
+    entry = _make_entry()
+
+    with patch(
+        "custom_components.timescaledb_recorder.sensor.ir.async_get",
+        return_value=hass._mock_issue_registry,
+    ):
+        sensor = TimescaledbHealthSensor(hass, entry)
+        sensor._update_state()
+
+    assert sensor._attr_native_value == "ok"
+
+
 def test_health_sensor_error_issue():
     """db_unreachable issue active → state 'error'."""
     hass = _make_hass(active_issue_ids={"db_unreachable"})

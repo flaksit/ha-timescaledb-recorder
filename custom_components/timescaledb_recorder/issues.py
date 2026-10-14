@@ -22,6 +22,7 @@ _META_WORKER_STALLED_ID = "meta_worker_stalled"
 _DB_UNREACHABLE_ID = "db_unreachable"
 _RECORDER_DISABLED_ID = "recorder_disabled"
 _METADATA_DROPPED_ID = "metadata_dropped"
+_STATES_DROPPED_ID = "states_dropped"
 
 
 @callback
@@ -191,5 +192,24 @@ def create_metadata_dropped_issue(hass: HomeAssistant) -> None:
         is_fixable=False,
         severity=ir.IssueSeverity.ERROR,
         translation_key=_METADATA_DROPPED_ID,
+    )
+    async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)
+
+
+@callback
+def create_states_dropped_issue(hass: HomeAssistant) -> None:
+    """Register the states_dropped repair issue (issue #20).
+
+    Fired by the states worker each time it gives up on a row. The row is in
+    the states_deadletter table. Never cleared automatically, for the same
+    reason as metadata_dropped.
+    """
+    ir.async_create_issue(
+        hass,
+        domain=DOMAIN,
+        issue_id=_STATES_DROPPED_ID,
+        is_fixable=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key=_STATES_DROPPED_ID,
     )
     async_dispatcher_send(hass, SIGNAL_HEALTH_CHANGE)

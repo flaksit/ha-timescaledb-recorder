@@ -34,6 +34,36 @@
       }
     }
   },
+  "issues": {
+    "buffer_dropping": {
+      "title": "TimescaleDB recorder buffer overflow",
+      "description": "The TimescaleDB recorder in-memory buffer filled up and is dropping state events. This usually means the TimescaleDB database has been unavailable for an extended period. Dropped events will be recovered automatically from Home Assistant's sqlite recorder once the database is reachable again. No user action is required; this issue will clear itself."
+    },
+    "states_worker_stalled": {
+      "title": "TimescaleDB recorder states worker stalled",
+      "description": "The TimescaleDB recorder states worker has failed more than 5 consecutive write attempts to the TimescaleDB database. The worker will continue retrying indefinitely with exponential backoff (capped at 60s). This issue will clear automatically on the next successful write. If it persists, check the HA log for tracebacks and verify that the database is reachable and the schema is compatible."
+    },
+    "meta_worker_stalled": {
+      "title": "TimescaleDB recorder metadata worker stalled",
+      "description": "The TimescaleDB recorder metadata worker has failed more than 5 consecutive write attempts. Registry changes (entities, devices, areas, labels) are queued on disk and will replay when the database is reachable again. This issue will clear automatically on the next successful write. If it persists, check the HA log for tracebacks."
+    },
+    "db_unreachable": {
+      "title": "TimescaleDB database unreachable",
+      "description": "The TimescaleDB recorder has been unable to reach the database for more than 5 minutes. State changes and registry updates are buffered in memory (capped at 10,000 events) and on disk (metadata queue). Data is preserved and will be written once connectivity is restored. This issue will clear automatically on the next successful write."
+    },
+    "recorder_disabled": {
+      "title": "Home Assistant recorder integration is disabled",
+      "description": "The Home Assistant recorder integration is not loaded or has been disabled. The TimescaleDB recorder relies on HA's sqlite recorder as a safety net for backfilling state changes after a database outage. Without it, events dropped during a TimescaleDB outage cannot be recovered. To fix this, re-enable the recorder integration in your configuration and restart Home Assistant."
+    },
+    "metadata_dropped": {
+      "title": "TimescaleDB recorder dropped a metadata change",
+      "description": "The TimescaleDB recorder gave up on a registry metadata change and dropped it so the metadata queue could keep moving. The full item is kept in the metadata_deadletter table in TimescaleDB, together with the reason it was dropped. This leaves a hole in the dimension history that does not heal on its own: inspect that table, fix the cause, and re-apply the change by editing the entity, device, area or label in Home Assistant. This issue does not clear automatically."
+    },
+    "states_dropped": {
+      "title": "TimescaleDB recorder dropped state rows",
+      "description": "The TimescaleDB recorder could not write one or more state rows because the database kept rejecting them with a non-transient error, so it dropped them to keep the states queue moving. Each dropped row is kept in the states_deadletter table in TimescaleDB, together with the error. The states table has a gap for those rows: inspect the dead-letter table, fix the cause, and re-insert the rows by hand if you need them. This issue does not clear automatically."
+    }
+  },
   "entity": {
     "sensor": {
       "health": { "name": "Health" },

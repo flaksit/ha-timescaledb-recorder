@@ -2,11 +2,13 @@
 import threading
 from unittest.mock import MagicMock, patch
 
+import psycopg
 import pytest
 
 from custom_components.timescaledb_recorder import const
 from custom_components.timescaledb_recorder.retry import (
     _BACKOFF_SCHEDULE,
+    is_transient,
     retry_until_success,
 )
 
@@ -141,7 +143,7 @@ def test_notify_stall_rearms_after_success():
 
 
 def test_broad_exception_catch_d07c():
-    """D-07-c: catches BaseException-derived data-class errors too."""
+    """Without on_poison, non-transient errors are retried like transient ones."""
     ev = threading.Event()
     calls = [0]
 
@@ -512,3 +514,161 @@ def test_on_sustained_fail_uses_monotonic_not_wall_clock():
         fn_b()
 
     on_sustained_fail_no_fire.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #20: error classification and the on_poison exit
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("exc", [
+    psycopg.OperationalError("conn lost"),
+    psycopg.errors.QueryCanceled("timeout"),
+    psycopg.errors.DeadlockDetected("deadlock"),
+    psycopg.errors.SerializationFailure("serialization"),
+    psycopg.errors.LockNotAvailable("lock"),
+    psycopg.errors.AdminShutdown("shutdown"),
+    psycopg.InterfaceError("closed"),
+    psycopg.errors.ReadOnlySqlTransaction("standby"),
+    psycopg.errors.InsufficientPrivilege("revoked"),
+    ConnectionResetError("reset"),
+    OSError("io"),
+])
+def test_is_transient_true(exc):
+    assert is_transient(exc)
+
+
+@pytest.mark.parametrize("exc", [
+    psycopg.errors.UniqueViolation("dup"),
+    psycopg.errors.ExclusionViolation("overlap"),
+    psycopg.errors.UntranslatableCharacter("nul"),
+    psycopg.DataError("bad"),
+    psycopg.errors.ProgramLimitExceeded("index row too big"),
+    psycopg.ProgrammingError("syntax"),
+    ValueError("bad value"),
+    TypeError("bad type"),
+])
+def test_is_transient_false(exc):
+    assert not is_transient(exc)
+
+
+def test_poison_gives_up_after_max_attempts_and_returns_hook_value():
+    ev = threading.Event()
+    calls = []
+    on_poison = MagicMock(return_value="dropped")
+    exc = ValueError("always bad")
+
+    @retry_until_success(stop_event=ev, backoff_schedule=(0,), on_poison=on_poison)
+    def fn(item, flag=None):
+        calls.append(item)
+        raise exc
+
+    assert fn("x", flag=1) == "dropped"
+    assert len(calls) == const.POISON_MAX_ATTEMPTS
+    on_poison.assert_called_once_with(exc, "x", flag=1)
+
+
+def test_poison_attempts_back_off_before_giving_up():
+    """A misclassified transient error must get the backoff, not a tight loop."""
+    ev = MagicMock()
+    ev.wait.return_value = False
+
+    @retry_until_success(stop_event=ev, on_poison=lambda exc: None)
+    def fn():
+        raise ValueError("bad")
+
+    fn()
+    assert [c.args[0] for c in ev.wait.call_args_list] == list(
+        _BACKOFF_SCHEDULE[: const.POISON_MAX_ATTEMPTS - 1]
+    )
+
+
+def test_transient_errors_never_reach_on_poison():
+    on_poison = MagicMock()
+    calls = [0]
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         on_poison=on_poison)
+    def fn():
+        calls[0] += 1
+        if calls[0] <= 10:
+            raise psycopg.OperationalError("down")
+        return "ok"
+
+    assert fn() == "ok"
+    on_poison.assert_not_called()
+
+
+def test_transient_error_resets_poison_count():
+    on_poison = MagicMock()
+    errors = [ValueError("a"), ValueError("b"), psycopg.OperationalError("down"),
+              ValueError("c"), ValueError("d")]
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         on_poison=on_poison)
+    def fn():
+        if errors:
+            raise errors.pop(0)
+        return "ok"
+
+    assert fn() == "ok"
+    on_poison.assert_not_called()
+
+
+def test_without_on_poison_non_transient_errors_retry_forever():
+    calls = [0]
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,))
+    def fn():
+        calls[0] += 1
+        if calls[0] <= const.POISON_MAX_ATTEMPTS * 3:
+            raise ValueError("bad")
+        return "ok"
+
+    assert fn() == "ok"
+
+
+def test_poison_exit_fires_on_recovery_after_stall():
+    """Giving up ends the streak: a stall raised by earlier transient failures
+    must be cleared, or its repair issue would outlive the stall."""
+    notify_stall = MagicMock()
+    on_recovery = MagicMock()
+    errors = [psycopg.OperationalError("down")] * 5 + [ValueError("bad")] * 3
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         notify_stall=notify_stall, on_recovery=on_recovery,
+                         on_poison=lambda exc: "dropped")
+    def fn():
+        raise errors.pop(0)
+
+    assert fn() == "dropped"
+    notify_stall.assert_called_once()
+    on_recovery.assert_called_once()
+
+
+def test_poison_alone_does_not_stall():
+    notify_stall = MagicMock()
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         notify_stall=notify_stall, on_poison=lambda exc: None)
+    def fn():
+        raise ValueError("bad")
+
+    fn()
+    notify_stall.assert_not_called()
+
+
+def test_on_poison_exception_propagates():
+    def on_poison(exc):
+        raise RuntimeError("hook bug")
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         on_poison=on_poison)
+    def fn():
+        raise ValueError("bad")
+
+    with pytest.raises(RuntimeError, match="hook bug"):
+        fn()
+
+
+def test_poison_max_below_stall_threshold():
+    assert const.POISON_MAX_ATTEMPTS < const.STALL_THRESHOLD

@@ -594,9 +594,10 @@ SCD2_OPEN_UNIQUE_IDX_SQL = {
 # SCD2 repair SQL (issue #17) — consumed by repair_scd2.py
 # ----------------------------------------------------------------------------
 #
-# Anchor principle: TRUST valid_from, NEVER WRITE IT — with one exception, an
-# entity starting before its device (SCD2_ALIGN_START_SQL, below), which only
-# ever moves a start later and never past a recorded state.
+# Anchor principle: TRUST valid_from, NEVER WRITE IT — except for first
+# versions contradicted by other evidence: an entity starting before its device
+# (SCD2_ALIGN_START_SQL) and a first version starting after a state the registry
+# entry already existed for (SCD2_EXTEND_*_SQL). See those for the bounds.
 #
 # valid_from is stamped in the event loop at event time and is the one field both
 # defects leave intact — the close-timestamp bug corrupts only valid_to, and the
@@ -1045,6 +1046,96 @@ archived AS (
       FROM plan p JOIN entities t ON t.ctid = p.rid)
 UPDATE entities t SET valid_from = p.new_from
   FROM plan p WHERE t.ctid = p.rid;
+"""
+)
+
+# ---- Extend a late first version back to the first state ---------------------
+#
+# The mirror of the alignment above, and the one place the repair moves a start
+# EARLIER. A first version is stamped when the integration hears of the entity:
+# the registry event fires after HA has already written the first state
+# (sub-millisecond), and an entity created during HA startup is only recorded by
+# the snapshot, ~30 s later (#19). Those first states fall before every version
+# and get NULL metadata.
+#
+# Two pieces of evidence, both required: a recorded state for this entity_id,
+# and the registry entry's own `created_at` at or before it — the entry existed
+# when the state was written. created_at alone is not enough: a renamed entity
+# keeps its registry entry, so created_at can predate the entity_id itself. The
+# new start is therefore the first state, never created_at.
+#
+# Ambiguous first versions (shared valid_from) are skipped, as in the alignment.
+_SCD2_EXTEND_ENTITY_CTES = f"""
+ordered AS (
+    SELECT ctid AS rid, entity_id, valid_from, extra,
+           row_number() OVER (PARTITION BY entity_id
+                              ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid) AS rn,
+           count(*) OVER (PARTITION BY entity_id, valid_from) AS ties
+      FROM entities),
+eplan AS (
+    SELECT o.rid, o.entity_id, s.first_state AS new_from
+      FROM ordered o
+      CROSS JOIN LATERAL (
+          SELECT min(st.last_updated) AS first_state
+            FROM {TABLE_NAME} st WHERE st.entity_id = o.entity_id) s
+     WHERE o.rn = 1 AND o.ties = 1
+       AND s.first_state < o.valid_from
+       AND (o.extra->>'created_at')::timestamptz <= s.first_state)
+"""
+
+SCD2_EXTEND_ENTITY_PREVIEW_SQL = (
+    "WITH " + _SCD2_EXTEND_ENTITY_CTES + "SELECT count(*) FROM eplan;"
+)
+
+SCD2_EXTEND_ENTITY_SQL = (
+    "WITH " + _SCD2_EXTEND_ENTITY_CTES + """,
+archived AS (
+    INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
+    SELECT %s, 'entities', p.entity_id, 'start_extended_to_first_state', to_jsonb(t)
+      FROM eplan p JOIN entities t ON t.ctid = p.rid)
+UPDATE entities t SET valid_from = p.new_from
+  FROM eplan p WHERE t.ctid = p.rid;
+"""
+)
+
+# Devices lag the same way and have no states of their own. A device's first
+# version moves back to the earliest entity version referencing it, bounded by
+# the device's own created_at, so an extended entity does not point at a device
+# that "did not exist yet". Entity starts are projected through eplan, so the
+# dry-run preview (entities not yet extended) and the run after the entities
+# transaction give the same answer.
+_SCD2_EXTEND_DEVICE_CTES = _SCD2_EXTEND_ENTITY_CTES + """,
+entity_starts AS (
+    SELECT e.device_id, COALESCE(p.new_from, e.valid_from) AS start
+      FROM entities e LEFT JOIN eplan p ON p.rid = e.ctid
+     WHERE e.device_id IS NOT NULL),
+dordered AS (
+    SELECT ctid AS rid, device_id, valid_from,
+           (extra->>'created_at')::timestamptz AS created_at,
+           row_number() OVER (PARTITION BY device_id
+                              ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid) AS rn,
+           count(*) OVER (PARTITION BY device_id, valid_from) AS ties
+      FROM devices),
+dplan AS (
+    SELECT d.rid, d.device_id, greatest(min(es.start), d.created_at) AS new_from
+      FROM dordered d JOIN entity_starts es ON es.device_id = d.device_id
+     WHERE d.rn = 1 AND d.ties = 1 AND d.created_at IS NOT NULL
+     GROUP BY d.rid, d.device_id, d.valid_from, d.created_at
+    HAVING greatest(min(es.start), d.created_at) < d.valid_from)
+"""
+
+SCD2_EXTEND_DEVICE_PREVIEW_SQL = (
+    "WITH " + _SCD2_EXTEND_DEVICE_CTES + "SELECT count(*) FROM dplan;"
+)
+
+SCD2_EXTEND_DEVICE_SQL = (
+    "WITH " + _SCD2_EXTEND_DEVICE_CTES + """,
+archived AS (
+    INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
+    SELECT %s, 'devices', p.device_id, 'start_extended_to_entity', to_jsonb(t)
+      FROM dplan p JOIN devices t ON t.ctid = p.rid)
+UPDATE devices t SET valid_from = p.new_from
+  FROM dplan p WHERE t.ctid = p.rid;
 """
 )
 

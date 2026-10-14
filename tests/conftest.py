@@ -122,8 +122,8 @@ def mock_device_registry():
     ]
 
     reg = MagicMock()
-    reg.devices = MagicMock()
-    reg.devices.values = MagicMock(return_value=iter(entries))
+    # Iterating .devices yields entries (HA >= 2026.9); mapping access is deprecated.
+    reg.devices = entries
     return reg
 
 

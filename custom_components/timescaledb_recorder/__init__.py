@@ -25,6 +25,7 @@ import queue
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from collections.abc import Iterator
 from typing import Callable
 
 import voluptuous as vol
@@ -181,6 +182,21 @@ def _get_entity_filter(hass: HomeAssistant, entry):
     })
 
 
+def _iter_device_entries(device_reg: dr.DeviceRegistry) -> Iterator[dr.DeviceEntry]:
+    """Yield every active device entry without mapping-style access to `.devices`.
+
+    HA >= 2026.9 deprecates `.devices.values()` and other mapping access (breaks in
+    2027.9); iterating `.devices` yields entries there. Older HA iterates a
+    UserDict, which yields device ids, so those are resolved via `async_get`.
+    """
+    for item in device_reg.devices:
+        if isinstance(item, str):
+            if (entry := device_reg.async_get(item)) is not None:
+                yield entry
+        else:
+            yield item
+
+
 async def _async_initial_registry_backfill(
     hass: HomeAssistant, meta_queue: PersistentQueue,
 ) -> None:
@@ -248,7 +264,7 @@ async def _async_initial_registry_backfill(
             "enqueued_at": now_iso,
         })
 
-    for entry in device_reg.devices.values():
+    for entry in _iter_device_entries(device_reg):
         params = listener_helper._extract_device_params(entry, now)
         items.append({
             "registry": "device",

@@ -9,6 +9,7 @@ These tests verify that:
 6. Phase 3: watchdog task spawned, orchestrator done_callback wired
 7. Phase 3: recorder_disabled check + auto-clear background task
 8. Phase 3: unload cancels and awaits watchdog before orchestrator (MEDIUM-12)
+9. Initial registry snapshot enumerates devices without deprecated mapping access
 """
 import asyncio
 import dataclasses
@@ -18,6 +19,8 @@ import pytest
 
 from custom_components.timescaledb_recorder import (
     TimescaledbRecorderData,
+    _async_initial_registry_backfill,
+    _iter_device_entries,
     async_setup_entry,
     async_unload_entry,
 )
@@ -1294,3 +1297,60 @@ async def test_unload_preserves_phase2_behaviour():
     data.meta_queue.wake_consumer.assert_called_once()
     hass.async_add_executor_job.assert_any_call(data.states_worker.join, 30)
     hass.async_add_executor_job.assert_any_call(data.meta_worker.join, 30)
+
+
+# ---------------------------------------------------------------------------
+# Issue #24: device registry enumeration without deprecated mapping access
+# ---------------------------------------------------------------------------
+
+def test_iter_device_entries_iterates_without_mapping_access():
+    """HA >= 2026.9: iterating .devices yields entries; .values() is never called."""
+    entries = [MagicMock(id="d1"), MagicMock(id="d2")]
+    reg = MagicMock()
+    reg.devices.__iter__.return_value = iter(entries)
+
+    assert list(_iter_device_entries(reg)) == entries
+    reg.devices.values.assert_not_called()
+    reg.async_get.assert_not_called()
+
+
+def test_iter_device_entries_resolves_ids_on_older_ha():
+    """Older HA: iterating .devices yields device ids, resolved via async_get."""
+    from homeassistant.helpers import device_registry as dr
+
+    # Real container of the installed (pre-2026.9) HA: iteration yields ids.
+    devices = dr.ActiveDeviceRegistryItems()
+    entries = [dr.DeviceEntry(), dr.DeviceEntry()]
+    for e in entries:
+        devices[e.id] = e
+    reg = MagicMock()
+    reg.devices = devices
+    reg.async_get = MagicMock(side_effect=devices.get)
+
+    assert list(_iter_device_entries(reg)) == entries
+
+
+async def test_initial_registry_backfill_enqueues_devices(
+    mock_area_registry, mock_label_registry, mock_entity_registry, mock_device_registry,
+):
+    """Initial snapshot enqueues one create item per device entry."""
+    meta_queue = MagicMock()
+    meta_queue.put_many_async = AsyncMock()
+    with patch(
+        "custom_components.timescaledb_recorder.ar.async_get",
+        return_value=mock_area_registry,
+    ), patch(
+        "custom_components.timescaledb_recorder.lr.async_get",
+        return_value=mock_label_registry,
+    ), patch(
+        "custom_components.timescaledb_recorder.er.async_get",
+        return_value=mock_entity_registry,
+    ), patch(
+        "custom_components.timescaledb_recorder.dr.async_get",
+        return_value=mock_device_registry,
+    ):
+        await _async_initial_registry_backfill(MagicMock(), meta_queue)
+
+    items = meta_queue.put_many_async.await_args.args[0]
+    device_ids = [i["registry_id"] for i in items if i["registry"] == "device"]
+    assert device_ids == ["device-001", "device-002"]

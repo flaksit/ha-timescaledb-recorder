@@ -12,6 +12,7 @@ Tests cover:
 - Defensive handling of None exc and missing _last_exception attribute
 - Poll-body exception does not kill the watchdog loop (MEDIUM-9)
 - Polling cadence is interruptible by loop_stop_event
+- Stop listener removed on exit only if it has not fired
 - spawn_states_worker constructs thread from runtime fields
 - spawn_meta_worker constructs thread from runtime fields
 - Factories return unstarted threads
@@ -578,6 +579,51 @@ async def test_watchdog_polls_cadence_interruptible_by_loop_stop_event():
 
     # states_worker.is_alive should have been called at least twice (3 poll cycles)
     assert states_w.is_alive.call_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# EVENT_HOMEASSISTANT_STOP listener cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_does_not_remove_fired_stop_listener():
+    """A fired one-time stop listener is not removed again on exit (#22)."""
+    hass = MagicMock()
+    remover = MagicMock()
+    hass.bus.async_listen_once.return_value = remover
+    runtime = _MockRuntime(
+        states_worker=_alive_worker(),
+        meta_worker=_alive_worker(),
+        stop_event=threading.Event(),
+    )
+
+    task = asyncio.create_task(watchdog_loop(hass, runtime))
+    await asyncio.sleep(0)
+    on_ha_stop = hass.bus.async_listen_once.call_args.args[1]
+    on_ha_stop(None)
+    await task
+
+    assert runtime.loop_stop_event.is_set()
+    remover.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_removes_unfired_stop_listener():
+    """Exit via unload (listener never fired) removes the stop listener."""
+    hass = MagicMock()
+    remover = MagicMock()
+    hass.bus.async_listen_once.return_value = remover
+    runtime = _MockRuntime(
+        states_worker=_alive_worker(),
+        meta_worker=_alive_worker(),
+        stop_event=threading.Event(),
+    )
+    runtime.loop_stop_event.set()
+
+    await watchdog_loop(hass, runtime)
+
+    remover.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

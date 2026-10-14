@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
@@ -130,8 +131,14 @@ async def watchdog_loop(
     Without this, HA logs "still running after final writes shutdown stage" when
     the restart path fires FINAL_WRITE before unload completes.
     """
+    cancel_stop_listener: Callable[[], None] | None = None
+
     @callback
     def _on_ha_stop(_event) -> None:
+        # A one-time listener removes itself when it fires; calling the remover
+        # again makes HA log "Unable to remove unknown job listener".
+        nonlocal cancel_stop_listener
+        cancel_stop_listener = None
         runtime.loop_stop_event.set()
 
     cancel_stop_listener = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_ha_stop)
@@ -182,4 +189,5 @@ async def watchdog_loop(
                     exc_info=True,
                 )
     finally:
-        cancel_stop_listener()
+        if cancel_stop_listener is not None:
+            cancel_stop_listener()

@@ -223,7 +223,7 @@ This enables historically correct joins: for any row in `states`, you can join t
 
 All four tables follow the same SCD2 pattern. The current row for any object has `valid_to IS NULL`. When metadata changes, the existing row is closed (`valid_to` set to the timestamp of the change) and a new row is inserted (`valid_from` = that same timestamp, `valid_to = NULL`). Historical rows are never deleted.
 
-Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`. Set-valued fields (e.g. `config_entries`, `identifiers`, `aliases`) are stored as sorted JSON arrays; rows written by older versions hold them as Python set strings such as `"{'a', 'b'}"`, in arbitrary order. Change detection treats both forms as equal, so upgrading does not create new versions.
+Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`. Set-valued fields (e.g. `identifiers`, `connections`, `aliases`) are stored as sorted JSON arrays, and `labels` arrays are sorted (code point order). Rows written by older versions hold sets as Python set strings such as `"{'a', 'b'}"`, in arbitrary order, and may hold unsorted `labels`. On its first start after the upgrade the metadata worker rewrites those rows once, before processing any registry change: only `extra` and `labels` change, never `valid_from`/`valid_to`, and the `schema_migrations` table records that it ran so later starts skip it.
 
 #### entities
 
@@ -379,7 +379,7 @@ A worker thread that dies is restarted by the watchdog with a persistent notific
 
 ### Database timeouts
 
-Every worker connection bounds its waits so a hang turns into a logged, retried error: TCP keepalives (dead connection detected after ~60 s idle), `tcp_user_timeout` 60 s, `connect_timeout` 10 s, and `statement_timeout` 5 min for reads and writes (schema setup at startup and the backfill's scan of all known entity ids run without it, since DDL on a large table and a scan that grows with it can take longer; the watchdog still reports either if it runs past 10 min). Values you set in the DSN win, e.g. `postgresql://...?keepalives_idle=120&options=-c%20statement_timeout%3D600000`. A `statement_timeout` configured on the role or database is kept too. These are session settings, so connect directly or through a pooler in session mode (PgBouncer `pool_mode = session`); transaction or statement pooling is not supported.
+Every worker connection bounds its waits so a hang turns into a logged, retried error: TCP keepalives (dead connection detected after ~60 s idle), `tcp_user_timeout` 60 s, `connect_timeout` 10 s, and `statement_timeout` 5 min for reads and writes (schema setup at startup, the one-time canonicalization of dimension rows and the backfill's scan of all known entity ids run without it, since DDL on a large table and work that grows with history can take longer; the watchdog still reports either if it runs past 10 min). Values you set in the DSN win, e.g. `postgresql://...?keepalives_idle=120&options=-c%20statement_timeout%3D600000`. A `statement_timeout` configured on the role or database is kept too. These are session settings, so connect directly or through a pooler in session mode (PgBouncer `pool_mode = session`); transaction or statement pooling is not supported.
 
 ## Troubleshooting
 
@@ -456,6 +456,7 @@ Order matters:
 - **Install 2.4.0 before repairing.** Older versions retry rejected writes forever, so the new constraints would wedge their metadata queue. Without the constraints (`--no-constraints`) the history re-corrupts.
 - **Keep steps 1–3 close together.** 2.4.0 redefines `states_flat` to join `valid_to` literally, so it duplicates rows until the repair runs.
 - **Restart after `--apply`.** The startup snapshot re-creates a current version for ids the repair left without one (see Fidelity below).
+- **`--dry-run` and `--apply` refuse (exit 2) until the integration has canonicalized the dimension rows**, which it does once on startup (step 1). They compare row payloads, and rows in the old set-string form would make identical versions look different. `--verify-only` compares intervals only and always runs.
 
 **Downgrading below 2.4.0** after the constraints are in place: first `ALTER TABLE <t> DROP CONSTRAINT excl_<t>_period` for `entities`, `devices`, `areas` and `labels`, or the old writer wedges as above.
 
@@ -470,7 +471,7 @@ Order matters:
 | `--no-constraints` | off | Repair without adding the exclusion constraints |
 | `--yes` | off | Skip the `--apply` confirmation. Required without a terminal |
 
-Exit codes: 0 invariant holds; 1 invariant violated, or a table still fails verification or its constraint could not be created; 2 `valid_from` itself looks unsound — stop and investigate. Ambiguity, Fidelity and Coverage findings do not change the exit code; read them. `--collapse-duplicates` and `--merge-identical-gaps` also work on an already-repaired database, so `--dry-run`, then `--apply --merge-identical-gaps` after reading Fidelity, is a valid sequence.
+Exit codes: 0 invariant holds; 1 invariant violated, or a table still fails verification or its constraint could not be created; 2 `valid_from` itself looks unsound — stop and investigate — or the dimension rows are not canonicalized yet (start the updated integration first). Ambiguity, Fidelity and Coverage findings do not change the exit code; read them. `--collapse-duplicates` and `--merge-identical-gaps` also work on an already-repaired database, so `--dry-run`, then `--apply --merge-identical-gaps` after reading Fidelity, is a valid sequence.
 
 ### What it does
 

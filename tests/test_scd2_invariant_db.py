@@ -100,7 +100,8 @@ def damaged(conn):
     """A schema holding the issue's evidence plus every other damage shape."""
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS entities, devices, areas, labels, states,"
-                    " scd2_repair_quarantine, metadata_deadletter CASCADE")
+                    " scd2_repair_quarantine, metadata_deadletter, schema_migrations"
+                    " CASCADE")
         cur.execute("SELECT tablename FROM pg_tables WHERE tablename LIKE %s",
                     ("%_prerepair_%",))
         for (name,) in cur.fetchall():
@@ -109,8 +110,11 @@ def damaged(conn):
                     const.CREATE_DIM_AREAS_SQL, const.CREATE_DIM_LABELS_SQL,
                     const.CREATE_TABLE_SQL, const.SCD2_QUARANTINE_DDL_SQL,
                     const.SCD2_QUARANTINE_IDX_SQL,
-                    const.METADATA_DEADLETTER_DDL_SQL):
+                    const.METADATA_DEADLETTER_DDL_SQL,
+                    const.SCHEMA_MIGRATIONS_DDL_SQL):
             cur.execute(ddl)
+        # These rows are canonical; the repair refuses to run before the marker.
+        cur.execute(const.SCHEMA_MIGRATION_MARK_SQL, (const.CANONICAL_SETS_MIGRATION_ID,))
         for eid, name, vf, vt in EVIDENCE_ROWS + OTHER_DAMAGE:
             cur.execute(
                 "INSERT INTO entities (entity_id, ha_entity_uuid, name, domain,"
@@ -384,10 +388,12 @@ def clean_db(conn):
     """Empty, constrained dimensions — the state a fresh install starts in."""
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS entities, devices, areas, labels, states,"
-                    " scd2_repair_quarantine, metadata_deadletter CASCADE")
+                    " scd2_repair_quarantine, metadata_deadletter, schema_migrations"
+                    " CASCADE")
         for ddl in (const.CREATE_DIM_ENTITIES_SQL, const.CREATE_DIM_DEVICES_SQL,
                     const.CREATE_DIM_AREAS_SQL, const.CREATE_DIM_LABELS_SQL,
-                    const.CREATE_TABLE_SQL, const.METADATA_DEADLETTER_DDL_SQL):
+                    const.CREATE_TABLE_SQL, const.METADATA_DEADLETTER_DDL_SQL,
+                    const.SCHEMA_MIGRATIONS_DDL_SQL):
             cur.execute(ddl)
     assert repair_scd2.add_constraints(
         conn, [t for t, _k in const.SCD2_DIMENSIONS]) == []

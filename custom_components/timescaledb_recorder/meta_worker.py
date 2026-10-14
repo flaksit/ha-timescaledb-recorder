@@ -42,7 +42,9 @@ from psycopg.types.json import Jsonb
 
 from homeassistant.core import HomeAssistant
 
+from .canonical import canonical_labels, canonical_legacy
 from .const import (
+    CANONICAL_SETS_MIGRATION_ID,
     DEADLETTER_REASON_INTEGRITY,
     DEADLETTER_REASON_OUT_OF_ORDER,
     DEADLETTER_REASON_POISON,
@@ -64,7 +66,7 @@ from .const import (
     SCD2_SWEEP_FREE_CLOSES,
     SCD2_SWEEP_MAX_CLOSE_FRACTION,
 )
-from .db import DbCallTracker, connect
+from .db import DbCallTracker, connect, statement_timeout_lifted
 from .issues import (
     clear_db_unreachable_issue,
     clear_meta_worker_stalled_issue,
@@ -72,6 +74,7 @@ from .issues import (
     create_meta_worker_stalled_issue,
     create_metadata_dropped_issue,
 )
+from .migrations import canonicalize_dimension_rows, migration_applied
 from .retry import retry_until_success
 
 if TYPE_CHECKING:
@@ -99,6 +102,12 @@ _SCD2_SQL = {
     "device": (SCD2_CLOSE_DEVICE_SQL, SCD2_SNAPSHOT_DEVICE_SQL),
     "area": (SCD2_CLOSE_AREA_SQL, SCD2_SNAPSHOT_AREA_SQL),
     "label": (SCD2_CLOSE_LABEL_SQL, SCD2_SNAPSHOT_LABEL_SQL),
+}
+
+# labels slot per registry that has one (see _extract_*_params). extra is last.
+_LABELS_INDEX = {
+    "entity": 7,
+    "device": 5,
 }
 
 _RECONCILE_ACTIONS = frozenset({"create", "update", "snapshot"})
@@ -177,6 +186,18 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             on_sustained_fail=self._sustained_fail_hook,
             on_poison=self._drop_poison_item,
         )(self.db_calls.track(self._write_item_raw))
+
+        # Same hooks as item writes: an unreachable DB stalls and alarms here
+        # exactly as it would on the first item. Tracked, so the watchdog sees
+        # a hung migration even though it runs without statement_timeout.
+        self._migrate = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+            notify_stall=self._stall_hook,
+            on_recovery=self._recovery_hook,
+            on_sustained_fail=self._sustained_fail_hook,
+            on_poison=self._migration_failed,
+        )(self.db_calls.track(self._migrate_raw))
 
     # ------------------------------------------------------------------
     # Connection management (D-07-g) — identical shape to states_worker.
@@ -304,6 +325,10 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         in run() can wrap it cleanly (MEDIUM-8 pattern)."""
         if not self._wait_for_schema():
             return
+        # Before the first item: change detection compares stored rows directly.
+        self._last_op = "migrate"
+        if self._migrate() is None:
+            return  # interrupted by shutdown
         while not self._stop_event.is_set():
             item = self._meta_queue.get()  # blocks on Condition; None on wake
             if item is None or self._stop_event.is_set():
@@ -337,6 +362,36 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             if self._stop_event.is_set():
                 return False
         return not self._stop_event.is_set()
+
+    def _migrate_raw(self) -> bool:
+        """Run pending one-time data migrations; one PK lookup once applied.
+
+        No statement_timeout: rewriting every dimension row can outlast it on a
+        large history, and a timeout would make it a retry loop that never
+        finishes.
+        """
+        conn = self.get_db_connection()
+        if migration_applied(conn, CANONICAL_SETS_MIGRATION_ID):
+            return True
+        _LOGGER.info("%s: canonicalizing stored dimension rows (one-time)", self.name)
+        with statement_timeout_lifted(conn):
+            rewritten = canonicalize_dimension_rows(conn)
+        _LOGGER.info("%s: dimension rows canonicalized: %s", self.name, rewritten)
+        return True
+
+    def _migration_failed(self, exc: Exception) -> bool:
+        """retry_until_success on_poison hook: keep ingesting, retry next start.
+
+        Without the marker the next startup tries again. Until then, rows still
+        in the legacy form read as changed, so the snapshot writes one extra
+        version per affected entry: noise, not loss, and better than halting
+        metadata ingestion on a migration bug.
+        """
+        _LOGGER.error(
+            "%s: one-time canonicalization of dimension rows failed; continuing "
+            "without it and retrying on the next start", self.name, exc_info=exc,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Dispatch (D-05-c)
@@ -584,6 +639,13 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         vf = rehydrated[idx]
         if isinstance(vf, str):
             rehydrated[idx] = datetime.fromisoformat(vf)
+        # Items queued by versions before canonical serialization carry str(set)
+        # in extra and possibly unsorted labels; written as-is they would undo
+        # the migration and read as changed.
+        if isinstance(rehydrated[-1], str):
+            rehydrated[-1] = json.dumps(canonical_legacy(json.loads(rehydrated[-1])))
+        if (labels_idx := _LABELS_INDEX.get(registry)) is not None:
+            rehydrated[labels_idx] = canonical_labels(rehydrated[labels_idx])
         return tuple(rehydrated)
 
     # ------------------------------------------------------------------

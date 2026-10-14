@@ -1,5 +1,4 @@
 """RegistryListener: thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker."""
-import ast
 import asyncio
 import json
 import logging
@@ -28,6 +27,7 @@ from .const import (
     SELECT_AREA_CURRENT_SQL,
     SELECT_LABEL_CURRENT_SQL,
 )
+from .canonical import canonical, canonical_labels
 from .persistent_queue import PersistentQueue
 
 _LOGGER = logging.getLogger(__name__)
@@ -50,25 +50,6 @@ _DEVICE_TYPED_KEYS = frozenset({
 })
 _AREA_TYPED_KEYS = frozenset({"id", "name"})
 _LABEL_TYPED_KEYS = frozenset({"label_id", "name", "color"})
-
-
-def _sort_key(value: object) -> str:
-    return json.dumps(value, sort_keys=True, default=str)
-
-
-def _canonical(value: object) -> object:
-    """JSON-ready copy of `value` with every set as a sorted list.
-
-    str(set) and set iteration order depend on PYTHONHASHSEED, so a set
-    serialized as-is reads as a change on every restart.
-    """
-    if isinstance(value, (set, frozenset)):
-        return sorted((_canonical(v) for v in value), key=_sort_key)
-    if isinstance(value, (list, tuple)):
-        return [_canonical(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _canonical(v) for k, v in value.items()}
-    return value
 
 
 def _build_extra(entry, exclude_keys: frozenset) -> str:
@@ -95,7 +76,7 @@ def _build_extra(entry, exclude_keys: frozenset) -> str:
         k: v for k, v in raw.items()
         if k not in exclude_keys and not k.startswith("_")
     }
-    return json.dumps(_canonical(filtered), default=str)
+    return json.dumps(canonical(filtered), default=str)
 
 
 # Fields present in extra that change on every HA internal registry write without
@@ -110,41 +91,16 @@ def _extra_changed(stored, new_json: str) -> bool:
     `stored` may be a str or dict (DB drivers may return JSONB columns as either).
     Ignores fields in _EXTRA_COMPARE_IGNORE (e.g. modified_at) which HA updates
     on every internal write regardless of whether user-visible metadata changed.
-    Both sides go through _normalize_legacy_sets, so rows written as str(set)
-    compare equal to the sorted-list form and are not re-versioned on upgrade.
+    Stored rows are canonical (migrations.canonicalize_dimension_rows), so the
+    parsed objects compare directly.
     """
     stored_dict = json.loads(stored) if isinstance(stored, str) else (stored or {})
     new_dict = json.loads(new_json)
-    return (
-        _normalize_legacy_sets({k: v for k, v in stored_dict.items() if k not in _EXTRA_COMPARE_IGNORE})
-        != _normalize_legacy_sets({k: v for k, v in new_dict.items() if k not in _EXTRA_COMPARE_IGNORE})
-    )
+    return _without_ignored(stored_dict) != _without_ignored(new_dict)
 
 
-def _normalize_legacy_sets(value: object) -> object:
-    """Replace str(set) strings (hash-ordered) with the canonical sorted list.
-
-    Only strings shaped like a set repr are parsed, and only a set result is
-    accepted; anything else stays a string. literal_eval evaluates no code.
-    """
-    if isinstance(value, dict):
-        return {k: _normalize_legacy_sets(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_normalize_legacy_sets(v) for v in value]
-    if not isinstance(value, str):
-        return value
-    text = value
-    if text.startswith("frozenset(") and text.endswith(")"):
-        text = text[len("frozenset("):-1] or "set()"
-    elif not (text == "set()" or (text.startswith("{") and text.endswith("}"))):
-        return value
-    try:
-        parsed = ast.literal_eval(text)
-    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-        return value
-    if not isinstance(parsed, (set, frozenset)):
-        return value
-    return _canonical(parsed)
+def _without_ignored(extra: dict) -> dict:
+    return {k: v for k, v in extra.items() if k not in _EXTRA_COMPARE_IGNORE}
 
 
 def _to_json_safe(params: tuple | list | None) -> list | None:
@@ -437,8 +393,8 @@ class RegistryListener:
         name = entry.name if entry.name is not None else entry.original_name
         domain = entry.entity_id.split(".")[0]
         # psycopg3 needs a list for TEXT[]; sorted so the stored array does not
-        # depend on PYTHONHASHSEED (the repair SQL compares rows textually).
-        labels = sorted(entry.labels)
+        # depend on PYTHONHASHSEED (the repair SQL compares arrays element-wise).
+        labels = canonical_labels(list(entry.labels))
         disabled_by = entry.disabled_by.value if entry.disabled_by is not None else None
         extra = _build_extra(entry, _ENTITY_TYPED_KEYS)
         return (
@@ -466,7 +422,7 @@ class RegistryListener:
         A ChildDeviceEntry has no manufacturer/model; reading them anyway goes
         through HA's deprecation shim, which logs a warning per access.
         """
-        labels = sorted(entry.labels)
+        labels = canonical_labels(list(entry.labels))
         extra = _build_extra(entry, _DEVICE_TYPED_KEYS)
         is_child = isinstance(entry, dr.ChildDeviceEntry)
         return (

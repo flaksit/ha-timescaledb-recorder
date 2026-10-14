@@ -34,6 +34,7 @@ from .const import (
     SCD2_DIMENSIONS,
     SCD2_EXCLUDE_CONSTRAINT_SQL,
     SCD2_OPEN_UNIQUE_IDX_SQL,
+    SCHEMA_MIGRATIONS_DDL_SQL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -172,6 +173,8 @@ def sync_setup_schema(
         cur.execute(METADATA_DEADLETTER_IDX_SQL)
         cur.execute(STATES_DEADLETTER_DDL_SQL)
         cur.execute(STATES_DEADLETTER_IDX_SQL)
+        # Before schema_ready is signalled: the meta worker reads it first thing.
+        cur.execute(SCHEMA_MIGRATIONS_DDL_SQL)
 
         # Convenience views — must follow the dimension tables, since
         # states_flat joins them. CREATE OR REPLACE (not IF NOT EXISTS)

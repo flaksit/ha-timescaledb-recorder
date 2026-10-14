@@ -183,7 +183,9 @@ def test_extra_carries_created_at_the_worker_can_read():
 # ---------------------------------------------------------------------------
 
 _HASHSEED_PROBE = """
+import dataclasses
 import json
+import attrs
 from datetime import datetime, timezone
 from homeassistant.helpers import device_registry as dr, area_registry as ar
 from custom_components.timescaledb_recorder import registry_listener as rl
@@ -197,11 +199,20 @@ device = dr.DeviceEntry(
 area = ar.AreaEntry(name="A", aliases={"x", "y", "z", "w"}, floor_id=None,
                     humidity_entity_id=None, icon=None, id="a", picture=None,
                     temperature_entity_id=None, created_at=ts, modified_at=ts)
+
+
+def legacy(raw, typed):
+    # _build_extra before canonical serialization: sets fell through to str().
+    return json.dumps({k: v for k, v in raw.items()
+                       if k not in typed and not k.startswith("_")}, default=str)
+
+
 print(json.dumps({
     "device": rl._build_extra(device, rl._DEVICE_TYPED_KEYS),
     "area": rl._build_extra(area, rl._AREA_TYPED_KEYS),
-    "legacy_device": json.dumps({"identifiers": str(device.identifiers),
-                                 "connections": str(device.connections)}),
+    "legacy_device": legacy(attrs.asdict(device), rl._DEVICE_TYPED_KEYS),
+    "legacy_area": legacy({f.name: getattr(area, f.name) for f in dataclasses.fields(area)},
+                          rl._AREA_TYPED_KEYS),
 }))
 """
 
@@ -232,28 +243,40 @@ def test_build_extra_is_independent_of_hash_seed():
     assert not _extra_changed(one["device"], two["device"])
 
 
-def test_legacy_set_repr_compares_equal_to_canonical_form():
-    """Rows stored as str(set) by older versions must not be re-versioned on upgrade."""
+def test_migration_turns_legacy_extra_into_exactly_the_new_form():
+    """canonical_legacy (the migration) and _build_extra must agree exactly,
+    across hash seeds, or migrated rows would still read as changed."""
     import json
-    from custom_components.timescaledb_recorder.registry_listener import _extra_changed
+    from custom_components.timescaledb_recorder.canonical import canonical_legacy
 
     one, two = _probe_under_seed(1), _probe_under_seed(2)
-    legacy = json.loads(one["legacy_device"])
-    canonical = {k: v for k, v in json.loads(two["device"]).items() if k in legacy}
-    assert not _extra_changed(legacy, json.dumps(canonical))
-    assert not _extra_changed({"aliases": "set()", "x": "frozenset({'b', 'a'})"},
-                              json.dumps({"aliases": [], "x": ["a", "b"]}))
+    for legacy, new in ((one["legacy_device"], two["device"]),
+                        (two["legacy_device"], one["device"]),
+                        (one["legacy_area"], two["area"])):
+        assert legacy != new
+        assert canonical_legacy(json.loads(legacy)) == json.loads(new)
+    assert canonical_legacy({"aliases": "set()", "x": "frozenset({'b', 'a'})"}) == {
+        "aliases": [], "x": ["a", "b"]}
 
 
-def test_extra_changed_still_detects_real_changes():
+def test_canonical_legacy_leaves_other_strings_alone():
+    from custom_components.timescaledb_recorder.canonical import canonical_legacy
+
+    for value in ("{mdi:x}", "{'a': 1}", "{1, 2", "set", "frozenset(x)", "{}"):
+        assert canonical_legacy(value) == value
+
+
+def test_extra_changed_compares_parsed_objects():
     import json
     from custom_components.timescaledb_recorder.registry_listener import _extra_changed
 
-    assert _extra_changed({"config_entries": "{'a', 'b'}"},
-                          json.dumps({"config_entries": ["a", "c"]}))
+    assert not _extra_changed({"a": [1], "b": "x"}, json.dumps({"b": "x", "a": [1]}))
+    assert not _extra_changed('{"a": 1, "modified_at": "t1"}',
+                              json.dumps({"a": 1, "modified_at": "t2"}))
     assert _extra_changed({"aliases": ["a", "b"]}, json.dumps({"aliases": ["a"]}))
-    # A plain string that is not a set repr stays a string.
     assert _extra_changed({"icon": "{mdi:x}"}, json.dumps({"icon": ["mdi:x"]}))
+    # Legacy forms are migrated before comparison, not tolerated by it.
+    assert _extra_changed({"aliases": "{'a'}"}, json.dumps({"aliases": ["a"]}))
 
 
 # ---------------------------------------------------------------------------

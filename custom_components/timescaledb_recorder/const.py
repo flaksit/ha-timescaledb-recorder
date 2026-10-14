@@ -821,11 +821,16 @@ HAVING count(*) > 1
 # one and inherit next_from, which equals their own valid_from. So the rows this
 # deletes could never label a state row, and their close times survive in both
 # the quarantine and the pre-repair backup.
+#
+# Payloads compare as jsonb, which ignores key order and numeric formatting. Set
+# fields (extra's lists, `labels`) compare element by element, so this relies on
+# canonical rows: repair_scd2 refuses to run before the integration's one-time
+# canonicalization (CANONICAL_SETS_MIGRATION_ID) has.
 _SCD2_REPAIR_IDENTICAL_DUPES_SQL = """
 WITH grouped AS (
     SELECT {key}::text AS id_value, valid_from,
            count(*) AS versions,
-           count(DISTINCT (to_jsonb(t) - 'valid_from' - 'valid_to')::text) AS payloads
+           count(DISTINCT to_jsonb(t) - 'valid_from' - 'valid_to') AS payloads
       FROM {table} t
      GROUP BY 1, 2
 )
@@ -838,25 +843,27 @@ SELECT id_value, valid_from, versions FROM grouped
 # (DISTINCT ON ... ORDER BY valid_to DESC NULLS FIRST -> the open twin), archives
 # the losers with their full payload, and deletes only rows sharing the
 # survivor's id, valid_from and payload (valid_to excluded — see above).
-# "All payloads in this group are equal" is expressed as min = max over the
-# partition, not count(DISTINCT ...) OVER (...): PostgreSQL rejects DISTINCT in a
-# window function ("DISTINCT is not implemented for window functions").
+# "All payloads in this group are equal" is the same grouped count(DISTINCT)
+# as _SCD2_REPAIR_IDENTICAL_DUPES_SQL, joined back: PostgreSQL rejects DISTINCT
+# in a window function and has no min/max over jsonb.
 _SCD2_REPAIR_COLLAPSE_SQL = """
 WITH ranked AS (
-    SELECT t.ctid AS rid, t.{key}::text AS id_value, t.valid_from,
+    SELECT t.ctid AS rid, t.{key} AS key_value, t.{key}::text AS id_value, t.valid_from,
            to_jsonb(t) AS row_data,
-           row_number() OVER w AS rn,
-           count(*) OVER w AS versions,
-           min((to_jsonb(t) - 'valid_from' - 'valid_to')::text) OVER w
-             = max((to_jsonb(t) - 'valid_from' - 'valid_to')::text) OVER w
-             AS payload_uniform
+           row_number() OVER (PARTITION BY t.{key}, t.valid_from
+                              ORDER BY t.valid_to DESC NULLS FIRST, t.ctid) AS rn
       FROM {table} t
-    WINDOW w AS (PARTITION BY t.{key}, t.valid_from
-                 ORDER BY t.valid_to DESC NULLS FIRST, t.ctid
-                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+),
+uniform AS (
+    SELECT {key} AS key_value, valid_from
+      FROM {table} t
+     GROUP BY 1, 2
+    HAVING count(*) > 1
+       AND count(DISTINCT to_jsonb(t) - 'valid_from' - 'valid_to') = 1
 ),
 losers AS (
-    SELECT * FROM ranked WHERE versions > 1 AND payload_uniform AND rn > 1
+    SELECT r.* FROM ranked r JOIN uniform u USING (key_value, valid_from)
+     WHERE r.rn > 1
 ),
 archived AS (
     INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
@@ -1341,17 +1348,19 @@ SCD2_CHECK_SKIPPED = -1
 # alike the two look). Identical payloads mean the gap could be closed without
 # asserting anything new; differing payloads mean the era genuinely cannot be
 # attributed to either version. The answer drives --merge-identical-gaps, so it
-# must ask exactly the question SCD2_MERGE_PLAN_SQL asks.
+# must ask exactly the question SCD2_MERGE_PLAN_SQL asks. extra compares as
+# jsonb and labels element-wise — see _SCD2_REPAIR_IDENTICAL_DUPES_SQL on why
+# both need canonical rows.
 SCD2_SUSPICIOUS_GAPS_SQL = f"""
 WITH ordered AS (
     SELECT entity_id, valid_from, valid_to,
            (ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
             device_class, unit_of_measurement, disabled_by)::text AS payload,
-           (extra - 'modified_at')::text AS extra_cmp,
+           extra - 'modified_at' AS extra_cmp,
            lead(valid_from) OVER w AS gap_end,
            lead((ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
                  device_class, unit_of_measurement, disabled_by)::text) OVER w AS next_payload,
-           lead((extra - 'modified_at')::text) OVER w AS next_extra
+           lead(extra - 'modified_at') OVER w AS next_extra
     FROM entities t
     WINDOW w AS (PARTITION BY entity_id
                  ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid)),
@@ -1438,13 +1447,13 @@ WITH ordered AS (
     SELECT ctid AS rid, entity_id, valid_from, valid_to,
            (ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
             device_class, unit_of_measurement, disabled_by)::text AS payload,
-           (extra - 'modified_at')::text AS extra_cmp,
+           extra - 'modified_at' AS extra_cmp,
            lead(ctid)       OVER w AS next_rid,
            lead(valid_from) OVER w AS next_from,
            lead(valid_to)   OVER w AS next_to,
            lead((ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
                  device_class, unit_of_measurement, disabled_by)::text) OVER w AS next_payload,
-           lead((extra - 'modified_at')::text) OVER w AS next_extra
+           lead(extra - 'modified_at') OVER w AS next_extra
       FROM entities t
     WINDOW w AS (PARTITION BY entity_id
                  ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid)),
@@ -1493,3 +1502,45 @@ SCD2_MERGE_PLAN_COUNT_SQL = "SELECT count(*) FROM pg_temp.scd2_merge_plan;"
 # schema qualification makes the statement incapable of naming anything but this
 # transaction's own temp table.
 SCD2_MERGE_PLAN_DROP_SQL = "DROP TABLE IF EXISTS pg_temp.scd2_merge_plan;"
+
+
+# ---- Schema migrations -------------------------------------------------------
+#
+# One row per one-time data migration that has completed. Created by
+# sync_setup_schema; checking a migration costs one primary-key lookup.
+SCHEMA_MIGRATIONS_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    id         TEXT        PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+SCHEMA_MIGRATION_APPLIED_SQL = "SELECT 1 FROM schema_migrations WHERE id = %s;"
+SCHEMA_MIGRATION_MARK_SQL = (
+    "INSERT INTO schema_migrations (id) VALUES (%s) ON CONFLICT (id) DO NOTHING;"
+)
+
+# Rewrites `extra` set reprs and unsorted `labels` arrays into the canonical
+# form (canonical.py). Touches no other column, so valid_from/valid_to — and
+# with them the exclusion constraints and open-row unique indexes — are unchanged.
+CANONICAL_SETS_MIGRATION_ID = "0001_canonical_dimension_sets"
+
+_DIM_TABLES_WITH_LABELS = frozenset({"entities", "devices"})
+
+# ctid identifies the row to rewrite; safe because the migration holds
+# SCD2_REPAIR_LOCK_SQL (blocks other writers) for the whole transaction.
+CANONICALIZE_SELECT_SQL = {
+    table: (
+        "SELECT ctid::text AS rid, "
+        + ("labels" if table in _DIM_TABLES_WITH_LABELS else "NULL::text[] AS labels")
+        + f", extra FROM {table};"
+    )
+    for table, _key in SCD2_DIMENSIONS
+}
+CANONICALIZE_UPDATE_SQL = {
+    table: (
+        f"UPDATE {table} SET "
+        + ("labels = %(labels)s, " if table in _DIM_TABLES_WITH_LABELS else "")
+        + "extra = %(extra)s WHERE ctid = %(rid)s::tid;"
+    )
+    for table, _key in SCD2_DIMENSIONS
+}

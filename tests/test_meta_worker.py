@@ -810,6 +810,7 @@ def test_meta_worker_waits_for_schema_before_reading_the_queue():
         registry_listener=MagicMock(), stop_event=threading.Event(),
         schema_ready=schema_ready,
     )
+    w._migrate = MagicMock(return_value=True)
     w.start()
     w.join(timeout=0.2)
     assert w.is_alive()
@@ -834,3 +835,112 @@ def test_meta_worker_schema_wait_ends_on_shutdown():
     w.join(timeout=5)
     assert not w.is_alive()
     meta_queue.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# One-time canonicalization of dimension rows
+# ---------------------------------------------------------------------------
+
+_MW = "custom_components.timescaledb_recorder.meta_worker"
+
+
+def test_migration_runs_before_the_first_queue_item():
+    order = []
+    meta_queue = MagicMock()
+    meta_queue.get.side_effect = lambda: order.append("get")
+    w = _make_worker(meta_queue=meta_queue)
+    w._migrate = MagicMock(side_effect=lambda: order.append("migrate") or True)
+
+    w._run_main_loop()
+
+    assert order == ["migrate", "get"]
+
+
+def test_shutdown_during_migration_reads_no_item():
+    meta_queue = MagicMock()
+    w = _make_worker(meta_queue=meta_queue)
+    w._migrate = MagicMock(return_value=None)
+
+    w._run_main_loop()
+
+    meta_queue.get.assert_not_called()
+
+
+def test_applied_migration_costs_one_lookup(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import (
+        CANONICAL_SETS_MIGRATION_ID,
+        SCHEMA_MIGRATION_APPLIED_SQL,
+    )
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = (1,)
+    w = _make_worker()
+    w._conn = conn
+    with patch(f"{_MW}.canonicalize_dimension_rows") as migrate:
+        assert w._migrate_raw() is True
+
+    migrate.assert_not_called()
+    assert cur.execute.call_args_list == [
+        call(SCHEMA_MIGRATION_APPLIED_SQL, (CANONICAL_SETS_MIGRATION_ID,))]
+
+
+def test_pending_migration_runs_untimed_but_tracked(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import (
+        STATEMENT_TIMEOUT_DISABLE_SQL,
+        STATEMENT_TIMEOUT_RESTORE_SQL,
+    )
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.side_effect = [None, ("5min",)]
+    w = _make_worker()
+    w._conn = conn
+    seen = {}
+
+    def fake_migrate(_conn):
+        seen["last_sql"] = cur.execute.call_args_list[-1].args[0]
+        seen["in_flight"] = w.db_calls.oldest()[0]
+        return {}
+
+    with patch(f"{_MW}.canonicalize_dimension_rows", side_effect=fake_migrate):
+        assert w._migrate() is True
+
+    assert seen == {"last_sql": STATEMENT_TIMEOUT_DISABLE_SQL, "in_flight": "migrate"}
+    assert cur.execute.call_args_list[-1] == call(STATEMENT_TIMEOUT_RESTORE_SQL, ("5min",))
+
+
+def test_failing_migration_does_not_block_ingestion(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import POISON_MAX_ATTEMPTS
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = None
+    meta_queue = MagicMock()
+    meta_queue.get.return_value = None
+    w = _make_worker(meta_queue=meta_queue)
+    w._stop_event.wait = MagicMock(return_value=False)
+    with patch(f"{_MW}.psycopg.connect", return_value=conn), patch(
+        f"{_MW}.canonicalize_dimension_rows", side_effect=ValueError("bug"),
+    ) as migrate:
+        w._run_main_loop()
+
+    assert migrate.call_count == POISON_MAX_ATTEMPTS
+    meta_queue.get.assert_called_once()
+
+
+def test_rehydrate_canonicalizes_items_queued_by_older_versions():
+    import json
+
+    w = _make_worker()
+    entity = w._rehydrate_params("entity", [
+        "x.y", "u", "n", "sensor", "zha", None, None, ["b", "a"], None, None, None,
+        "2026-04-21T12:00:00+00:00", json.dumps({"aliases": "{'z', 'y'}"})])
+    assert entity[7] == ["a", "b"]
+    assert json.loads(entity[-1]) == {"aliases": ["y", "z"]}
+
+    device = w._rehydrate_params("device", [
+        "d", "n", None, None, None, ["b", "a"], "2026-04-21T12:00:00+00:00",
+        json.dumps({"identifiers": "{('hue', '2'), ('hue', '1')}"})])
+    assert device[5] == ["a", "b"]
+    assert json.loads(device[-1]) == {"identifiers": [["hue", "1"], ["hue", "2"]]}
+
+    area = w._rehydrate_params("area", ["a", "A", "2026-04-21T12:00:00+00:00", "{}"])
+    assert area[1:] == ("A", datetime(2026, 4, 21, 12, tzinfo=timezone.utc), "{}")

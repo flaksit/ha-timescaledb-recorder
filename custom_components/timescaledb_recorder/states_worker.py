@@ -582,8 +582,12 @@ class TimescaledbStateRecorderThread(threading.Thread):
         backfilling for the period before removal.
         states uses GROUP BY (not DISTINCT) to force index-based grouping
         before the UNION deduplication step — plain UNION causes a full scan.
+
+        Runs without statement_timeout: the scan grows with the hypertable, and
+        a timeout would turn it into a retry loop that never succeeds. A truly
+        hung read still shows up through db_calls in the watchdog.
         """
         conn = self.get_db_connection()
-        with conn.cursor() as cur:
+        with statement_timeout_lifted(conn), conn.cursor() as cur:
             cur.execute(SELECT_ALL_KNOWN_ENTITIES_SQL)
             return {row[0] for row in cur.fetchall()}

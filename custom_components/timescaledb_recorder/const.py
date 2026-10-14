@@ -82,10 +82,10 @@ DB_CONNECT_DEFAULTS: dict[str, int] = {
 # Session statement_timeout for worker reads and writes, so a lock wait becomes
 # QueryCanceled, which the retry decorator treats as transient (logged, stall
 # issue after STALL_THRESHOLD). Applied only when the session has none (DSN
-# options, role or database setting win). Generous: the slowest normal statement
-# is the backfill entity scan, whose full-scan worst case is noted at ~27 s at
-# SELECT_ALL_KNOWN_ENTITIES_SQL.
-# Lifted for schema setup, whose DDL and index builds can legitimately run long.
+# options, role or database setting win). Generous: normal statements are
+# single-chunk writes and point reads.
+# Lifted for schema setup, whose DDL and index builds can legitimately run long,
+# and for SELECT_ALL_KNOWN_ENTITIES_SQL, which grows with the hypertable.
 DB_STATEMENT_TIMEOUT_MS: int = 300_000
 # A worker DB call in flight this long is reported as ingestion_stalled by the
 # watchdog. Comfortably above DB_STATEMENT_TIMEOUT_MS plus the TCP timeouts

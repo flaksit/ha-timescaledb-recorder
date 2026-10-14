@@ -803,6 +803,26 @@ def test_setup_schema_runs_without_statement_timeout(mock_psycopg_conn):
     assert cur.execute.call_args_list[-1] == call(STATEMENT_TIMEOUT_RESTORE_SQL, ("5min",))
 
 
+def test_known_entities_scan_runs_without_statement_timeout(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import (
+        SELECT_ALL_KNOWN_ENTITIES_SQL,
+        STATEMENT_TIMEOUT_DISABLE_SQL,
+        STATEMENT_TIMEOUT_RESTORE_SQL,
+    )
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = ("5min",)
+    cur.fetchall.return_value = [("a.b",)]
+    t = _make_thread()
+    t._conn = conn
+
+    assert t.read_all_known_entities() == {"a.b"}
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    scan = sqls.index(SELECT_ALL_KNOWN_ENTITIES_SQL)
+    assert STATEMENT_TIMEOUT_DISABLE_SQL in sqls[:scan]
+    assert cur.execute.call_args_list[-1] == call(STATEMENT_TIMEOUT_RESTORE_SQL, ("5min",))
+
+
 def test_insert_keeps_statement_timeout(mock_psycopg_conn):
     from custom_components.timescaledb_recorder.const import STATEMENT_TIMEOUT_DISABLE_SQL
 

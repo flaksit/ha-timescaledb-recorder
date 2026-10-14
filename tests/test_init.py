@@ -9,7 +9,6 @@ These tests verify that:
 6. Phase 3: watchdog task spawned, orchestrator done_callback wired
 7. Phase 3: recorder_disabled check + auto-clear background task
 8. Phase 3: unload cancels and awaits watchdog before orchestrator (MEDIUM-12)
-9. Initial registry snapshot enumerates devices without deprecated mapping access
 """
 import asyncio
 import dataclasses
@@ -19,7 +18,6 @@ import pytest
 
 from custom_components.timescaledb_recorder import (
     TimescaledbRecorderData,
-    _iter_device_entries,
     async_setup_entry,
     async_unload_entry,
 )
@@ -1298,34 +1296,3 @@ async def test_unload_preserves_phase2_behaviour():
     data.meta_queue.wake_consumer.assert_called_once()
     hass.async_add_executor_job.assert_any_call(data.states_worker.join, 30)
     hass.async_add_executor_job.assert_any_call(data.meta_worker.join, 30)
-
-
-# ---------------------------------------------------------------------------
-# Issue #24: device registry enumeration without deprecated mapping access
-# ---------------------------------------------------------------------------
-
-def test_iter_device_entries_iterates_without_mapping_access():
-    """HA >= 2026.9: iterating .devices yields entries; .values() is never called."""
-    entries = [MagicMock(id="d1"), MagicMock(id="d2")]
-    reg = MagicMock()
-    reg.devices.__iter__.return_value = iter(entries)
-
-    assert list(_iter_device_entries(reg)) == entries
-    reg.devices.values.assert_not_called()
-    reg.async_get.assert_not_called()
-
-
-def test_iter_device_entries_resolves_ids_on_older_ha():
-    """Older HA: iterating .devices yields device ids, resolved via async_get."""
-    from homeassistant.helpers import device_registry as dr
-
-    # Real container of the installed (pre-2026.9) HA: iteration yields ids.
-    devices = dr.ActiveDeviceRegistryItems()
-    entries = [dr.DeviceEntry(), dr.DeviceEntry()]
-    for e in entries:
-        devices[e.id] = e
-    reg = MagicMock()
-    reg.devices = devices
-    reg.async_get = MagicMock(side_effect=devices.get)
-
-    assert list(_iter_device_entries(reg)) == entries

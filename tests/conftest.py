@@ -112,9 +112,18 @@ def mock_entity_registry():
 
 @pytest.fixture
 def mock_device_registry():
-    """Return a mock HA device registry with two example DeviceEntry objects."""
-    entries = [
-        _make_registry_entry(
+    """Device registry stand-in holding real HA containers and entries.
+
+    `devices` is HA's real iteration view (mapping access on it reports a
+    deprecation) and `child_devices` a real child container's values, so
+    snapshot tests exercise the actual registry shapes.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    active = dr.ActiveDeviceRegistryItems()
+    for entry in (
+        dr.DeviceEntry(
+            config_entry_id="entry-zha",
             id="device-001",
             name="Living Room Sensor",
             manufacturer="IKEA",
@@ -122,7 +131,8 @@ def mock_device_registry():
             area_id="area-living-room",
             labels={"zigbee"},
         ),
-        _make_registry_entry(
+        dr.DeviceEntry(
+            config_entry_id="entry-zha",
             id="device-002",
             name="Smart Plug Kettle",
             manufacturer="IKEA",
@@ -130,11 +140,20 @@ def mock_device_registry():
             area_id="area-kitchen",
             labels=set(),
         ),
-    ]
+    ):
+        active[entry.id] = entry
+    children = dr.ChildDeviceRegistryItems()
+    child = dr.ChildDeviceEntry(
+        config_entry_id="entry-zha",
+        id="device-003",
+        name="Kettle Plug USB Port",
+        parent_device_id="device-002",
+    )
+    children[child.id] = child
 
     reg = MagicMock()
-    # Iterating .devices yields entries (HA >= 2026.9); mapping access is deprecated.
-    reg.devices = entries
+    reg.devices = dr._DeprecatedDeviceRegistryItemsView(active)
+    reg.child_devices = children.values()
     return reg
 
 

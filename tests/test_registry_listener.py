@@ -87,9 +87,22 @@ def test_snapshot_items_cover_every_registry_in_dependency_order(snapshot_listen
         ("area", "area-living-room"), ("area", "area-kitchen"),
         ("label", "indoor"), ("label", "climate"),
         ("entity", "sensor.living_room_temp"), ("entity", "switch.plug_kettle_power"),
-        ("device", "device-001"), ("device", "device-002"),
+        ("device", "device-001"), ("device", "device-002"), ("device", "device-003"),
     ]
     assert snapshot_listener._buffer_ready.is_set()
+
+
+def test_snapshot_reads_devices_without_deprecated_access(snapshot_listener):
+    """Iterating `devices` is HA's supported API; mapping access and reading
+    manufacturer/model off a ChildDeviceEntry both report deprecations."""
+    from homeassistant.helpers import device_registry as dr
+
+    with patch.object(dr, "report_usage") as report:
+        snapshot_listener.enqueue_snapshot()
+
+    report.assert_not_called()
+    child = next(i for i in snapshot_listener._buffer if i["registry_id"] == "device-003")
+    assert child["params"][1:4] == ["Kettle Plug USB Port", None, None]
 
 
 def test_snapshot_ends_with_one_sweep_per_registry(snapshot_listener):
@@ -105,7 +118,7 @@ def test_snapshot_ends_with_one_sweep_per_registry(snapshot_listener):
         ("sweep", "area", ["area-kitchen", "area-living-room"]),
         ("sweep", "label", ["climate", "indoor"]),
         ("sweep", "entity", ["sensor.living_room_temp", "switch.plug_kettle_power"]),
-        ("sweep", "device", ["device-001", "device-002"]),
+        ("sweep", "device", ["device-001", "device-002", "device-003"]),
     ]
     assert {i["enqueued_at"] for i in sweeps} == {buffer[0]["enqueued_at"]}
     assert json.loads(json.dumps(sweeps)) == sweeps
@@ -153,7 +166,7 @@ def test_extra_carries_created_at_the_worker_can_read():
     rl = RegistryListener(hass=MagicMock())
     now = datetime.now(timezone.utc)
 
-    device = dr.DeviceEntry(created_at=created)
+    device = dr.DeviceEntry(config_entry_id="e", created_at=created)
     assert _created_at(rl._extract_device_params(device, now)[-1]) == created
 
     # Dataclass path of _build_extra (areas and labels).
@@ -177,8 +190,7 @@ from custom_components.timescaledb_recorder import registry_listener as rl
 
 ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
 device = dr.DeviceEntry(
-    id="d", created_at=ts, modified_at=ts,
-    config_entries={"e1", "e2", "e3", "e4", "e5"},
+    id="d", created_at=ts, modified_at=ts, config_entry_id="e1",
     connections={("mac", "1"), ("zigbee", "2"), ("bt", "3")},
     identifiers={("hue", "1"), ("hue", "2"), ("hue", "3")},
 )
@@ -188,7 +200,7 @@ area = ar.AreaEntry(name="A", aliases={"x", "y", "z", "w"}, floor_id=None,
 print(json.dumps({
     "device": rl._build_extra(device, rl._DEVICE_TYPED_KEYS),
     "area": rl._build_extra(area, rl._AREA_TYPED_KEYS),
-    "legacy_device": json.dumps({"config_entries": str(device.config_entries),
+    "legacy_device": json.dumps({"identifiers": str(device.identifiers),
                                  "connections": str(device.connections)}),
 }))
 """

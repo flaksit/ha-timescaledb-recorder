@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from collections.abc import Iterator
+from itertools import chain
 from typing import Callable
 
 import attrs
@@ -161,21 +161,6 @@ def _to_json_safe(params: tuple | list | None) -> list | None:
     ]
 
 
-def _iter_device_entries(device_reg: dr.DeviceRegistry) -> Iterator[dr.DeviceEntry]:
-    """Yield every active device entry without mapping-style access to `.devices`.
-
-    HA >= 2026.9 deprecates `.devices.values()` and other mapping access (breaks in
-    2027.9); iterating `.devices` yields entries there. Older HA iterates a
-    UserDict, which yields device ids, so those are resolved via `async_get`.
-    """
-    for item in device_reg.devices:
-        if isinstance(item, str):
-            if (entry := device_reg.async_get(item)) is not None:
-                yield entry
-        else:
-            yield item
-
-
 class RegistryListener:
     """Thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker.
 
@@ -265,8 +250,10 @@ class RegistryListener:
              lambda e: e.label_id),
             ("entity", self._entity_reg.entities.values(), self._extract_entity_params,
              lambda e: e.entity_id),
-            ("device", _iter_device_entries(self._device_reg), self._extract_device_params,
-             lambda e: e.id),
+            # Child devices are a separate collection, but share device ids and
+            # events with main devices; leaving them out would sweep them closed.
+            ("device", chain(self._device_reg.devices, self._device_reg.child_devices),
+             self._extract_device_params, lambda e: e.id),
         )
         items: list[dict] = []
         sweeps: list[dict] = []
@@ -475,14 +462,18 @@ class RegistryListener:
 
         $1=device_id, $2=name, $3=manufacturer, $4=model,
         $5=area_id, $6=labels, $7=valid_from, $8=extra
+
+        A ChildDeviceEntry has no manufacturer/model; reading them anyway goes
+        through HA's deprecation shim, which logs a warning per access.
         """
         labels = sorted(entry.labels)
         extra = _build_extra(entry, _DEVICE_TYPED_KEYS)
+        is_child = isinstance(entry, dr.ChildDeviceEntry)
         return (
             entry.id,
             entry.name,
-            entry.manufacturer,
-            entry.model,
+            None if is_child else entry.manufacturer,
+            None if is_child else entry.model,
             entry.area_id,
             labels,
             valid_from,

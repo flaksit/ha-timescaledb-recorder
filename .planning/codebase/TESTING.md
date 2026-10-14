@@ -16,7 +16,7 @@ focus: quality
 
 **Key plugins:**
 - `pytest-asyncio >= 0.24` — async test support
-- `pytest-homeassistant-custom-component >= 0.13.320` — HA test helpers and fixtures
+- `pytest-homeassistant-custom-component == 0.13.372` — HA test helpers and fixtures
 
 **Assertion library:**
 - Python built-in `assert` — no third-party assertion library

@@ -57,7 +57,7 @@ Next milestone requirements (to be defined in `/gsd-new-milestone`):
 **Current state (v1.1, 2026-04-23):**
 - Source: 3,669 LOC Python (custom_components/timescaledb_recorder/)
 - Tests: 5,565 LOC Python, 194 passing tests
-- Tech stack: Python 3.14+, psycopg[binary]==3.3.3, HA 2026.3.4, TimescaleDB ≥ 2.18.1
+- Tech stack: Python 3.14+, psycopg[binary]==3.3.3, HA 2026.10.1, TimescaleDB ≥ 2.18.1
 
 **Architecture (post-v1.1):**
 - `states_worker.py`: `TimescaledbStateRecorderThread` — dequeues from `OverflowQueue`, flushes to TimescaleDB via psycopg3, retries on transient errors, triggers backfill on recovery

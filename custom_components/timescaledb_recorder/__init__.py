@@ -65,7 +65,7 @@ from .notifications import notify_watchdog_recovery
 from .overflow_queue import OverflowQueue
 from .persistent_queue import PersistentQueue
 from .states_worker import StatesWriteStats, TimescaledbStateRecorderThread
-from .registry_listener import RegistryListener, _iter_device_entries  # noqa: F401  re-exported for tests
+from .registry_listener import RegistryListener
 from .watchdog import spawn_meta_worker, spawn_states_worker, watchdog_loop
 
 _LOGGER = logging.getLogger(__name__)

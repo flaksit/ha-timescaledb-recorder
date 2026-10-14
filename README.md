@@ -13,7 +13,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 
 ## Prerequisites
 
-- Home Assistant 2024.1 or later
+- Home Assistant 2026.10.1 or later
 - The built-in HA recorder integration must be enabled — the integration uses the recorder's Python API for automatic gap detection and backfill (any recorder backend works).
 - The standalone [`backfill_gaps.py`](#backfilling-historical-gaps) (optional use) script requires the default SQLite backend.
 - A running PostgreSQL + TimescaleDB instance > 2.18 (the [TimescaleDB HA app](https://github.com/flaksic/hass-timescaledb) is the intended companion)
@@ -245,6 +245,8 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 | `extra` | JSONB | Full registry entry serialisation |
 
 #### devices
+
+Child devices (HA 2026.10+) are stored here too; their `manufacturer` and `model` are NULL and `extra` carries `parent_device_id`.
 
 | Column | Type | Description |
 |--------|------|-------------|

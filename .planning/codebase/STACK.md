@@ -26,7 +26,7 @@ focus: tech
 ## Frameworks
 
 **Core:**
-- `homeassistant` 2026.3.4 — HA core library; provides `ConfigEntry`, `HomeAssistant`, event bus, entity/device/area/label registries, `EntityFilter`, `async_track_time_interval`
+- `homeassistant` 2026.10.1 (minimum, pinned via `hacs.json`) — HA core library; provides `ConfigEntry`, `HomeAssistant`, event bus, entity/device/area/label registries, `EntityFilter`, `async_track_time_interval`
 - `asyncpg` 0.31.0 — async PostgreSQL driver; used for all DB operations (pool, connection, `executemany`, `execute`, `fetchrow`)
 
 **Schema Validation:**
@@ -38,7 +38,7 @@ focus: tech
 **Testing:**
 - `pytest` 9.0.0
 - `pytest-asyncio` 1.3.0 — async test support
-- `pytest-homeassistant-custom-component` 0.13.320 — HA test harness (pulls in `homeassistant`, `freezegun`, `coverage`)
+- `pytest-homeassistant-custom-component` 0.13.372 (pins `homeassistant==2026.10.1`) — HA test harness (pulls in `homeassistant`, `freezegun`, `coverage`)
 
 ## Key Dependencies
 

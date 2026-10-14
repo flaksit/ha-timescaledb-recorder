@@ -414,8 +414,11 @@ async def async_setup_entry(
     compress_after_hours = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_HOURS)
     entity_filter = _get_entity_filter(hass, entry)
 
-    # D-12 step 1: open PersistentQueue
-    meta_queue = PersistentQueue(hass.config.path(DOMAIN, "metadata_queue.jsonl"))
+    # D-12 step 1: open PersistentQueue. Its constructor does blocking file I/O
+    # (mkdir + full-file line count), so it must not run on the event loop.
+    meta_queue = await hass.async_add_executor_job(
+        PersistentQueue, hass.config.path(DOMAIN, "metadata_queue.jsonl"),
+    )
 
     # Shared signals
     stop_event = threading.Event()

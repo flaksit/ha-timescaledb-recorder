@@ -48,7 +48,8 @@ def hass():
     h.bus = MagicMock()
     h.bus.async_listen = MagicMock(return_value=MagicMock())
     h.bus.async_listen_once = MagicMock()
-    h.async_add_executor_job = AsyncMock(return_value=None)
+    # Run the job inline so executor-built objects (PersistentQueue) are real mocks.
+    h.async_add_executor_job = AsyncMock(side_effect=lambda func, *args: func(*args))
     h.async_create_task = MagicMock()
     h.async_create_background_task = MagicMock()
     h.config = MagicMock()
@@ -179,6 +180,12 @@ async def test_setup_entry_returns_true(hass, mock_entry):
     assert result is True
     assert mock_entry.runtime_data is not None
     assert isinstance(mock_entry.runtime_data, TimescaledbRecorderData)
+
+    # PersistentQueue does blocking file I/O in __init__ — built in the executor (#23).
+    hass.async_add_executor_job.assert_any_await(
+        MockPQ, "/tmp/ha_tsdb_test/metadata_queue.jsonl",
+    )
+    assert mock_entry.runtime_data.meta_queue is MockPQ.return_value
 
 
 async def test_setup_entry_runtime_data_has_all_fields(hass, mock_entry):

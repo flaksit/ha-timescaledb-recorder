@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS states (
 
 ### When a state row cannot be written
 
-Connection loss, timeouts, deadlocks and other transient database errors are retried until they succeed. Any other error means the data itself is rejected (for example a NUL character in an attribute). After 3 failed attempts the batch is retried row by row, and each row that still fails goes to the **`states_deadletter`** table (entity, timestamp, error, full row as JSON text) and raises a `states_dropped` repair issue, so ingestion carries on. The issue does not clear itself:
+Connection loss, timeouts, deadlocks, server-internal errors (SQLSTATE class XX) and other transient database errors are retried until they succeed. Any other error is taken to mean the data itself is rejected (for example a NUL character in an attribute). Once the batch has failed at least 3 times over at least 60 seconds it is retried row by row. If rows of 5 different entities all fail, the database rather than the rows is blamed: nothing is dropped, the batch goes back to retrying (raising the stalled repair issue) and the row-by-row pass is tried again later. Otherwise each row that still fails, again after 3 attempts over 60 seconds, goes to the **`states_deadletter`** table (entity, timestamp, error, full row as JSON text) and raises a `states_dropped` repair issue, so ingestion carries on. The issue does not clear itself:
 
 ```sql
 SELECT detected_at, entity_id, last_updated, error FROM states_deadletter ORDER BY detected_at DESC;
@@ -300,7 +300,7 @@ The dimension tables are created idempotently on every integration startup (same
 
 ### When a change cannot be written
 
-A registry change is dropped instead of retried when the exclusion constraint rejects it, when a newer version of the same id is already stored, or when it fails 3 times with a non-transient error (anything other than connection loss, timeouts, deadlocks and similar, which are retried until they succeed). The item goes to the **`metadata_deadletter`** table (reason, registry, id, full item as JSONB) and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
+A registry change is dropped instead of retried when the exclusion constraint rejects it, when a newer version of the same id is already stored, or when it fails at least 3 times over at least 60 seconds with a non-transient error (anything other than connection loss, timeouts, deadlocks, server-internal errors and similar, which are retried until they succeed). There is no circuit breaker here as for state rows: the startup snapshot re-reads every registry, so after a restart the current version of every existing entry is written again; only intermediate versions and removals are lost. The item goes to the **`metadata_deadletter`** table (reason, registry, id, full item as JSONB) and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
 
 ```sql
 SELECT detected_at, reason, registry_id, error FROM metadata_deadletter ORDER BY detected_at DESC;

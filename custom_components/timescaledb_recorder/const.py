@@ -45,10 +45,19 @@ BACKFILL_QUEUE_MAXSIZE: int = 2   # D-01-b: backpressure cap for backfill_queue
 STALL_THRESHOLD: int = 5
 # POISON_MAX_ATTEMPTS — consecutive non-transient failures after which a
 #   retry_until_success wrapper with an on_poison hook gives up on its input
-#   (issue #20). Retries still back off, so a misclassified transient error gets
-#   a few seconds to clear. Must stay below STALL_THRESHOLD: a poison item is not
-#   a stall and should not raise the stalled repair issue on its way out.
+#   (issue #20), once they also span POISON_MIN_SECONDS. The time floor gives an
+#   environmental error the classifier does not know (e.g. a TimescaleDB TSxxx
+#   code) a minute to clear before data is dropped. The stall hook is held back
+#   while such a streak is pending, so a poison item does not raise the stalled
+#   repair issue on its way out.
 POISON_MAX_ATTEMPTS: int = 3
+POISON_MIN_SECONDS: float = 60.0
+# POISON_PROBE_ROWS — states per-row fallback circuit breaker. If this many rows
+#   of distinct entities in a poison chunk all fail non-transiently, the fault is
+#   taken to be the database, not the rows: nothing is dropped and the whole
+#   chunk is retried (stall hooks fire), with the per-row path tried again after
+#   the next poison window.
+POISON_PROBE_ROWS: int = 5
 WATCHDOG_INTERVAL_S: float = 10.0
 DB_UNREACHABLE_THRESHOLD_SECONDS: float = 300.0
 

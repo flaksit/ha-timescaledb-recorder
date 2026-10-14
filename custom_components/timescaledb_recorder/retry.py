@@ -3,10 +3,12 @@
 Catches every Exception. Transient errors (see is_transient) are retried
 forever (D-07-d: recovery from a long outage is waiting it out). Any other
 error means the input itself is bad: a wrapper given an on_poison hook gives up
-on it after POISON_MAX_ATTEMPTS consecutive such failures and hands it to the
-hook, so one poison item cannot wedge a queue (issue #20). Without the hook
-every error is retried forever — right for calls with no item to drop (schema
-setup, reads). Shutdown-aware via stop_event (D-07-e, D-13-c).
+on it after POISON_MAX_ATTEMPTS consecutive such failures spanning at least
+POISON_MIN_SECONDS, and hands it to the hook, so one poison item cannot wedge a
+queue (issue #20). The hook can veto by raising NotPoison when the failure looks
+environmental. Without the hook every error is retried forever — right for calls
+with no item to drop (schema setup, reads). Shutdown-aware via stop_event
+(D-07-e, D-13-c).
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ from typing import Any, Callable
 
 import psycopg
 
+from . import const
 from .const import POISON_MAX_ATTEMPTS, STALL_THRESHOLD
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,10 +32,21 @@ _BACKOFF_SCHEDULE: tuple[int, ...] = (1, 5, 10, 30, 60)
 # not "this input is bad". psycopg maps them outside OperationalError, but
 # dropping data because of a failover or a revoked grant would turn a fixable
 # outage into permanent loss.
+# InternalError (class XX) is the server failing, not the input: TimescaleDB
+# raises XX000 for races such as "tuple concurrently updated".
 _TRANSIENT_DB_ERRORS: tuple[type[Exception], ...] = (
     psycopg.errors.ReadOnlySqlTransaction,
     psycopg.errors.InsufficientPrivilege,
+    psycopg.InternalError,
 )
+
+
+class NotPoison(Exception):
+    """Raised by an on_poison hook to refuse dropping: keep retrying the input.
+
+    The streak continues as an ordinary failure (stall and sustained-fail hooks
+    fire) and the hook is asked again after a fresh poison window.
+    """
 
 
 def is_transient(exc: BaseException) -> bool:
@@ -43,7 +57,10 @@ def is_transient(exc: BaseException) -> bool:
     serialization failure); InterfaceError and OSError cover client-side
     connection trouble. ProgramLimitExceeded is an OperationalError in psycopg
     but SQLSTATE class 54 is about the statement (e.g. an index row too large),
-    so the same input fails forever.
+    so the same input fails forever. Errors that are neither (including
+    TimescaleDB's own TSxxx codes, which psycopg maps to plain DatabaseError)
+    count as poison, which the retry wrapper only acts on after
+    POISON_MIN_SECONDS.
     """
     if isinstance(exc, psycopg.errors.ProgramLimitExceeded):
         return False
@@ -65,6 +82,7 @@ def retry_until_success(
     backoff_schedule: tuple[int, ...] = _BACKOFF_SCHEDULE,
     stall_threshold: int = STALL_THRESHOLD,
     poison_max_attempts: int = POISON_MAX_ATTEMPTS,
+    poison_min_seconds: float | None = None,
 ) -> Callable:
     """Retry decorator for thread-worker DB calls.
 
@@ -99,11 +117,14 @@ def retry_until_success(
             Exceptions raised by the hook are logged and swallowed.
         on_poison: optional ``on_poison(exc, *args, **kwargs)`` called with the
             last exception and the wrapped call's arguments once
-            poison_max_attempts consecutive non-transient failures accumulate.
-            Its return value becomes the wrapper's. A transient failure resets
-            the count. None (the default) retries every error forever.
-            Unlike the other hooks, exceptions it raises propagate: it is the
-            result path, not a notification.
+            poison_max_attempts consecutive non-transient failures accumulate
+            over at least poison_min_seconds. Its return value becomes the
+            wrapper's. A transient failure resets the count and the clock.
+            None (the default) retries every error forever. Unlike the other
+            hooks, exceptions it raises propagate: it is the result path, not a
+            notification — except NotPoison, which resumes retrying.
+            While a non-transient streak may still end in on_poison,
+            notify_stall is held back: a poison input is not a stall.
         sustained_fail_seconds: threshold in seconds for on_sustained_fail
             (default 300.0 = DB_UNREACHABLE_THRESHOLD_SECONDS).
         backoff_schedule: override of the default (1, 5, 10, 30, 60) schedule.
@@ -111,6 +132,8 @@ def retry_until_success(
         stall_threshold: override of the default STALL_THRESHOLD (5) attempt
             notify threshold.
         poison_max_attempts: override of POISON_MAX_ATTEMPTS.
+        poison_min_seconds: override of const.POISON_MIN_SECONDS, read at call
+            time when None.
 
     All hooks except on_poison are best-effort: exceptions inside them are
     logged and swallowed.
@@ -132,13 +155,23 @@ def retry_until_success(
             first_fail_ts: float | None = None   # monotonic timestamp of first failure in current streak
             sustained_notified = False  # guards on_sustained_fail from firing twice in same streak
             poison_attempts = 0       # consecutive non-transient failures
+            first_poison_ts: float | None = None  # monotonic start of that run
+            vetoed = False            # on_poison raised NotPoison in this streak
+            min_seconds = (const.POISON_MIN_SECONDS if poison_min_seconds is None
+                           else poison_min_seconds)
             while True:
                 try:
                     result = fn(*args, **kwargs)
                 except Exception as exc:  # noqa: BLE001 — classified below
                     attempts += 1
-                    poison_attempts = 0 if is_transient(exc) else poison_attempts + 1
                     now_mono = time.monotonic()
+                    if is_transient(exc):
+                        poison_attempts = 0
+                        first_poison_ts = None
+                    else:
+                        poison_attempts += 1
+                        if first_poison_ts is None:
+                            first_poison_ts = now_mono
                     if first_fail_ts is None:
                         first_fail_ts = now_mono
                     # D-07-g: drop stale connection so caller reconnects lazily.
@@ -150,20 +183,38 @@ def retry_until_success(
                                 "on_transient hook raised in retry_until_success; "
                                 "continuing",
                             )
-                    if on_poison is not None and poison_attempts >= poison_max_attempts:
+                    if (
+                        on_poison is not None
+                        and poison_attempts >= poison_max_attempts
+                        and first_poison_ts is not None
+                        and now_mono - first_poison_ts >= min_seconds
+                    ):
                         _LOGGER.error(
                             "%s failed %d times with a non-transient error; giving up "
                             "on this input: %r",
                             fn.__qualname__, poison_attempts, exc,
                         )
-                        if stalled and on_recovery is not None:
-                            try:
-                                on_recovery()
-                            except Exception:  # noqa: BLE001
-                                _LOGGER.exception("on_recovery hook raised; continuing")
-                        return on_poison(exc, *args, **kwargs)
+                        try:
+                            poison_result = on_poison(exc, *args, **kwargs)
+                        except NotPoison as veto:
+                            _LOGGER.warning(
+                                "%s: not dropping the input (%s); retrying it",
+                                fn.__qualname__, veto,
+                            )
+                            vetoed = True
+                            poison_attempts = 0
+                            first_poison_ts = None
+                        else:
+                            if stalled and on_recovery is not None:
+                                try:
+                                    on_recovery()
+                                except Exception:  # noqa: BLE001
+                                    _LOGGER.exception("on_recovery hook raised; continuing")
+                            return poison_result
+                    # Held back while this failure may still end in on_poison.
+                    poison_pending = on_poison is not None and poison_attempts > 0 and not vetoed
                     # D-07-f: stall notification on first crossing of threshold.
-                    if not notified and attempts >= stall_threshold:
+                    if not notified and not poison_pending and attempts >= stall_threshold:
                         if notify_stall is not None:
                             try:
                                 notify_stall(attempts)

@@ -3,6 +3,17 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_poison_time_floor(monkeypatch):
+    """Tests skip backoff sleeps, so the 60 s poison floor would never elapse.
+
+    Tests of the floor itself pass poison_min_seconds or patch the clock.
+    """
+    from custom_components.timescaledb_recorder import const
+
+    monkeypatch.setattr(const, "POISON_MIN_SECONDS", 0.0)
+
+
 @pytest.fixture
 def mock_conn():
     """Return a mock asyncpg connection (retained for legacy test_schema.py compat)."""

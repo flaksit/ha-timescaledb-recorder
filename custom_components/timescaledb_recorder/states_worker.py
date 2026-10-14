@@ -38,6 +38,7 @@ from .const import (
     INSERT_CHUNK_SIZE,
     INSERT_LIVE_SQL,
     INSERT_SQL,
+    POISON_PROBE_ROWS,
     SELECT_ALL_KNOWN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
     STATES_DEADLETTER_INSERT_SQL,
@@ -49,7 +50,7 @@ from .issues import (
     create_states_dropped_issue,
     create_states_worker_stalled_issue,
 )
-from .retry import retry_until_success
+from .retry import NotPoison, is_transient, retry_until_success
 from .schema import sync_setup_schema
 from .worker import StateRow
 
@@ -454,15 +455,52 @@ class TimescaledbStateRecorderThread(threading.Thread):
 
         executemany fails the whole chunk for one bad row, so this isolates the
         bad rows instead of dropping their neighbours.
+
+        Circuit breaker: rows of POISON_PROBE_ROWS distinct entities are tried
+        once each first. If none lands, the database is the likelier fault (a
+        missing table, an unknown TimescaleDB error), so nothing is dropped:
+        NotPoison sends the whole chunk back to retrying. A chunk with fewer
+        distinct entities skips the probe, since one bad entity could fill it.
         """
         _LOGGER.warning(
             "%s: chunk of %d rows failed non-transiently (%r); inserting row by row",
             self.name, len(chunk), exc,
         )
+        landed = self._probe_rows(chunk)
         for row in chunk:
             if self._stop_event.is_set():
                 return
-            self._insert_row(row)
+            if row is not landed:
+                self._insert_row(row)
+
+    def _probe_rows(self, chunk: list[StateRow]) -> StateRow | None:
+        """Try one row per entity until one lands; return it (None: no probe).
+
+        Raises NotPoison if every probe fails, or on a transient failure.
+        """
+        probe: dict[str, StateRow] = {}
+        for row in chunk:
+            probe.setdefault(row.entity_id, row)
+            if len(probe) == POISON_PROBE_ROWS:
+                break
+        else:
+            return None
+        for row in probe.values():
+            if self._stop_event.is_set():
+                return None
+            try:
+                with self.db_calls.call("insert_row_probe"):
+                    self._insert_row_raw(row)
+            except Exception as probe_exc:  # noqa: BLE001 — classified below
+                self.reset_db_connection()
+                if is_transient(probe_exc):
+                    raise NotPoison(f"transient error while probing rows: {probe_exc!r}") from probe_exc
+                continue
+            return row
+        raise NotPoison(
+            f"rows of {POISON_PROBE_ROWS} different entities all failed; "
+            "treating it as a database fault, not bad rows"
+        )
 
     def _drop_row(self, exc: Exception, row: StateRow) -> None:
         """on_poison hook for a row: count, log, dead-letter and surface it."""

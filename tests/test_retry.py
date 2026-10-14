@@ -8,6 +8,7 @@ import pytest
 from custom_components.timescaledb_recorder import const
 from custom_components.timescaledb_recorder.retry import (
     _BACKOFF_SCHEDULE,
+    NotPoison,
     is_transient,
     retry_until_success,
 )
@@ -530,6 +531,8 @@ def test_on_sustained_fail_uses_monotonic_not_wall_clock():
     psycopg.InterfaceError("closed"),
     psycopg.errors.ReadOnlySqlTransaction("standby"),
     psycopg.errors.InsufficientPrivilege("revoked"),
+    psycopg.InternalError("tuple concurrently updated"),
+    psycopg.errors.DataCorrupted("corrupt"),
     ConnectionResetError("reset"),
     OSError("io"),
 ])
@@ -544,6 +547,7 @@ def test_is_transient_true(exc):
     psycopg.DataError("bad"),
     psycopg.errors.ProgramLimitExceeded("index row too big"),
     psycopg.ProgrammingError("syntax"),
+    psycopg.DatabaseError("TS001 unknown timescaledb error"),
     ValueError("bad value"),
     TypeError("bad type"),
 ])
@@ -670,5 +674,85 @@ def test_on_poison_exception_propagates():
         fn()
 
 
-def test_poison_max_below_stall_threshold():
-    assert const.POISON_MAX_ATTEMPTS < const.STALL_THRESHOLD
+def _clock(step: float):
+    """Patch retry's monotonic clock to advance `step` seconds per read."""
+    ticks = iter(range(10_000))
+    return patch("custom_components.timescaledb_recorder.retry.time.monotonic",
+                 side_effect=lambda: next(ticks) * step)
+
+
+def test_poison_waits_for_the_time_floor():
+    """Attempts alone are not enough: the streak must also span poison_min_seconds."""
+    on_poison = MagicMock(return_value="dropped")
+    calls = [0]
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         on_poison=on_poison, poison_min_seconds=60)
+    def fn():
+        calls[0] += 1
+        raise ValueError("bad")
+
+    with _clock(10):
+        assert fn() == "dropped"
+    # Failure n is read at t = 10 * (n - 1); the floor is crossed at t = 60.
+    assert calls[0] == 7
+    on_poison.assert_called_once()
+
+
+def test_poison_floor_restarts_after_a_transient_error():
+    on_poison = MagicMock(return_value="dropped")
+    errors = [ValueError("a")] * 5 + [psycopg.OperationalError("down")]
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         on_poison=on_poison, poison_min_seconds=60)
+    def fn():
+        raise errors.pop(0) if errors else ValueError("b")
+
+    with _clock(10):
+        fn()
+    # Six failures before the transient one, then seven more for a fresh window.
+    assert not errors
+    on_poison.assert_called_once()
+
+
+def test_pending_poison_does_not_stall_past_the_threshold():
+    notify_stall = MagicMock()
+    on_recovery = MagicMock()
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         notify_stall=notify_stall, on_recovery=on_recovery,
+                         on_poison=lambda exc: None, poison_min_seconds=60)
+    def fn():
+        raise ValueError("bad")
+
+    with _clock(10):
+        fn()
+    notify_stall.assert_not_called()
+    on_recovery.assert_not_called()
+
+
+def test_not_poison_veto_keeps_retrying_and_stalls():
+    """A hook that blames the environment keeps the input and lets the stall alarm fire."""
+    notify_stall = MagicMock()
+    on_recovery = MagicMock()
+    verdicts = [NotPoison("database fault"), "dropped"]
+    calls = [0]
+
+    def on_poison(exc):
+        verdict = verdicts.pop(0)
+        if isinstance(verdict, Exception):
+            raise verdict
+        return verdict
+
+    @retry_until_success(stop_event=threading.Event(), backoff_schedule=(0,),
+                         notify_stall=notify_stall, on_recovery=on_recovery,
+                         on_poison=on_poison)
+    def fn():
+        calls[0] += 1
+        raise ValueError("bad")
+
+    assert fn() == "dropped"
+    # A fresh poison window after the veto: the hook is asked again.
+    assert calls[0] == 2 * const.POISON_MAX_ATTEMPTS
+    notify_stall.assert_called_once()
+    on_recovery.assert_called_once()

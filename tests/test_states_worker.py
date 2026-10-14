@@ -666,6 +666,72 @@ def test_poison_chunk_drops_only_bad_rows(mock_psycopg_conn):
     assert call(create_states_dropped_issue, t._hass) in t._hass.add_job.call_args_list
 
 
+def test_rows_that_all_fail_are_a_database_fault_not_poison(mock_psycopg_conn):
+    """Circuit breaker: if no probed row lands, nothing is dropped; the chunk is
+    retried (and stalls) until the database recovers."""
+    import psycopg
+
+    from custom_components.timescaledb_recorder.const import POISON_PROBE_ROWS
+
+    conn, cur = mock_psycopg_conn
+    succeeded = []
+    broken = [60]  # executemany calls that fail before the "table" comes back
+
+    def executemany(sql, params):
+        if broken[0]:
+            broken[0] -= 1
+            raise psycopg.errors.UndefinedTable('relation "states" does not exist')
+        succeeded.extend(p[0] for p in params)
+
+    cur.executemany.side_effect = executemany
+    t = _fallback_thread(conn)
+    t._stall_hook = MagicMock()
+    rows = [_sample_state_row(f"s.e{i}") for i in range(POISON_PROBE_ROWS + 2)]
+    # Rebuild the chunk wrapper so it binds the mocked stall hook.
+    from custom_components.timescaledb_recorder.retry import retry_until_success
+    t._insert_chunk = retry_until_success(
+        stop_event=t._stop_event, on_transient=t.reset_db_connection,
+        notify_stall=t._stall_hook, on_poison=t._insert_rows_individually,
+    )(t._insert_chunk_raw)
+
+    with patch("custom_components.timescaledb_recorder.states_worker.psycopg.connect",
+               return_value=conn):
+        t._flush(rows)
+
+    assert t.rows_dropped == 0
+    assert sorted(succeeded) == sorted(r.entity_id for r in rows)
+    t._stall_hook.assert_called_once()
+
+
+def test_one_landing_probe_row_lets_bad_rows_be_dropped(mock_psycopg_conn):
+    import psycopg
+
+    from custom_components.timescaledb_recorder.const import POISON_PROBE_ROWS
+
+    conn, cur = mock_psycopg_conn
+    succeeded = []
+
+    def executemany(sql, params):
+        if any(p[0] == "bad.row" for p in params):
+            raise psycopg.errors.UntranslatableCharacter("nul")
+        succeeded.extend(p[0] for p in params)
+
+    cur.executemany.side_effect = executemany
+    t = _fallback_thread(conn)
+    # The bad row is probed first; the next probe lands and clears the database.
+    rows = [_sample_state_row("bad.row")] + [
+        _sample_state_row(f"s.e{i}") for i in range(POISON_PROBE_ROWS)
+    ]
+
+    with patch("custom_components.timescaledb_recorder.states_worker.psycopg.connect",
+               return_value=conn):
+        t._flush(rows)
+
+    assert t.rows_dropped == 1
+    assert sorted(succeeded) == sorted(r.entity_id for r in rows[1:])
+    assert succeeded.count("s.e0") == 1
+
+
 def test_transient_error_in_row_fallback_retries_instead_of_dropping(mock_psycopg_conn):
     import psycopg
 

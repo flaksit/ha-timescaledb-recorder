@@ -150,6 +150,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         # Phase 3: extended with on_recovery and on_sustained_fail (D-03, D-11).
         # on_poison dead-letters an item that keeps failing non-transiently; it
         # returns None, so run() task_done()s it like a success (issue #20).
+        # No circuit breaker as in the states worker: the startup snapshot
+        # rewrites every live registry entry, so an environment fault that
+        # dead-letters items costs at most intermediate versions and removals.
         self._write_item = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,

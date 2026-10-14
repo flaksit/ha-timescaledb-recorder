@@ -377,7 +377,7 @@ A worker thread that dies is restarted by the watchdog with a persistent notific
 
 ### Database timeouts
 
-Every worker connection bounds its waits so a hang turns into a logged, retried error: TCP keepalives (dead connection detected after ~60 s idle), `tcp_user_timeout` 60 s, `connect_timeout` 10 s, and `statement_timeout` 5 min for reads and writes (schema setup at startup and the backfill's scan of all known entity ids run without it, since DDL on a large table and a scan that grows with it can take longer; the watchdog still reports either if it runs past 10 min). Values you set in the DSN win, e.g. `postgresql://...?keepalives_idle=120&options=-c%20statement_timeout%3D600000`. A `statement_timeout` configured on the role or database is kept too.
+Every worker connection bounds its waits so a hang turns into a logged, retried error: TCP keepalives (dead connection detected after ~60 s idle), `tcp_user_timeout` 60 s, `connect_timeout` 10 s, and `statement_timeout` 5 min for reads and writes (schema setup at startup and the backfill's scan of all known entity ids run without it, since DDL on a large table and a scan that grows with it can take longer; the watchdog still reports either if it runs past 10 min). Values you set in the DSN win, e.g. `postgresql://...?keepalives_idle=120&options=-c%20statement_timeout%3D600000`. A `statement_timeout` configured on the role or database is kept too. These are session settings, so connect directly or through a pooler in session mode (PgBouncer `pool_mode = session`); transaction or statement pooling is not supported.
 
 ## Troubleshooting
 

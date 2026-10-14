@@ -41,6 +41,12 @@ def connect(dsn: str) -> psycopg.Connection:
     statement_timeout is set per session after connecting rather than through the
     `options` startup parameter, which PgBouncer rejects unless configured to
     ignore it.
+
+    Session pooling only (direct connection or PgBouncer pool_mode=session).
+    Under transaction or statement pooling a session setting lands on whichever
+    server connection served that statement: the timeout is lost for later
+    statements, and statement_timeout_lifted can leave another client's
+    connection without one.
     """
     conn = psycopg.connect(dsn, autocommit=True, **connect_kwargs(dsn))
     try:

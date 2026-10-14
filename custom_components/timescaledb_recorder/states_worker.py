@@ -190,6 +190,11 @@ class TimescaledbStateRecorderThread(threading.Thread):
             on_poison=self._drop_row,
         )(self.db_calls.track(self._insert_row_raw))
 
+    @property
+    def in_backfill(self) -> bool:
+        """True while the worker consumes backfill_queue and waits for BACKFILL_DONE."""
+        return self._last_mode == MODE_BACKFILL
+
     # ------------------------------------------------------------------
     # Connection management (D-07-g)
     # ------------------------------------------------------------------

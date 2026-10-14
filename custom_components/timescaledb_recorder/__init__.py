@@ -392,6 +392,12 @@ def _make_orchestrator_done_callback(
             )
             new_task.add_done_callback(_on_orchestrator_done)
             runtime.orchestrator_task = new_task
+            # The crashed run had already consumed backfill_request. A states
+            # worker still in backfill mode waits for BACKFILL_DONE and requests
+            # nothing more, so without a fresh request both would wait forever.
+            worker = runtime.states_worker
+            if worker is not None and worker.in_backfill:
+                runtime.backfill_request.set()
 
         hass.async_create_background_task(_relaunch(), name="timescaledb_recorder_orchestrator_relaunch")
 

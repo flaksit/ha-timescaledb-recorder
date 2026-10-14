@@ -822,6 +822,37 @@ async def test_orchestrator_relaunch_sleeps_5s_before_new_task():
     )
 
 
+@pytest.mark.parametrize("in_backfill", [True, False])
+async def test_orchestrator_relaunch_rerequests_backfill_only_mid_backfill(in_backfill):
+    """A crash mid-cycle leaves the states worker waiting for BACKFILL_DONE; the
+    relaunched orchestrator must get a fresh request or both wait forever."""
+    from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
+
+    hass = MagicMock()
+    runtime = MagicMock()
+    runtime.stop_event.is_set.return_value = False
+    runtime.loop_stop_event.is_set.return_value = False
+    runtime.states_worker.in_backfill = in_backfill
+    created = []
+    hass.async_create_background_task = MagicMock(
+        side_effect=lambda coro, *, name=None: created.append(coro) or MagicMock(),
+    )
+    cb = _make_orchestrator_done_callback(hass, runtime, {"hass": hass})
+    task = MagicMock()
+    task.cancelled.return_value = False
+    task.exception.return_value = RuntimeError("crash")
+
+    with patch("custom_components.timescaledb_recorder.notify_watchdog_recovery"), patch(
+        "custom_components.timescaledb_recorder.asyncio.sleep", new=AsyncMock(),
+    ), patch(
+        "custom_components.timescaledb_recorder.backfill_orchestrator", return_value=object(),
+    ):
+        cb(task)
+        await created[0]
+
+    assert runtime.backfill_request.set.called is in_backfill
+
+
 async def test_orchestrator_relaunch_aborts_if_stop_event_set_during_sleep():
     """_relaunch() must not create a new orchestrator task if stop_event is set after the sleep."""
     from custom_components.timescaledb_recorder import _make_orchestrator_done_callback

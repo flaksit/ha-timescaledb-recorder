@@ -147,6 +147,85 @@ def test_extra_carries_created_at_the_worker_can_read():
 
 
 # ---------------------------------------------------------------------------
+# extra: set fields must not depend on PYTHONHASHSEED
+# ---------------------------------------------------------------------------
+
+_HASHSEED_PROBE = """
+import json
+from datetime import datetime, timezone
+from homeassistant.helpers import device_registry as dr, area_registry as ar
+from custom_components.timescaledb_recorder import registry_listener as rl
+
+ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+device = dr.DeviceEntry(
+    id="d", created_at=ts, modified_at=ts,
+    config_entries={"e1", "e2", "e3", "e4", "e5"},
+    connections={("mac", "1"), ("zigbee", "2"), ("bt", "3")},
+    identifiers={("hue", "1"), ("hue", "2"), ("hue", "3")},
+)
+area = ar.AreaEntry(name="A", aliases={"x", "y", "z", "w"}, floor_id=None,
+                    humidity_entity_id=None, icon=None, id="a", picture=None,
+                    temperature_entity_id=None, created_at=ts, modified_at=ts)
+print(json.dumps({
+    "device": rl._build_extra(device, rl._DEVICE_TYPED_KEYS),
+    "area": rl._build_extra(area, rl._AREA_TYPED_KEYS),
+    "legacy_device": json.dumps({"config_entries": str(device.config_entries),
+                                 "connections": str(device.connections)}),
+}))
+"""
+
+
+def _probe_under_seed(seed: int) -> dict:
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONHASHSEED": str(seed), "PYTHONPATH": str(root)}
+    out = subprocess.run([sys.executable, "-c", _HASHSEED_PROBE], env=env, cwd=root,
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def test_build_extra_is_independent_of_hash_seed():
+    """Restarts change PYTHONHASHSEED; the reconcile must not see a change."""
+    from custom_components.timescaledb_recorder.registry_listener import _extra_changed
+
+    one, two = _probe_under_seed(1), _probe_under_seed(2)
+    # Precondition: these seeds really do order the sets differently.
+    assert one["legacy_device"] != two["legacy_device"]
+    assert one["device"] == two["device"]
+    assert one["area"] == two["area"]
+    assert not _extra_changed(one["device"], two["device"])
+
+
+def test_legacy_set_repr_compares_equal_to_canonical_form():
+    """Rows stored as str(set) by older versions must not be re-versioned on upgrade."""
+    import json
+    from custom_components.timescaledb_recorder.registry_listener import _extra_changed
+
+    one, two = _probe_under_seed(1), _probe_under_seed(2)
+    legacy = json.loads(one["legacy_device"])
+    canonical = {k: v for k, v in json.loads(two["device"]).items() if k in legacy}
+    assert not _extra_changed(legacy, json.dumps(canonical))
+    assert not _extra_changed({"aliases": "set()", "x": "frozenset({'b', 'a'})"},
+                              json.dumps({"aliases": [], "x": ["a", "b"]}))
+
+
+def test_extra_changed_still_detects_real_changes():
+    import json
+    from custom_components.timescaledb_recorder.registry_listener import _extra_changed
+
+    assert _extra_changed({"config_entries": "{'a', 'b'}"},
+                          json.dumps({"config_entries": ["a", "c"]}))
+    assert _extra_changed({"aliases": ["a", "b"]}, json.dumps({"aliases": ["a"]}))
+    # A plain string that is not a set repr stays a string.
+    assert _extra_changed({"icon": "{mdi:x}"}, json.dumps({"icon": ["mdi:x"]}))
+
+
+# ---------------------------------------------------------------------------
 # Entity registry callback → dict enqueue (live mode)
 # ---------------------------------------------------------------------------
 

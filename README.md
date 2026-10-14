@@ -223,7 +223,7 @@ This enables historically correct joins: for any row in `states`, you can join t
 
 All four tables follow the same SCD2 pattern. The current row for any object has `valid_to IS NULL`. When metadata changes, the existing row is closed (`valid_to` set to the timestamp of the change) and a new row is inserted (`valid_from` = that same timestamp, `valid_to = NULL`). Historical rows are never deleted.
 
-Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`.
+Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`. Set-valued fields (e.g. `config_entries`, `identifiers`, `aliases`) are stored as sorted JSON arrays; rows written by older versions hold them as Python set strings such as `"{'a', 'b'}"`, in arbitrary order. Change detection treats both forms as equal, so upgrading does not create new versions.
 
 #### entities
 

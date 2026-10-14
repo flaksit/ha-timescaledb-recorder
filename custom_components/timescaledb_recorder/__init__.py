@@ -23,7 +23,7 @@ import asyncio
 import logging
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -32,11 +32,7 @@ import voluptuous as vol
 from homeassistant.components import recorder as ha_recorder
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers import label_registry as lr
 from homeassistant.helpers.entityfilter import (
     convert_filter,
     convert_include_exclude_filter,
@@ -68,8 +64,8 @@ from .meta_worker import TimescaledbMetaRecorderThread
 from .notifications import notify_watchdog_recovery
 from .overflow_queue import OverflowQueue
 from .persistent_queue import PersistentQueue
-from .states_worker import TimescaledbStateRecorderThread
-from .registry_listener import RegistryListener, _to_json_safe
+from .states_worker import StatesWriteStats, TimescaledbStateRecorderThread
+from .registry_listener import RegistryListener
 from .watchdog import spawn_meta_worker, spawn_states_worker, watchdog_loop
 
 _LOGGER = logging.getLogger(__name__)
@@ -150,6 +146,11 @@ class TimescaledbRecorderData:
     chunk_interval_days: int                # TimescaleDB chunk interval
     compress_after_hours: int               # TimescaleDB compression policy
     entity_filter: Callable[[str], bool]    # entity filter for orchestrator relaunch kwargs
+    # Shared with every states worker incarnation so "last write" survives a respawn.
+    states_stats: StatesWriteStats = field(default_factory=StatesWriteStats)
+    # Set once by the first states worker to finish schema setup, never
+    # cleared; the meta worker writes nothing before it (fresh install).
+    schema_ready: threading.Event = field(default_factory=threading.Event)
 
 
 TimescaledbRecorderConfigEntry = ConfigEntry[TimescaledbRecorderData]
@@ -179,88 +180,6 @@ def _get_entity_filter(hass: HomeAssistant, entry):
         "exclude_entity_globs": [],
         "exclude_entities": [],
     })
-
-
-async def _async_initial_registry_backfill(
-    hass: HomeAssistant, meta_queue: PersistentQueue,
-) -> None:
-    """Enumerate all four HA registries and enqueue create items (D-12 step 5).
-
-    Idempotent by construction: meta_worker dispatches through SCD2_SNAPSHOT_*
-    which carries a WHERE NOT EXISTS guard.
-
-    Iteration order per CONTEXT Claude's Discretion: area → label → entity → device.
-    Rationale: loose FK-like dependency ordering — referenced area_id / label_id
-    rows land before the referencing entity/device rows.
-
-    Issue #11: builds a single ordered list of create items and writes them
-    via meta_queue.put_many_async — exactly ONE fsync regardless of registry
-    size, instead of one fsync per entry. On a typical install with hundreds
-    of registry rows this collapses N synchronous fsyncs (each gating HA's
-    bootstrap) into one, removing the startup-delay symptom in the issue.
-    """
-    now_iso = datetime.now(timezone.utc).isoformat()
-    area_reg = ar.async_get(hass)
-    label_reg = lr.async_get(hass)
-    entity_reg = er.async_get(hass)
-    device_reg = dr.async_get(hass)
-
-    # Construct a throwaway RegistryListener bound to meta_queue so we can reuse
-    # its _extract_*_params helpers without duplicating the extraction logic.
-    # async_start() has NOT been called on this instance, so _entity_reg etc. are
-    # None — but the extract helpers receive the registry entry directly as an
-    # argument and do not read self._entity_reg.
-    now = datetime.now(timezone.utc)
-    listener_helper = RegistryListener(hass=hass, meta_queue=meta_queue)
-
-    items: list[dict] = []
-
-    for entry in area_reg.async_list_areas():
-        params = listener_helper._extract_area_params(entry, now)
-        items.append({
-            "registry": "area",
-            "action": "create",
-            "registry_id": entry.id,
-            "old_id": None,
-            "params": _to_json_safe(params),
-            "enqueued_at": now_iso,
-        })
-
-    for entry in label_reg.async_list_labels():
-        params = listener_helper._extract_label_params(entry, now)
-        items.append({
-            "registry": "label",
-            "action": "create",
-            "registry_id": entry.label_id,
-            "old_id": None,
-            "params": _to_json_safe(params),
-            "enqueued_at": now_iso,
-        })
-
-    for entry in entity_reg.entities.values():
-        params = listener_helper._extract_entity_params(entry, now)
-        items.append({
-            "registry": "entity",
-            "action": "create",
-            "registry_id": entry.entity_id,
-            "old_id": None,
-            "params": _to_json_safe(params),
-            "enqueued_at": now_iso,
-        })
-
-    for entry in device_reg.devices.values():
-        params = listener_helper._extract_device_params(entry, now)
-        items.append({
-            "registry": "device",
-            "action": "create",
-            "registry_id": entry.id,
-            "old_id": None,
-            "params": _to_json_safe(params),
-            "enqueued_at": now_iso,
-        })
-
-    # Single batched write — one fsync, one notify_all (issue #11).
-    await meta_queue.put_many_async(items)
 
 
 async def _overflow_watcher(
@@ -374,34 +293,16 @@ def _make_orchestrator_done_callback(
             )
             new_task.add_done_callback(_on_orchestrator_done)
             runtime.orchestrator_task = new_task
+            # The crashed run had already consumed backfill_request. A states
+            # worker still in backfill mode waits for BACKFILL_DONE and requests
+            # nothing more, so without a fresh request both would wait forever.
+            worker = runtime.states_worker
+            if worker is not None and worker.in_backfill:
+                runtime.backfill_request.set()
 
         hass.async_create_background_task(_relaunch(), name="timescaledb_recorder_orchestrator_relaunch")
 
     return _on_orchestrator_done
-
-
-async def _async_meta_init(
-    hass: HomeAssistant,
-    meta_queue: PersistentQueue,
-    registry_listener: RegistryListener,
-) -> None:
-    """Drain persisted queue, run registry backfill, then enable registry_listener.
-
-    Runs as a background task so async_setup_entry returns fast and does not
-    delay homeassistant_started. Three steps in strict order:
-    1. Drain the file-backed queue from the previous session (meta_worker processes
-       old items first — FIFO ordering preserved).
-    2. Snapshot current HA registries into meta_queue via SCD2_SNAPSHOT (idempotent,
-       WHERE NOT EXISTS guard). No recorder dependency — reads er/ar/dr/lr directly.
-    3. Enable registry_listener: flip DISCARD → LIVE so incoming registry events
-       now flow to meta_queue normally.
-
-    HA cancels background tasks on shutdown automatically, so no stop_event check
-    is needed — CancelledError interrupts any awaited step cleanly.
-    """
-    await meta_queue.join()
-    await _async_initial_registry_backfill(hass, meta_queue)
-    registry_listener.enable()
 
 
 async def async_setup_entry(
@@ -414,8 +315,11 @@ async def async_setup_entry(
     compress_after_hours = options.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_HOURS)
     entity_filter = _get_entity_filter(hass, entry)
 
-    # D-12 step 1: open PersistentQueue
-    meta_queue = PersistentQueue(hass.config.path(DOMAIN, "metadata_queue.jsonl"))
+    # D-12 step 1: open PersistentQueue. Its constructor does blocking file I/O
+    # (mkdir + full-file line count), so it must not run on the event loop.
+    meta_queue = await hass.async_add_executor_job(
+        PersistentQueue, hass.config.path(DOMAIN, "metadata_queue.jsonl"),
+    )
 
     # Shared signals
     stop_event = threading.Event()
@@ -461,8 +365,7 @@ async def async_setup_entry(
 
     started: list[str] = []
     try:
-        # D-12 step 4: subscribe registry_listener in DISCARD mode — events dropped
-        # until _async_meta_init calls enable() after drain + backfill complete.
+        # D-12 step 4: registry events are enqueued from here on (issue #19).
         await registry_listener.async_start()
         started.append("registry_listener")
         # D-12 step 5: subscribe state_listener — live_queue buffers all events
@@ -481,24 +384,16 @@ async def async_setup_entry(
         await hass.async_add_executor_job(data.states_worker.join, 30)
         raise
 
-    # D-12 steps 6+7: drain persisted queue + registry backfill + enable listeners.
-    # Issue #11: defer until HA reaches RUNNING via async_at_started so the
-    # initial registry snapshot does not compete with HA bootstrap. The
-    # registry_listener was already registered above in DISCARD mode, so any
-    # registry events fired during bootstrap are dropped (and re-snapshotted
-    # by the backfill below); state events continue to buffer in live_queue
-    # via state_listener regardless of when meta_init runs.
+    # D-12 step 6: reconcile the dimensions with the registries (issue #19).
+    # Deferred to RUNNING so the snapshot does not compete with HA bootstrap
+    # (issue #11); registry events during bootstrap are already queued ahead
+    # of it. No wait for the persisted backlog: the queue is FIFO, so it is
+    # applied first anyway.
     @callback
-    def _start_meta_init(_hass: HomeAssistant) -> None:
-        # async_at_started invokes this synchronously when HA is already
-        # RUNNING (reload path), so the wrapper must NOT await — schedule the
-        # coroutine via async_create_background_task instead.
-        hass.async_create_background_task(
-            _async_meta_init(hass, meta_queue, registry_listener),
-            name="timescaledb_recorder_meta_init",
-        )
+    def _enqueue_registry_snapshot(_hass: HomeAssistant) -> None:
+        registry_listener.enqueue_snapshot()
 
-    async_at_started(hass, _start_meta_init)
+    async_at_started(hass, _enqueue_registry_snapshot)
 
     # D-11: recorder_disabled detection — one-shot check at setup. Backfill
     # requires HA's sqlite recorder; if it's not loaded or disabled, raise a

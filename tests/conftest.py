@@ -3,6 +3,17 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_poison_time_floor(monkeypatch):
+    """Tests skip backoff sleeps, so the 60 s poison floor would never elapse.
+
+    Tests of the floor itself pass poison_min_seconds or patch the clock.
+    """
+    from custom_components.timescaledb_recorder import const
+
+    monkeypatch.setattr(const, "POISON_MIN_SECONDS", 0.0)
+
+
 @pytest.fixture
 def mock_conn():
     """Return a mock asyncpg connection (retained for legacy test_schema.py compat)."""
@@ -101,9 +112,18 @@ def mock_entity_registry():
 
 @pytest.fixture
 def mock_device_registry():
-    """Return a mock HA device registry with two example DeviceEntry objects."""
-    entries = [
-        _make_registry_entry(
+    """Device registry stand-in holding real HA containers and entries.
+
+    `devices` is HA's real iteration view (mapping access on it reports a
+    deprecation) and `child_devices` a real child container's values, so
+    snapshot tests exercise the actual registry shapes.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    active = dr.ActiveDeviceRegistryItems()
+    for entry in (
+        dr.DeviceEntry(
+            config_entry_id="entry-zha",
             id="device-001",
             name="Living Room Sensor",
             manufacturer="IKEA",
@@ -111,7 +131,8 @@ def mock_device_registry():
             area_id="area-living-room",
             labels={"zigbee"},
         ),
-        _make_registry_entry(
+        dr.DeviceEntry(
+            config_entry_id="entry-zha",
             id="device-002",
             name="Smart Plug Kettle",
             manufacturer="IKEA",
@@ -119,11 +140,20 @@ def mock_device_registry():
             area_id="area-kitchen",
             labels=set(),
         ),
-    ]
+    ):
+        active[entry.id] = entry
+    children = dr.ChildDeviceRegistryItems()
+    child = dr.ChildDeviceEntry(
+        config_entry_id="entry-zha",
+        id="device-003",
+        name="Kettle Plug USB Port",
+        parent_device_id="device-002",
+    )
+    children[child.id] = child
 
     reg = MagicMock()
-    reg.devices = MagicMock()
-    reg.devices.values = MagicMock(return_value=iter(entries))
+    reg.devices = dr._DeprecatedDeviceRegistryItemsView(active)
+    reg.child_devices = children.values()
     return reg
 
 

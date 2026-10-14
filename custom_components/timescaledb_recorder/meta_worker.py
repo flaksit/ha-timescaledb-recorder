@@ -6,8 +6,13 @@ PersistentQueue and dispatches via the Phase 1 SCD2 helpers on the syncer.
 Item-dict schema (D-15-c; produced by plan 09 syncer updates):
     {
         "registry": "entity" | "device" | "area" | "label",
-        "action":   "create" | "update" | "remove",
-        "registry_id": str,            # entity_id | device_id | area_id | label_id
+        "action":   "create" | "update" | "remove" | "snapshot" | "sweep",
+                                       # "snapshot": startup registry read; same
+                                       # reconcile semantics as create/update.
+                                       # "sweep": one per registry after the
+                                       # snapshot; closes open rows not in live_ids.
+        "registry_id": str | None,     # entity_id | device_id | area_id | label_id;
+                                       # None on "sweep"
         "old_id": str | None,          # only non-None for entity renames
         "params": list | None,         # JSON-safe; None on remove actions.
                                        # Datetimes serialized as ISO strings;
@@ -20,10 +25,12 @@ Item-dict schema (D-15-c; produced by plan 09 syncer updates):
                                        # is the close time (see
                                        # _close_timestamp). Informational for
                                        # every other action.
+        "live_ids": list[str],         # "sweep" only: ids the registry holds
     }
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -35,21 +42,31 @@ from psycopg.types.json import Jsonb
 
 from homeassistant.core import HomeAssistant
 
+from .canonical import canonical_labels, canonical_legacy
 from .const import (
+    CANONICAL_SETS_MIGRATION_ID,
     DEADLETTER_REASON_INTEGRITY,
     DEADLETTER_REASON_OUT_OF_ORDER,
+    DEADLETTER_REASON_POISON,
+    DEADLETTER_REASON_SWEEP_REFUSED,
     METADATA_DEADLETTER_INSERT_SQL,
     SCD2_CLOSE_AREA_SQL,
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
     SCD2_CLOSE_LABEL_SQL,
+    SCD2_ANY_VERSION_SQL,
     SCD2_OPEN_VERSION_AT_SQL,
     SCD2_OPEN_VERSION_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
     SCD2_SNAPSHOT_DEVICE_SQL,
     SCD2_SNAPSHOT_ENTITY_SQL,
     SCD2_SNAPSHOT_LABEL_SQL,
+    SCD2_SWEEP_CLOSE_SQL,
+    SCD2_SWEEP_COUNT_SQL,
+    SCD2_SWEEP_FREE_CLOSES,
+    SCD2_SWEEP_MAX_CLOSE_FRACTION,
 )
+from .db import DbCallTracker, connect, statement_timeout_lifted
 from .issues import (
     clear_db_unreachable_issue,
     clear_meta_worker_stalled_issue,
@@ -57,6 +74,7 @@ from .issues import (
     create_meta_worker_stalled_issue,
     create_metadata_dropped_issue,
 )
+from .migrations import canonicalize_dimension_rows, migration_applied
 from .retry import retry_until_success
 
 if TYPE_CHECKING:
@@ -78,6 +96,25 @@ _VALID_FROM_INDEX = {
     "label": 3,
 }
 
+# (close, guarded insert) per registry.
+_SCD2_SQL = {
+    "entity": (SCD2_CLOSE_ENTITY_SQL, SCD2_SNAPSHOT_ENTITY_SQL),
+    "device": (SCD2_CLOSE_DEVICE_SQL, SCD2_SNAPSHOT_DEVICE_SQL),
+    "area": (SCD2_CLOSE_AREA_SQL, SCD2_SNAPSHOT_AREA_SQL),
+    "label": (SCD2_CLOSE_LABEL_SQL, SCD2_SNAPSHOT_LABEL_SQL),
+}
+
+# labels slot per registry that has one (see _extract_*_params). extra is last.
+_LABELS_INDEX = {
+    "entity": 7,
+    "device": 5,
+}
+
+_RECONCILE_ACTIONS = frozenset({"create", "update", "snapshot"})
+
+# How often a schema wait re-checks stop_event (it cannot wait on both events).
+_SCHEMA_WAIT_POLL_S = 1.0
+
 
 class TimescaledbMetaRecorderThread(threading.Thread):
     """Daemon thread draining PersistentQueue and dispatching SCD2 writes."""
@@ -89,6 +126,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         meta_queue: "PersistentQueue",
         registry_listener: "RegistryListener",
         stop_event: threading.Event,
+        schema_ready: threading.Event | None = None,
     ) -> None:
         super().__init__(daemon=True, name="timescaledb_meta_worker")
         self._hass = hass
@@ -96,7 +134,11 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         self._meta_queue = meta_queue
         self._registry_listener = registry_listener
         self._stop_event = stop_event
+        # Set by the states worker once the schema exists. None: no wait.
+        self._schema_ready = schema_ready
         self._conn: psycopg.Connection | None = None
+        # Watchdog-readable hang detection (issue #14).
+        self.db_calls = DbCallTracker()
 
         # D-06-b: watchdog-readable post-mortem context. Safe defaults in __init__
         # so watchdog can read these even if run() never executes. (MEDIUM-8)
@@ -123,26 +165,48 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         # broke. Replays of an already-applied item also write nothing, but they
         # lose no history and are excluded — see _note_version_skipped.
         self.out_of_order_skips: int = 0
+        # Items given up on after repeated non-transient errors (issue #20).
+        # Same durability story as integrity_drops.
+        self.poison_drops: int = 0
 
         # retry_until_success is applied to the bound method at __init__ time so
         # on_transient / notify_stall can reference self. D-07 wiring.
         # Phase 3: extended with on_recovery and on_sustained_fail (D-03, D-11).
+        # on_poison dead-letters an item that keeps failing non-transiently; it
+        # returns None, so run() task_done()s it like a success (issue #20).
+        # No circuit breaker as in the states worker: the startup snapshot
+        # rewrites every live registry entry and sweeps removed ones, so an
+        # environment fault that dead-letters items costs at most intermediate
+        # versions and the exact time of removals.
         self._write_item = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
             notify_stall=self._stall_hook,
             on_recovery=self._recovery_hook,
             on_sustained_fail=self._sustained_fail_hook,
-        )(self._write_item_raw)
+            on_poison=self._drop_poison_item,
+        )(self.db_calls.track(self._write_item_raw))
+
+        # Same hooks as item writes: an unreachable DB stalls and alarms here
+        # exactly as it would on the first item. Tracked, so the watchdog sees
+        # a hung migration even though it runs without statement_timeout.
+        self._migrate = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+            notify_stall=self._stall_hook,
+            on_recovery=self._recovery_hook,
+            on_sustained_fail=self._sustained_fail_hook,
+            on_poison=self._migration_failed,
+        )(self.db_calls.track(self._migrate_raw))
 
     # ------------------------------------------------------------------
     # Connection management (D-07-g) — identical shape to states_worker.
     # ------------------------------------------------------------------
 
     def get_db_connection(self) -> psycopg.Connection:
-        """Return the current connection, opening a new one lazily if needed."""
+        """Return the current connection, opening one lazily via db.connect."""
         if self._conn is None:
-            self._conn = psycopg.connect(self._dsn, autocommit=True)
+            self._conn = connect(self._dsn)
         return self._conn
 
     def reset_db_connection(self) -> None:
@@ -259,6 +323,12 @@ class TimescaledbMetaRecorderThread(threading.Thread):
     def _run_main_loop(self) -> None:
         """Inner main loop extracted from run() so the outer try/except/finally
         in run() can wrap it cleanly (MEDIUM-8 pattern)."""
+        if not self._wait_for_schema():
+            return
+        # Before the first item: change detection compares stored rows directly.
+        self._last_op = "migrate"
+        if self._migrate() is None:
+            return  # interrupted by shutdown
         while not self._stop_event.is_set():
             item = self._meta_queue.get()  # blocks on Condition; None on wake
             if item is None or self._stop_event.is_set():
@@ -278,6 +348,51 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         # Connection is NOT closed here — the finally block in run() handles
         # teardown unconditionally (MEDIUM-8: single teardown path).
 
+    def _wait_for_schema(self) -> bool:
+        """Block until the states worker has created the schema; False on shutdown.
+
+        On a fresh install the tables, metadata_deadletter included, do not
+        exist until then, and every item would fail as poison.
+        """
+        if self._schema_ready is None or self._schema_ready.is_set():
+            return True
+        self._last_op = "wait_for_schema"
+        _LOGGER.debug("%s: waiting for the states worker to set up the schema", self.name)
+        while not self._schema_ready.wait(timeout=_SCHEMA_WAIT_POLL_S):
+            if self._stop_event.is_set():
+                return False
+        return not self._stop_event.is_set()
+
+    def _migrate_raw(self) -> bool:
+        """Run pending one-time data migrations; one PK lookup once applied.
+
+        No statement_timeout: rewriting every dimension row can outlast it on a
+        large history, and a timeout would make it a retry loop that never
+        finishes.
+        """
+        conn = self.get_db_connection()
+        if migration_applied(conn, CANONICAL_SETS_MIGRATION_ID):
+            return True
+        _LOGGER.info("%s: canonicalizing stored dimension rows (one-time)", self.name)
+        with statement_timeout_lifted(conn):
+            rewritten = canonicalize_dimension_rows(conn)
+        _LOGGER.info("%s: dimension rows canonicalized: %s", self.name, rewritten)
+        return True
+
+    def _migration_failed(self, exc: Exception) -> bool:
+        """retry_until_success on_poison hook: keep ingesting, retry next start.
+
+        Without the marker the next startup tries again. Until then, rows still
+        in the legacy form read as changed, so the snapshot writes one extra
+        version per affected entry: noise, not loss, and better than halting
+        metadata ingestion on a migration bug.
+        """
+        _LOGGER.error(
+            "%s: one-time canonicalization of dimension rows failed; continuing "
+            "without it and retrying on the next start", self.name, exc_info=exc,
+        )
+        return False
+
     # ------------------------------------------------------------------
     # Dispatch (D-05-c)
     # ------------------------------------------------------------------
@@ -285,15 +400,15 @@ class TimescaledbMetaRecorderThread(threading.Thread):
     def _write_item_raw(self, item: dict) -> None:
         """Dispatch one item, dropping items the SCD2 invariant refuses.
 
-        Raises on any DB error — retry_until_success handles transient failure.
-        Called as self._write_item (the retry-wrapped version) from run().
+        Raises on any other error. Called as self._write_item (the
+        retry-wrapped version) from run(): transient errors are retried, and an
+        item that keeps failing otherwise ends up in _drop_poison_item.
 
-        Integrity violations are the exception: they are not transient, so
-        retrying replays the same conflicting row forever. retry_until_success
-        never gives up, so one bad item would wedge every later metadata write
-        and silently stop the dimension tables from tracking anything. Dropping
-        it keeps ingestion alive; the constraint has already done its job by
-        refusing the write.
+        Integrity violations are caught here rather than left to that generic
+        path: they are known to be permanent, so retrying them only delays the
+        queue by the poison backoff, and they keep their own dead-letter reason
+        and counter. Dropping it keeps ingestion alive; the constraint has
+        already done its job by refusing the write.
 
         Dropping is not forgetting. The item goes to the dead-letter table
         first, so the change survives the restart that erases the counter and
@@ -312,6 +427,16 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             )
             self._dead_letter(item, DEADLETTER_REASON_INTEGRITY, str(err))
 
+    def _drop_poison_item(self, exc: Exception, item: dict) -> None:
+        """retry_until_success on_poison hook: give up on an item that cannot be written."""
+        self.poison_drops += 1
+        _LOGGER.error(
+            "%s: metadata write kept failing with a non-transient error; dropping "
+            "the item to keep the queue moving (total dropped: %d). Item: %r",
+            self.name, self.poison_drops, item, exc_info=exc,
+        )
+        self._dead_letter(item, DEADLETTER_REASON_POISON, repr(exc))
+
     def _dead_letter(self, item: dict, reason: str, error: str) -> None:
         """Record an item the worker is about to stop trying to write.
 
@@ -322,13 +447,14 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         than pretending the item was captured.
         """
         try:
-            conn = self.get_db_connection()
-            with conn.transaction(), conn.cursor() as cur:
-                cur.execute(
-                    METADATA_DEADLETTER_INSERT_SQL,
-                    (reason, item.get("registry"), item.get("registry_id"),
-                     error, Jsonb(item)),
-                )
+            with self.db_calls.call("dead_letter"):
+                conn = self.get_db_connection()
+                with conn.transaction(), conn.cursor() as cur:
+                    cur.execute(
+                        METADATA_DEADLETTER_INSERT_SQL,
+                        (reason, item.get("registry"), item.get("registry_id"),
+                         error, Jsonb(item)),
+                    )
         except Exception:  # noqa: BLE001 — the caller has already given up on this item
             _LOGGER.error(
                 "%s: could not dead-letter the dropped item; it now exists only in "
@@ -340,21 +466,24 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         """Route one item to the per-registry SCD2 path."""
         registry = item["registry"]
         action = item["action"]
+        if registry not in _SCD2_SQL:
+            _LOGGER.warning("Unknown registry type in metadata item: %s", registry)
+            return
         registry_id = item["registry_id"]
         old_id = item.get("old_id")
         params = self._rehydrate_params(registry, item.get("params"))
         close_ts = self._close_timestamp(registry, params, item.get("enqueued_at"))
 
-        if registry == "entity":
-            self._process_entity(action, registry_id, old_id, params, close_ts)
-        elif registry == "device":
-            self._process_device(action, registry_id, params, close_ts)
-        elif registry == "area":
-            self._process_area(action, registry_id, params, close_ts)
-        elif registry == "label":
-            self._process_label(action, registry_id, params, close_ts)
+        if action == "sweep":
+            self._process_sweep(item, registry, item["live_ids"], close_ts)
+        elif action == "remove":
+            self._process_remove(registry, registry_id, close_ts)
+        elif action == "update" and old_id is not None:
+            self._process_rename(registry, registry_id, old_id, params, close_ts)
+        elif action in _RECONCILE_ACTIONS:
+            self._process_reconcile(registry, registry_id, params, close_ts)
         else:
-            _LOGGER.warning("Unknown registry type in metadata item: %s", registry)
+            _LOGGER.warning("Unknown action in metadata item: %s", action)
 
     def _note_version_skipped(self, cur, registry: str, registry_id: str,
                           close_ts: datetime, params: tuple[object, ...] | None) -> None:
@@ -411,15 +540,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             # replay. Treat it as a real skip: over-reporting a lost change is
             # recoverable, under-reporting one is what issue #17 was.
             return True
-        comparators = {
-            "entity": self._registry_listener._entity_row_changed,
-            "device": self._registry_listener._device_row_changed,
-            "area": self._registry_listener._area_row_changed,
-            "label": self._registry_listener._label_row_changed,
-        }
         conn = self.get_db_connection()
         with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-            return comparators[registry](dict_cur, registry_id, params)
+            return self._row_changed(registry, dict_cur, registry_id, params)
 
     def _note_removal_skipped(self, cur, registry: str, registry_id: str,
                               close_ts: datetime) -> None:
@@ -516,168 +639,152 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         vf = rehydrated[idx]
         if isinstance(vf, str):
             rehydrated[idx] = datetime.fromisoformat(vf)
+        # Items queued by versions before canonical serialization carry str(set)
+        # in extra and possibly unsorted labels; written as-is they would undo
+        # the migration and read as changed.
+        if isinstance(rehydrated[-1], str):
+            rehydrated[-1] = json.dumps(canonical_legacy(json.loads(rehydrated[-1])))
+        if (labels_idx := _LABELS_INDEX.get(registry)) is not None:
+            rehydrated[labels_idx] = canonical_labels(rehydrated[labels_idx])
         return tuple(rehydrated)
 
     # ------------------------------------------------------------------
-    # Per-registry dispatch — entity (D-05-c). Port Phase 1 worker.py:256-294
-    # verbatim with s/cmd.*/params|registry_id|old_id/g.
+    # SCD2 writes (D-05-c). One shape for all four registries; only entities
+    # can be renamed, so only entity items ever carry an old_id.
     # ------------------------------------------------------------------
 
-    def _process_entity(
-        self,
-        action: str,
-        registry_id: str,
-        old_id: str | None,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for an entity registry change.
+    def _row_changed(self, registry: str, dict_cur, registry_id: str, params: tuple) -> bool:
+        """The registry listener's change detection — the one definition of "same version"."""
+        comparators = {
+            "entity": self._registry_listener._entity_row_changed,
+            "device": self._registry_listener._device_row_changed,
+            "area": self._registry_listener._area_row_changed,
+            "label": self._registry_listener._label_row_changed,
+        }
+        return comparators[registry](dict_cur, registry_id, params)
 
-        "create": snapshot SQL with idempotent WHERE NOT EXISTS guard.
-        "remove": close the open row; no new row (entry already gone).
-        "update" rename (old_id is not None): close old entity_id + insert new, atomically.
-        "update" field change (old_id is None): change-detection gate, then close+insert.
-
-        Both update paths close with the incoming valid_from and insert through the
-        guarded snapshot statement, which together make a replayed item a no-op.
-        """
+    def _process_remove(self, registry: str, registry_id: str, close_ts: datetime) -> None:
+        """Close the open row; nothing replaces it (the registry entry is gone)."""
+        close_sql, _insert_sql = _SCD2_SQL[registry]
         conn = self.get_db_connection()
         with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = entity_id; appears twice per SCD2_SNAPSHOT_ENTITY_SQL.
-                cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "entity", registry_id, close_ts)
-            elif action == "update":
-                if old_id is not None:
-                    # Rename path — atomic close of the old id + insert under the new.
-                    with conn.transaction():
-                        cur.execute(SCD2_CLOSE_ENTITY_SQL, (close_ts, old_id, close_ts))
-                        cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "entity", registry_id, close_ts, params)
-                else:
-                    # Field-change path. The change-detection read runs inside the
-                    # transaction so it and the close+insert see one snapshot.
-                    with conn.transaction():
-                        with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                            changed = self._registry_listener._entity_row_changed(
-                                dict_cur, registry_id, params
-                            )
-                        if changed:
-                            cur.execute(
-                                SCD2_CLOSE_ENTITY_SQL, (close_ts, registry_id, close_ts)
-                            )
-                            cur.execute(SCD2_SNAPSHOT_ENTITY_SQL, (*params, params[0]))
-                            self._note_version_skipped(cur, "entity", registry_id, close_ts, params)
+            cur.execute(close_sql, (close_ts, registry_id, close_ts))
+            self._note_removal_skipped(cur, registry, registry_id, close_ts)
 
-    # ------------------------------------------------------------------
-    # Per-registry dispatch — device/area/label (D-05-c). Mechanical copies
-    # of _process_entity without the rename path (devices, areas, and labels
-    # cannot be renamed in HA — old_id is always None for these registries).
-    # ------------------------------------------------------------------
+    def _process_sweep(self, item: dict, registry: str, live_ids: list[str],
+                       close_ts: datetime) -> None:
+        """Close every open row whose id the registry no longer holds, at close_ts.
 
-    def _process_device(
-        self,
-        action: str,
-        registry_id: str,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for a device registry change.
-
-        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
-        "remove": close the open row.
-        "update": change-detection gate via syncer helper; close+insert if changed.
-        No rename path — devices cannot be renamed in HA.
+        Catches removals made while HA was not running, which no event reports.
+        Replay-safe: a second run finds nothing outside live_ids still open.
+        Refuses implausible sweeps rather than ending history wholesale.
         """
         conn = self.get_db_connection()
-        with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = device_id; appears twice per SCD2_SNAPSHOT_DEVICE_SQL.
-                cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "device", registry_id, close_ts)
-            elif action == "update":
-                with conn.transaction():
-                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._registry_listener._device_row_changed(
-                            dict_cur, registry_id, params
-                        )
-                    if changed:
-                        cur.execute(
-                            SCD2_CLOSE_DEVICE_SQL, (close_ts, registry_id, close_ts)
-                        )
-                        cur.execute(SCD2_SNAPSHOT_DEVICE_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "device", registry_id, close_ts, params)
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(SCD2_SWEEP_COUNT_SQL[registry], (close_ts, live_ids))
+            open_rows, to_close = cur.fetchone()
+            if open_rows and not live_ids:
+                _LOGGER.warning(
+                    "%s: %s registry listed no entries but %d row(s) are open; "
+                    "not closing any", self.name, registry, open_rows,
+                )
+                return
+            refused = (to_close > SCD2_SWEEP_FREE_CLOSES
+                       and to_close > open_rows * SCD2_SWEEP_MAX_CLOSE_FRACTION)
+            if to_close and not refused:
+                cur.execute(SCD2_SWEEP_CLOSE_SQL[registry], (close_ts, close_ts, live_ids))
+                to_close = cur.rowcount
+        if refused:
+            why = (f"would close {to_close} of {open_rows} open {registry} rows, "
+                   f"more than {SCD2_SWEEP_MAX_CLOSE_FRACTION:.0%}")
+            _LOGGER.error(
+                "%s: refused the startup removal sweep: it %s. Rows of entries removed "
+                "while HA was down stay open; the item is in metadata_deadletter.",
+                self.name, why,
+            )
+            self._dead_letter(item, DEADLETTER_REASON_SWEEP_REFUSED, why)
+            return
+        _LOGGER.info(
+            "%s: closed %d open %s row(s) whose entry no longer exists in the registry",
+            self.name, to_close, registry,
+        )
 
-    def _process_area(
-        self,
-        action: str,
-        registry_id: str,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for an area registry change.
+    def _process_rename(self, registry: str, registry_id: str, old_id: str,
+                        params: tuple, close_ts: datetime) -> None:
+        """Close the old id and insert under the new one, atomically.
 
-        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
-        "remove": close the open row.
-        "update": change-detection gate via syncer helper; close+insert if changed.
-        No rename path — areas cannot be renamed by entity_id in HA.
+        Always stamped at event time, never created_at: the registry entry
+        predates the new id.
         """
+        close_sql, insert_sql = _SCD2_SQL[registry]
         conn = self.get_db_connection()
-        with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = area_id; appears twice per SCD2_SNAPSHOT_AREA_SQL.
-                cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "area", registry_id, close_ts)
-            elif action == "update":
-                with conn.transaction():
-                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._registry_listener._area_row_changed(
-                            dict_cur, registry_id, params
-                        )
-                    if changed:
-                        cur.execute(
-                            SCD2_CLOSE_AREA_SQL, (close_ts, registry_id, close_ts)
-                        )
-                        cur.execute(SCD2_SNAPSHOT_AREA_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "area", registry_id, close_ts, params)
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(close_sql, (close_ts, old_id, close_ts))
+            cur.execute(insert_sql, (*params, params[0]))
+            self._note_version_skipped(cur, registry, registry_id, close_ts, params)
 
-    def _process_label(
-        self,
-        action: str,
-        registry_id: str,
-        params: tuple | None,
-        close_ts: datetime,
-    ) -> None:
-        """Execute SCD2 write for a label registry change.
+    def _process_reconcile(self, registry: str, registry_id: str,
+                           params: tuple, close_ts: datetime) -> None:
+        """Make the open version match `params`: create, update and snapshot.
 
-        "create": idempotent snapshot SQL (WHERE NOT EXISTS guard).
-        "remove": close the open row.
-        "update": change-detection gate via syncer helper; close+insert if changed.
-        No rename path — labels cannot be renamed by label_id in HA.
+        No open row → insert; open row equal → nothing; differs → close+insert at
+        the item's valid_from. Each is therefore safe whether or not an open row
+        exists, which is what lets the listener enqueue from startup on and the
+        snapshot repair drift instead of only filling gaps (issue #19).
+
+        The change-detection read runs inside the transaction so it and the
+        close+insert see one snapshot.
         """
+        close_sql, insert_sql = _SCD2_SQL[registry]
         conn = self.get_db_connection()
-        with conn.cursor() as cur:
-            if action == "create":
-                # params[0] = label_id; appears twice per SCD2_SNAPSHOT_LABEL_SQL.
-                cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
-            elif action == "remove":
-                cur.execute(SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts))
-                self._note_removal_skipped(cur, "label", registry_id, close_ts)
-            elif action == "update":
-                with conn.transaction():
-                    with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
-                        changed = self._registry_listener._label_row_changed(
-                            dict_cur, registry_id, params
-                        )
-                    if changed:
-                        cur.execute(
-                            SCD2_CLOSE_LABEL_SQL, (close_ts, registry_id, close_ts)
-                        )
-                        cur.execute(SCD2_SNAPSHOT_LABEL_SQL, (*params, params[0]))
-                        self._note_version_skipped(cur, "label", registry_id, close_ts, params)
+        with conn.transaction(), conn.cursor() as cur:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as dict_cur:
+                if not self._row_changed(registry, dict_cur, registry_id, params):
+                    return
+            cur.execute(close_sql, (close_ts, registry_id, close_ts))
+            if not cur.rowcount:
+                # Nothing closed: possibly the id's first version ever.
+                params = self._first_version_params(cur, registry, registry_id, params)
+            cur.execute(insert_sql, (*params, params[0]))
+            self._note_version_skipped(cur, registry, registry_id, close_ts, params)
+
+    def _first_version_params(self, cur, registry: str, registry_id: str,
+                              params: tuple) -> tuple:
+        """Start an id's first version at its registry entry's created_at.
+
+        The event, and even more so the startup snapshot, arrives after HA has
+        written the entity's first states; a first version stamped then leaves
+        those states without metadata (issue #19). Only for an id with no
+        version at all: once one exists, earlier history is already described,
+        and a gap after a removal is real.
+
+        Never later than the item's own valid_from. created_at is read from the
+        `extra` blob (last param), so items persisted by older versions get it too.
+        """
+        idx = _VALID_FROM_INDEX[registry]
+        created_at = _created_at(params[-1])
+        if created_at is None or created_at >= params[idx]:
+            return params
+        args = (registry_id, params[1]) if registry == "entity" else (registry_id,)
+        cur.execute(SCD2_ANY_VERSION_SQL[registry], args)
+        if cur.fetchone() is not None:
+            return params
+        return (*params[:idx], created_at, *params[idx + 1:])
+
+
+def _created_at(extra: object) -> datetime | None:
+    """Registry entry's created_at from the serialized extra blob, if usable.
+
+    HA's storage migrations set created_at to the Unix epoch for entries that
+    predate the field. That means "unknown", not 1970, so it is ignored.
+    """
+    try:
+        data = json.loads(extra) if isinstance(extra, str) else extra
+        raw = data.get("created_at") if isinstance(data, dict) else None
+        ts = datetime.fromisoformat(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return None
+    if ts is None or ts.tzinfo is None or ts.timestamp() <= 0:
+        return None
+    return ts
+

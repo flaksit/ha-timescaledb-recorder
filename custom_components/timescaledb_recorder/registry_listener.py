@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from itertools import chain
 from typing import Callable
 
 import attrs
@@ -26,6 +27,7 @@ from .const import (
     SELECT_AREA_CURRENT_SQL,
     SELECT_LABEL_CURRENT_SQL,
 )
+from .canonical import canonical, canonical_labels
 from .persistent_queue import PersistentQueue
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,8 +57,9 @@ def _build_extra(entry, exclude_keys: frozenset) -> str:
 
     Tries attrs.asdict() first (HA EntityEntry/DeviceEntry use @attr.s), then
     dataclasses.fields() for __slots__ dataclasses (AreaEntry, LabelEntry), then
-    falls back to __dict__ as a last resort.  The default=str encoder handles
-    HA-specific types (sets, enums, datetime, nested dataclasses).
+    falls back to __dict__ as a last resort. Sets become sorted lists; the
+    default=str encoder handles the remaining HA types (enums, datetime,
+    nested dataclasses).
     """
     try:
         raw = attrs.asdict(entry)
@@ -73,7 +76,7 @@ def _build_extra(entry, exclude_keys: frozenset) -> str:
         k: v for k, v in raw.items()
         if k not in exclude_keys and not k.startswith("_")
     }
-    return json.dumps(filtered, default=str)
+    return json.dumps(canonical(filtered), default=str)
 
 
 # Fields present in extra that change on every HA internal registry write without
@@ -88,13 +91,16 @@ def _extra_changed(stored, new_json: str) -> bool:
     `stored` may be a str or dict (DB drivers may return JSONB columns as either).
     Ignores fields in _EXTRA_COMPARE_IGNORE (e.g. modified_at) which HA updates
     on every internal write regardless of whether user-visible metadata changed.
+    Stored rows are canonical (migrations.canonicalize_dimension_rows), so the
+    parsed objects compare directly.
     """
     stored_dict = json.loads(stored) if isinstance(stored, str) else (stored or {})
     new_dict = json.loads(new_json)
-    return (
-        {k: v for k, v in stored_dict.items() if k not in _EXTRA_COMPARE_IGNORE}
-        != {k: v for k, v in new_dict.items() if k not in _EXTRA_COMPARE_IGNORE}
-    )
+    return _without_ignored(stored_dict) != _without_ignored(new_dict)
+
+
+def _without_ignored(extra: dict) -> dict:
+    return {k: v for k, v in extra.items() if k not in _EXTRA_COMPARE_IGNORE}
 
 
 def _to_json_safe(params: tuple | list | None) -> list | None:
@@ -115,32 +121,23 @@ class RegistryListener:
     """Thin HA registry event relay that enqueues JSON-safe dicts for MetaWorker.
 
     Lifecycle:
-    - async_start(): register event listeners in DISCARD mode — events are dropped
-      until enable() is called. This allows subscription before the registry backfill
-      completes without risking out-of-order SCD2 writes.
-    - enable(): flip from DISCARD to LIVE — called by _async_meta_init after the
-      persistent queue drain and initial registry backfill complete.
-    - async_stop(): cancel all event subscriptions.
+    - async_start(): register event listeners; every event is enqueued from here on.
+    - enqueue_snapshot(): called once HA has started, to append the startup
+      registry snapshot and removal sweeps to the same ordered stream.
+    - async_stop(): cancel all event subscriptions and flush.
 
     Design boundary (D-08): registry param extraction MUST happen in @callback context
     (event loop). DB writes and change-detection reads run in the meta worker thread.
 
-    DISCARD mode rationale: the initial registry backfill (_async_initial_registry_backfill)
-    snapshots the current registry state via SCD2_SNAPSHOT (WHERE NOT EXISTS, idempotent).
-    Any registry change event that fires during the drain+backfill window would be
-    processed before the snapshot row exists, causing the SCD2 close/insert to target
-    a non-existent row. DISCARD mode eliminates this ordering hazard. The backfill
-    captures the registry state at snapshot time; changes after enable() flow normally.
-
-    What DISCARD costs, stated plainly because it is a real hole and not a
-    rounding error (issue #19): the snapshot reads the registries as they are
-    when it runs, so a create or an update inside the window is picked up by it.
-    A REMOVAL is not — the entry is already gone, the snapshot has nothing to
-    see, and the open row stays open indefinitely, so the dimension goes on
-    claiming the thing exists. An entity created and deleted inside the window
-    is never recorded at all. Fixing it means buffering the window's events and
-    enqueuing them ahead of the snapshot; that is issue #19's job, not this
-    class's docstring.
+    Startup (issue #19): there is no window in which events are dropped. Every
+    item the worker applies reconciles — insert when no open row exists, nothing
+    when the open row already matches, close+insert when it differs — and a
+    remove with no open row closes nothing. So an event processed before the
+    snapshot is safe, and the snapshot repairs whatever drifted while HA was not
+    running. A change made while HA was down is therefore stamped with the
+    snapshot time, not the time it happened. So is a removal while HA was down:
+    the sweep after the snapshot closes every open row whose id the registry no
+    longer has.
 
     Event ordering (issue #17): handlers append to an in-memory buffer synchronously
     and a single drain task moves the buffer to the PersistentQueue. Each handler
@@ -168,9 +165,6 @@ class RegistryListener:
         self._device_reg = None
         self._area_reg = None
         self._label_reg = None
-        # DISCARD mode: events are dropped until enable() is called. Prevents
-        # out-of-order SCD2 writes during the initial drain+backfill window.
-        self._enabled: bool = False
         # Ordered hand-off to the meta queue (issue #17). Handlers append here
         # synchronously; _drain_loop is the only reader and the only writer to
         # the PersistentQueue, so event order survives all the way to the worker.
@@ -188,11 +182,62 @@ class RegistryListener:
         """
         self._meta_queue = q
 
-    def enable(self) -> None:
-        """Flip from DISCARD to LIVE mode. Called by _async_meta_init after
-        persistent queue drain and initial registry backfill complete.
+    @callback
+    def enqueue_snapshot(self) -> None:
+        """Append one "snapshot" item per registry entry, then one "sweep" per registry.
+
+        Read, stamped and buffered in one synchronous step, so every event item
+        already buffered is stamped earlier and every later one later: the
+        worker sees them in timestamp order. Going straight to the queue instead
+        would race the drain task and could put an earlier event behind the
+        snapshot, where the ordering guard would refuse it as out of order.
+
+        A sweep carries the registry's live ids; the worker closes every open
+        row outside them, i.e. entries removed while HA was not running.
+
+        Area → label → entity → device: referenced rows land before referencing ones.
         """
-        self._enabled = True
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        sources = (
+            ("area", self._area_reg.async_list_areas(), self._extract_area_params,
+             lambda e: e.id),
+            ("label", self._label_reg.async_list_labels(), self._extract_label_params,
+             lambda e: e.label_id),
+            ("entity", self._entity_reg.entities.values(), self._extract_entity_params,
+             lambda e: e.entity_id),
+            # Child devices are a separate collection, but share device ids and
+            # events with main devices; leaving them out would sweep them closed.
+            ("device", chain(self._device_reg.devices, self._device_reg.child_devices),
+             self._extract_device_params, lambda e: e.id),
+        )
+        items: list[dict] = []
+        sweeps: list[dict] = []
+        for registry, entries, extract, key in sources:
+            entries = list(entries)
+            items.extend(
+                {
+                    "registry": registry,
+                    "action": "snapshot",
+                    "registry_id": key(entry),
+                    "old_id": None,
+                    "params": _to_json_safe(extract(entry, now)),
+                    "enqueued_at": now_iso,
+                }
+                for entry in entries
+            )
+            sweeps.append({
+                "registry": registry,
+                "action": "sweep",
+                "registry_id": None,
+                "old_id": None,
+                "params": None,
+                "live_ids": sorted({key(entry) for entry in entries}),
+                "enqueued_at": now_iso,
+            })
+        # One buffer append → one put_many_async → one fsync (issue #11).
+        self._buffer.extend(items + sweeps)
+        self._buffer_ready.set()
 
     @callback
     def _enqueue(self, item: dict) -> None:
@@ -300,12 +345,7 @@ class RegistryListener:
                 "Enqueue of %d registry item(s) failed during shutdown", len(batch))
 
     async def async_start(self) -> None:
-        """Cache registry references and register event listeners in DISCARD mode.
-
-        Listeners are registered immediately so subscription starts as early as
-        possible, but events are silently dropped until enable() is called.
-        This matches the startup flow described in RegistryListener class docstring.
-        """
+        """Cache registry references and register event listeners."""
         self._entity_reg = er.async_get(self._hass)
         self._device_reg = dr.async_get(self._hass)
         self._area_reg = ar.async_get(self._hass)
@@ -352,8 +392,9 @@ class RegistryListener:
         """
         name = entry.name if entry.name is not None else entry.original_name
         domain = entry.entity_id.split(".")[0]
-        # Convert set to list — psycopg3 requires list for TEXT[] columns
-        labels = list(entry.labels)
+        # psycopg3 needs a list for TEXT[]; sorted so the stored array does not
+        # depend on PYTHONHASHSEED (the repair SQL compares arrays element-wise).
+        labels = canonical_labels(list(entry.labels))
         disabled_by = entry.disabled_by.value if entry.disabled_by is not None else None
         extra = _build_extra(entry, _ENTITY_TYPED_KEYS)
         return (
@@ -377,14 +418,18 @@ class RegistryListener:
 
         $1=device_id, $2=name, $3=manufacturer, $4=model,
         $5=area_id, $6=labels, $7=valid_from, $8=extra
+
+        A ChildDeviceEntry has no manufacturer/model; reading them anyway goes
+        through HA's deprecation shim, which logs a warning per access.
         """
-        labels = list(entry.labels)
+        labels = canonical_labels(list(entry.labels))
         extra = _build_extra(entry, _DEVICE_TYPED_KEYS)
+        is_child = isinstance(entry, dr.ChildDeviceEntry)
         return (
             entry.id,
             entry.name,
-            entry.manufacturer,
-            entry.model,
+            None if is_child else entry.manufacturer,
+            None if is_child else entry.model,
             entry.area_id,
             labels,
             valid_from,
@@ -498,8 +543,6 @@ class RegistryListener:
     @callback
     def _handle_entity_registry_updated(self, event: Event) -> None:
         """Extract entity registry params and enqueue to PersistentQueue (D-08: extract in event loop)."""
-        if not self._enabled:
-            return
         action = event.data["action"]
         entity_id = event.data["entity_id"]
         old_entity_id = event.data.get("old_entity_id")
@@ -536,8 +579,6 @@ class RegistryListener:
     @callback
     def _handle_device_registry_updated(self, event: Event) -> None:
         """Extract device registry params and enqueue to PersistentQueue."""
-        if not self._enabled:
-            return
         action = event.data["action"]
         device_id = event.data["device_id"]
 
@@ -576,8 +617,6 @@ class RegistryListener:
         Reorder events (action="reorder") are skipped — these only affect UI ordering,
         contain no data change, and have area_id=None which would produce a corrupt item.
         """
-        if not self._enabled:
-            return
         action = event.data["action"]
         if action == "reorder":
             return
@@ -618,8 +657,6 @@ class RegistryListener:
     @callback
     def _handle_label_registry_updated(self, event: Event) -> None:
         """Extract label registry params and enqueue to PersistentQueue."""
-        if not self._enabled:
-            return
         action = event.data["action"]
         label_id = event.data["label_id"]
 

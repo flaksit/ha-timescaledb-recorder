@@ -13,7 +13,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 
 ## Prerequisites
 
-- Home Assistant 2024.1 or later
+- Home Assistant 2026.10.1 or later
 - The built-in HA recorder integration must be enabled — the integration uses the recorder's Python API for automatic gap detection and backfill (any recorder backend works).
 - The standalone [`backfill_gaps.py`](#backfilling-historical-gaps) (optional use) script requires the default SQLite backend.
 - A running PostgreSQL + TimescaleDB instance > 2.18 (the [TimescaleDB HA app](https://github.com/flaksic/hass-timescaledb) is the intended companion)
@@ -117,6 +117,14 @@ CREATE TABLE IF NOT EXISTS states (
 
 **Index** — `idx_states_entity_time ON states (entity_id, last_updated DESC)` for fast per-entity time-series lookups.
 
+### When a state row cannot be written
+
+Connection loss, timeouts, deadlocks, server-internal errors (SQLSTATE class XX) and other transient database errors are retried until they succeed. Any other error is taken to mean the data itself is rejected (for example a NUL character in an attribute). Once the batch has failed at least 3 times over at least 60 seconds it is retried row by row. If rows of 5 different entities all fail, the database rather than the rows is blamed: nothing is dropped, the batch goes back to retrying (raising the stalled repair issue) and the row-by-row pass is tried again later. Otherwise each row that still fails, again after 3 attempts over 60 seconds, goes to the **`states_deadletter`** table (entity, timestamp, error, full row as JSON text) and raises a `states_dropped` repair issue, so ingestion carries on. The issue does not clear itself:
+
+```sql
+SELECT detected_at, entity_id, last_updated, error FROM states_deadletter ORDER BY detected_at DESC;
+```
+
 ### Convenience views
 
 `state` is TEXT because HA states are untyped — the same column holds `"23.5"`, `"on"`, and `"unavailable"`. Two views are created alongside the tables so queries don't have to re-derive the numeric cast:
@@ -215,7 +223,7 @@ This enables historically correct joins: for any row in `states`, you can join t
 
 All four tables follow the same SCD2 pattern. The current row for any object has `valid_to IS NULL`. When metadata changes, the existing row is closed (`valid_to` set to the timestamp of the change) and a new row is inserted (`valid_from` = that same timestamp, `valid_to = NULL`). Historical rows are never deleted.
 
-Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`.
+Every table also carries an `extra` JSONB column that stores the full registry object serialisation. This column is for forward-compatibility — when HA adds or renames internal fields across versions, the typed columns remain stable while the raw data is still accessible via `extra`. Set-valued fields (e.g. `identifiers`, `connections`, `aliases`) are stored as sorted JSON arrays, and `labels` arrays are sorted (code point order). Rows written by older versions hold sets as Python set strings such as `"{'a', 'b'}"`, in arbitrary order, and may hold unsorted `labels`. On its first start after the upgrade the metadata worker rewrites those rows once, before processing any registry change: only `extra` and `labels` change, never `valid_from`/`valid_to`, and the `schema_migrations` table records that it ran so later starts skip it.
 
 #### entities
 
@@ -237,6 +245,8 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 | `extra` | JSONB | Full registry entry serialisation |
 
 #### devices
+
+Child devices (HA 2026.10+) are stored here too; their `manufacturer` and `model` are NULL and `extra` carries `parent_device_id`.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -273,30 +283,32 @@ Every table also carries an `extra` JSONB column that stores the full registry o
 
 ### How it works
 
-On integration load, a full snapshot of all four registries is taken and inserted into the dimension tables. The snapshot uses idempotent `WHERE NOT EXISTS` inserts so restarting the integration never creates duplicate open rows.
-
-After the snapshot, the integration subscribes to four HA registry events:
+On integration load, the integration subscribes to four HA registry events:
 
 - `EVENT_ENTITY_REGISTRY_UPDATED`
 - `EVENT_DEVICE_REGISTRY_UPDATED`
 - `EVENT_AREA_REGISTRY_UPDATED`
 - `EVENT_LABEL_REGISTRY_UPDATED`
 
-Each event triggers the SCD2 close-and-insert cycle: the open row is closed and a new row inserted, both stamped with the time the event fired, so each interval ends exactly where its successor begins. Events are written in arrival order. Entity renames (entity_id changes) close the old entity_id row and open one under the new entity_id.
+Each event triggers the SCD2 close-and-insert cycle: the open row is closed and a new row inserted, both stamped with the time the event fired, so each interval ends exactly where its successor begins. Events are written in arrival order. Entity renames (entity_id changes) close the old entity_id row and open one under the new entity_id. A change that leaves the stored metadata unchanged writes nothing.
 
-The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates.
+Once HA has started, a snapshot of all four registries is queued behind the events received so far, stamped with the snapshot time. Each entry is reconciled against its open row: missing → inserted, equal → nothing, different → closed and replaced. So a restart repairs any drift, and a change made while HA was down is recorded at the restart time, not when it happened. Events are recorded from integration load on, so changes during startup are not lost.
+
+An id's first version starts at the registry entry's `created_at` rather than the event or snapshot time, so the states HA writes before announcing a new entity are covered. This only applies when the id has no earlier version (for entities: neither the entity_id nor the registry uuid), never to a rename, and never to entries whose `created_at` is HA's 1970 placeholder for "unknown".
+
+After the snapshot, each registry's open rows whose id the registry no longer holds are closed at the snapshot time, so an entry removed while HA was down ends there. As a safeguard nothing is closed when a registry lists no entries while its table has open rows (logged as a warning), and a sweep that would close more than half of a table's open rows (and more than 2) is refused and goes to `metadata_deadletter` with reason `sweep_refused`, raising the `metadata_dropped` repair issue. A refused sweep is retried, and refused again, on every restart until the rows are closed by hand or the registry lists them again.
+
+The dimension tables are created idempotently on every integration startup (same as `states`), so no manual schema migration is needed after updates. Registry changes queue on disk until that setup has finished.
 
 ### When a change cannot be written
 
-A registry change is dropped instead of retried when the exclusion constraint rejects it, or when a newer version of the same id is already stored. The item goes to the **`metadata_deadletter`** table (reason, registry, id, full item as JSONB) and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
+A registry change is dropped instead of retried when the exclusion constraint rejects it, when a newer version of the same id is already stored, or when it fails at least 3 times over at least 60 seconds with a non-transient error (anything other than connection loss, timeouts, deadlocks, server-internal errors and similar, which are retried until they succeed). There is no circuit breaker here as for state rows: the startup snapshot re-reads every registry, so after a restart the current version of every existing entry is written again and removed entries are closed; only intermediate versions and the exact time of removals are lost. The item goes to the **`metadata_deadletter`** table (reason, registry, id, full item as JSONB) and a `metadata_dropped` repair issue appears in Home Assistant. The issue does not clear itself. Inspect the table, fix the cause, and re-apply the change by editing the entity, device, area or label in HA:
 
 ```sql
 SELECT detected_at, reason, registry_id, error FROM metadata_deadletter ORDER BY detected_at DESC;
 ```
 
 The table is normally empty. Each row is a gap in the dimension history, shown as NULL metadata in `states_flat`.
-
-Registry changes during startup, before the initial snapshot completes, are discarded. Creates and updates are picked up by the snapshot; a **removal** is lost and the row stays open ([#19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19)).
 
 ### The invariant
 
@@ -324,6 +336,51 @@ A hand-written inner join on the dimensions drops state rows no version covers (
 
 This integration runs alongside the built-in recorder — it does not replace it. Both can have independent entity filter configurations.
 
+## Monitoring
+
+### Diagnostic entities
+
+All on the "TimescaleDB Recorder" device:
+
+| Entity | Shows |
+|--------|-------|
+| Health | `ok` / `degraded` / `error` rollup of the repair issues below and worker liveness |
+| DB Status | `connected` / `disconnected` / `stalled` |
+| Last Write | Timestamp of the last successful states insert, refreshed every 60 s. Alert on it: it keeps moving only while data is actually written |
+| Queue Depth Peak, Events Dropped, Meta Queue Depth | Buffer pressure |
+| States Worker, Metadata Worker | Worker thread alive |
+| Buffer Overflow | Live buffer full and dropping (recovered by backfill) |
+
+Example alert when nothing was written for 15 minutes:
+
+```yaml
+template:
+  - trigger:
+      - trigger: time_pattern
+        minutes: "/5"
+    binary_sensor:
+      - name: TimescaleDB writes stale
+        state: >
+          {{ now() - states('sensor.timescaledb_recorder_last_write') | as_datetime(now()) > timedelta(minutes=15) }}
+```
+
+### Repair issues
+
+| Issue | Severity | Raised when | Clears |
+|-------|----------|-------------|--------|
+| `states_worker_stalled`, `meta_worker_stalled` | error | 5 consecutive failed writes | on next success |
+| `db_unreachable` | error | writes failing for 5 min | on next success |
+| `ingestion_stalled` | error | a worker made no progress for 10 min without an error: a DB call still in flight, or the states worker waiting for backfill data | when the worker moves again |
+| `buffer_dropping` | warning | live buffer full | when the catch-up backfill starts |
+| `states_dropped`, `metadata_dropped` | error | data rejected and dead-lettered | never (inspect the dead-letter table) |
+| `recorder_disabled` | warning | HA recorder not loaded | when it loads |
+
+A worker thread that dies is restarted by the watchdog with a persistent notification.
+
+### Database timeouts
+
+Every worker connection bounds its waits so a hang turns into a logged, retried error: TCP keepalives (dead connection detected after ~60 s idle), `tcp_user_timeout` 60 s, `connect_timeout` 10 s, and `statement_timeout` 5 min for reads and writes (schema setup at startup, the one-time canonicalization of dimension rows and the backfill's scan of all known entity ids run without it, since DDL on a large table and work that grows with history can take longer; the watchdog still reports either if it runs past 10 min). Values you set in the DSN win, e.g. `postgresql://...?keepalives_idle=120&options=-c%20statement_timeout%3D600000`. A `statement_timeout` configured on the role or database is kept too. These are session settings, so connect directly or through a pooler in session mode (PgBouncer `pool_mode = session`); transaction or statement pooling is not supported.
+
 ## Troubleshooting
 
 **Cannot connect to TimescaleDB**
@@ -337,6 +394,13 @@ This integration runs alongside the built-in recorder — it does not replace it
 - Open the HA log viewer and filter for `custom_components.timescaledb_recorder` — any connection errors appear here
 - Check your entity filter: if you added an `include` block, only listed domains/entities are written
 - The default `flush_interval` is 10 seconds — wait at least 10 seconds after a state change before querying
+
+**Writes stopped (`ingestion_stalled` repair issue, Last Write not advancing)**
+
+- The issue and the log line `Ingestion stalled: ...` name the worker and the DB call or wait. A call should end within the timeouts above; one that does not points at the network path or a server-side wait the timeouts did not cover
+- Look for the worker's session on the server: `SELECT pid, state, wait_event_type, wait_event, now() - query_start AS running, query FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() ORDER BY query_start;`
+- `schema_setup` on a large table after an upgrade can legitimately take this long — wait for it
+- Otherwise reload the integration. The gap is backfilled from HA's recorder as long as it still holds the data (`purge_keep_days`)
 
 **Slow writes or high latency**
 
@@ -392,6 +456,7 @@ Order matters:
 - **Install 2.4.0 before repairing.** Older versions retry rejected writes forever, so the new constraints would wedge their metadata queue. Without the constraints (`--no-constraints`) the history re-corrupts.
 - **Keep steps 1–3 close together.** 2.4.0 redefines `states_flat` to join `valid_to` literally, so it duplicates rows until the repair runs.
 - **Restart after `--apply`.** The startup snapshot re-creates a current version for ids the repair left without one (see Fidelity below).
+- **`--dry-run` and `--apply` refuse (exit 2) until the integration has canonicalized the dimension rows**, which it does once on startup (step 1). They compare row payloads, and rows in the old set-string form would make identical versions look different. `--verify-only` compares intervals only and always runs.
 
 **Downgrading below 2.4.0** after the constraints are in place: first `ALTER TABLE <t> DROP CONSTRAINT excl_<t>_period` for `entities`, `devices`, `areas` and `labels`, or the old writer wedges as above.
 
@@ -406,7 +471,7 @@ Order matters:
 | `--no-constraints` | off | Repair without adding the exclusion constraints |
 | `--yes` | off | Skip the `--apply` confirmation. Required without a terminal |
 
-Exit codes: 0 invariant holds; 1 invariant violated, or a table still fails verification or its constraint could not be created; 2 `valid_from` itself looks unsound — stop and investigate. Ambiguity, Fidelity and Coverage findings do not change the exit code; read them. `--collapse-duplicates` and `--merge-identical-gaps` also work on an already-repaired database, so `--dry-run`, then `--apply --merge-identical-gaps` after reading Fidelity, is a valid sequence.
+Exit codes: 0 invariant holds; 1 invariant violated, or a table still fails verification or its constraint could not be created; 2 `valid_from` itself looks unsound — stop and investigate — or the dimension rows are not canonicalized yet (start the updated integration first). Ambiguity, Fidelity and Coverage findings do not change the exit code; read them. `--collapse-duplicates` and `--merge-identical-gaps` also work on an already-repaired database, so `--dry-run`, then `--apply --merge-identical-gaps` after reading Fidelity, is a valid sequence.
 
 ### What it does
 
@@ -415,7 +480,7 @@ Each version's `valid_to` is set to the next version's `valid_from`. Only `valid
 Two exceptions write `valid_from`, both for first versions only:
 
 - An entity whose first version starts before its device's first version, typically left by a history import that backdated entities but not devices, is moved later to the device's start — but never past the entity's first recorded state, and not if that would empty the version.
-- A first version that starts after the entity's first state is moved back to that state, if the registry entry's `created_at` shows it already existed then. This happens because the version is stamped when the integration hears of the entity, which is just after the first state, or ~30 s later for entities created during HA startup ([#19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19)). The entity's device follows, but never before its own `created_at`.
+- A first version that starts after the entity's first state is moved back to that state, if the registry entry's `created_at` shows it already existed then. Up to 2.4.1 the version was stamped when the integration heard of the entity, just after the first state, or ~30 s later for entities created during HA startup ([#19](https://github.com/flaksit/ha-timescaledb-recorder/issues/19)); first versions now start at `created_at`. The entity's device follows, but never before its own `created_at`.
 
 Each table is first copied to `<table>_prerepair_<utc timestamp>`, the only full record of the old values; drop those once satisfied. Deleted or clamped rows, and rows whose start moved, are also archived as JSONB in `scd2_repair_quarantine`, tagged with the run id.
 

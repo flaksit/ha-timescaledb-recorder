@@ -20,6 +20,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -29,22 +30,27 @@ from psycopg.types.json import Jsonb
 from homeassistant.core import HomeAssistant
 
 from .backfill import BACKFILL_DONE
+from .db import DbCallTracker, connect, statement_timeout_lifted
 from .const import (
     BATCH_FLUSH_SIZE,
+    DEADLETTER_REASON_POISON,
     FLUSH_INTERVAL,
     INSERT_CHUNK_SIZE,
     INSERT_LIVE_SQL,
     INSERT_SQL,
+    POISON_PROBE_ROWS,
     SELECT_ALL_KNOWN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
+    STATES_DEADLETTER_INSERT_SQL,
 )
 from .issues import (
     clear_db_unreachable_issue,
     clear_states_worker_stalled_issue,
     create_db_unreachable_issue,
+    create_states_dropped_issue,
     create_states_worker_stalled_issue,
 )
-from .retry import retry_until_success
+from .retry import NotPoison, is_transient, retry_until_success
 from .schema import sync_setup_schema
 from .worker import StateRow
 
@@ -61,6 +67,13 @@ def _json_default(obj: object) -> str:
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     return str(obj)
+
+
+@dataclass
+class StatesWriteStats:
+    """Write progress that must outlive a respawned worker (kept on runtime data)."""
+
+    last_write_at: datetime | None = None  # wall clock of the last successful insert
 
 
 # State-machine modes (D-04-b). String-valued for log readability.
@@ -87,6 +100,8 @@ class TimescaledbStateRecorderThread(threading.Thread):
         *,
         chunk_interval_days: int,
         compress_after_hours: int,
+        stats: StatesWriteStats | None = None,
+        schema_ready: threading.Event | None = None,
     ) -> None:
         super().__init__(daemon=True, name="timescaledb_states_worker")
         self._hass = hass
@@ -98,6 +113,13 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._chunk_interval_days = chunk_interval_days
         self._compress_after_hours = compress_after_hours
         self._conn: psycopg.Connection | None = None
+        self.stats = stats if stats is not None else StatesWriteStats()
+        self._schema_ready = schema_ready if schema_ready is not None else threading.Event()
+        # Watchdog-readable hang detection (issue #14): calls in flight, and
+        # since when the worker has been waiting on the backfill queue (None
+        # outside MODE_BACKFILL or while it is writing a slice).
+        self.db_calls = DbCallTracker()
+        self.backfill_wait_since: float | None = None
 
         # D-06-b: watchdog-readable post-mortem context. Initialized to safe defaults
         # so watchdog can always read these attributes even if run() never executes.
@@ -115,6 +137,9 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._last_op: str = "unknown"
         self._last_mode: str = "init"
         self._last_retry_attempt: int | None = None
+        # Rows given up on after repeated non-transient errors (issue #20).
+        # In-process only; states_deadletter is the durable record.
+        self.rows_dropped: int = 0
 
         # D-03 / D-07 wiring: retry_until_success with full Phase 3 hook set.
         # Wrapping at class-body time would fix `self` too early; __init__ ensures
@@ -125,7 +150,8 @@ class TimescaledbStateRecorderThread(threading.Thread):
             notify_stall=self._stall_hook,
             on_recovery=self._recovery_hook,
             on_sustained_fail=self._sustained_fail_hook,
-        )(self._insert_chunk_raw)
+            on_poison=self._insert_rows_individually,
+        )(self.db_calls.track(self._insert_chunk_raw))
 
         # D-03-c: watermark read uses same retry shape as writes (owns a connection,
         # so on_transient resets it). No stall/recovery hooks — a persistently
@@ -136,7 +162,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self.read_watermark = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-        )(self._read_watermark_raw)
+        )(self.db_calls.track(self._read_watermark_raw))
 
         # Schema setup: retry on transient DB failure at startup (Issue #12).
         # No stall/recovery hooks — schema setup is a one-time startup op; a
@@ -145,7 +171,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._setup_schema = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-        )(self._setup_schema_raw)
+        )(self.db_calls.track(self._setup_schema_raw))
 
         # read_all_known_entities: called by orchestrator via executor job at backfill
         # start; must retry on transient errors to avoid a bare DB failure escaping
@@ -153,17 +179,34 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self.read_all_known_entities = retry_until_success(
             stop_event=stop_event,
             on_transient=self.reset_db_connection,
-        )(self._read_all_known_entities_raw)
+        )(self.db_calls.track(self._read_all_known_entities_raw))
+
+        # Per-row fallback for a poison chunk (issue #20): same hooks, so a
+        # transient failure here still retries and stalls like a chunk would;
+        # only a row that keeps failing non-transiently is dropped.
+        self._insert_row = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+            notify_stall=self._stall_hook,
+            on_recovery=self._recovery_hook,
+            on_sustained_fail=self._sustained_fail_hook,
+            on_poison=self._drop_row,
+        )(self.db_calls.track(self._insert_row_raw))
+
+    @property
+    def in_backfill(self) -> bool:
+        """True while the worker consumes backfill_queue and waits for BACKFILL_DONE."""
+        return self._last_mode == MODE_BACKFILL
 
     # ------------------------------------------------------------------
     # Connection management (D-07-g)
     # ------------------------------------------------------------------
 
     def get_db_connection(self) -> psycopg.Connection:
-        """Lazily open the psycopg3 connection. Reconnect handled by the
-        retry decorator via reset_db_connection → next call reopens."""
+        """Lazily open the connection via db.connect (bounded waits). Reconnect
+        handled by the retry decorator via reset_db_connection → next call reopens."""
         if self._conn is None:
-            self._conn = psycopg.connect(self._dsn, autocommit=True)
+            self._conn = connect(self._dsn)
         return self._conn
 
     def reset_db_connection(self) -> None:
@@ -244,11 +287,14 @@ class TimescaledbStateRecorderThread(threading.Thread):
     def _setup_schema_raw(self) -> None:
         """Raw schema setup — wrapped by retry_until_success in __init__."""
         conn = self.get_db_connection()
-        sync_setup_schema(
-            conn,
-            chunk_interval_days=self._chunk_interval_days,
-            compress_after_hours=self._compress_after_hours,
-        )
+        # DDL and index builds on a large hypertable can outlast
+        # DB_STATEMENT_TIMEOUT_MS; a timeout here would retry them forever.
+        with statement_timeout_lifted(conn):
+            sync_setup_schema(
+                conn,
+                chunk_interval_days=self._chunk_interval_days,
+                compress_after_hours=self._compress_after_hours,
+            )
 
     def run(self) -> None:
         """Thread entry point.
@@ -295,6 +341,9 @@ class TimescaledbStateRecorderThread(threading.Thread):
         in run() can wrap it cleanly (MEDIUM-8 pattern)."""
         self._last_op = "schema_setup"
         self._setup_schema()
+        # None from the retry wrapper also means "interrupted by shutdown".
+        if not self._stop_event.is_set():
+            self._schema_ready.set()
 
         mode = MODE_INIT
         self._last_mode = mode
@@ -313,6 +362,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 mode = MODE_BACKFILL
                 self._last_mode = mode
                 last_flush = time.monotonic()
+                self.backfill_wait_since = last_flush
                 continue
 
             if mode == MODE_BACKFILL:
@@ -321,6 +371,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 except queue.Empty:
                     continue  # D-04-f: timeout allows stop_event check
                 if item is BACKFILL_DONE:
+                    self.backfill_wait_since = None
                     if buffer:
                         self._last_op = "flush_backfill_done"
                         self._flush(buffer)
@@ -330,11 +381,14 @@ class TimescaledbStateRecorderThread(threading.Thread):
                     last_flush = time.monotonic()
                     continue
                 # item is dict[entity_id, list[HA State]] (D-04-d)
+                # Writing is not waiting: a slow write is the in-flight check's job.
+                self.backfill_wait_since = None
                 rows = self._slice_to_rows(item)
                 buffer.extend(rows)
                 self._last_op = "flush_backfill_chunk"
                 self._flush(buffer)
                 buffer.clear()
+                self.backfill_wait_since = time.monotonic()
                 continue
 
             # MODE_LIVE: adaptive-timeout flushing (D-04-e fix)
@@ -395,6 +449,98 @@ class TimescaledbStateRecorderThread(threading.Thread):
         conn = self.get_db_connection()
         with conn.cursor() as cur:
             cur.executemany(sql, params)
+        self.stats.last_write_at = datetime.now(timezone.utc)
+
+    def _insert_row_raw(self, row: StateRow) -> None:
+        """Raw single-row insert. Wrapped by retry_until_success in __init__."""
+        self._insert_chunk_raw([row])
+
+    def _insert_rows_individually(self, exc: Exception, chunk: list[StateRow]) -> None:
+        """on_poison hook for a chunk: retry its rows one at a time.
+
+        executemany fails the whole chunk for one bad row, so this isolates the
+        bad rows instead of dropping their neighbours.
+
+        Circuit breaker: rows of POISON_PROBE_ROWS distinct entities are tried
+        once each first. If none lands, the database is the likelier fault (a
+        missing table, an unknown TimescaleDB error), so nothing is dropped:
+        NotPoison sends the whole chunk back to retrying. A chunk with fewer
+        distinct entities skips the probe, since one bad entity could fill it.
+        """
+        _LOGGER.warning(
+            "%s: chunk of %d rows failed non-transiently (%r); inserting row by row",
+            self.name, len(chunk), exc,
+        )
+        landed = self._probe_rows(chunk)
+        for row in chunk:
+            if self._stop_event.is_set():
+                return
+            if row is not landed:
+                self._insert_row(row)
+
+    def _probe_rows(self, chunk: list[StateRow]) -> StateRow | None:
+        """Try one row per entity until one lands; return it (None: no probe).
+
+        Raises NotPoison if every probe fails, or on a transient failure.
+        """
+        probe: dict[str, StateRow] = {}
+        for row in chunk:
+            probe.setdefault(row.entity_id, row)
+            if len(probe) == POISON_PROBE_ROWS:
+                break
+        else:
+            return None
+        for row in probe.values():
+            if self._stop_event.is_set():
+                return None
+            try:
+                with self.db_calls.call("insert_row_probe"):
+                    self._insert_row_raw(row)
+            except Exception as probe_exc:  # noqa: BLE001 — classified below
+                self.reset_db_connection()
+                if is_transient(probe_exc):
+                    raise NotPoison(f"transient error while probing rows: {probe_exc!r}") from probe_exc
+                continue
+            return row
+        raise NotPoison(
+            f"rows of {POISON_PROBE_ROWS} different entities all failed; "
+            "treating it as a database fault, not bad rows"
+        )
+
+    def _drop_row(self, exc: Exception, row: StateRow) -> None:
+        """on_poison hook for a row: count, log, dead-letter and surface it."""
+        self.rows_dropped += 1
+        _LOGGER.error(
+            "%s: dropping state row entity_id=%s last_updated=%s after repeated "
+            "non-transient errors (total dropped: %d): %r",
+            self.name, row.entity_id, row.last_updated.isoformat(),
+            self.rows_dropped, exc,
+        )
+        row_data = json.dumps(
+            {
+                "entity_id": row.entity_id,
+                "state": row.state,
+                "attributes": row.attributes,
+                "last_updated": row.last_updated,
+                "last_changed": row.last_changed,
+            },
+            default=_json_default,
+        )
+        try:
+            with self.db_calls.call("dead_letter"):
+                conn = self.get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        STATES_DEADLETTER_INSERT_SQL,
+                        (DEADLETTER_REASON_POISON, row.entity_id, row.last_updated,
+                         repr(exc), row_data),
+                    )
+        except Exception:  # noqa: BLE001 — the row is already given up on
+            _LOGGER.error(
+                "%s: could not dead-letter the dropped row; it now exists only in "
+                "this log: %s", self.name, row_data, exc_info=True,
+            )
+        self._hass.add_job(create_states_dropped_issue, self._hass)
 
     def _slice_to_rows(self, slice_dict: dict) -> list[StateRow]:
         """Merge per-entity lists, sort by last_updated, convert to StateRow (D-04-d)."""
@@ -436,8 +582,12 @@ class TimescaledbStateRecorderThread(threading.Thread):
         backfilling for the period before removal.
         states uses GROUP BY (not DISTINCT) to force index-based grouping
         before the UNION deduplication step — plain UNION causes a full scan.
+
+        Runs without statement_timeout: the scan grows with the hypertable, and
+        a timeout would turn it into a retry loop that never succeeds. A truly
+        hung read still shows up through db_calls in the watchdog.
         """
         conn = self.get_db_connection()
-        with conn.cursor() as cur:
+        with statement_timeout_lifted(conn), conn.cursor() as cur:
             cur.execute(SELECT_ALL_KNOWN_ENTITIES_SQL)
             return {row[0] for row in cur.fetchall()}

@@ -43,8 +43,55 @@ BACKFILL_QUEUE_MAXSIZE: int = 2   # D-01-b: backpressure cap for backfill_queue
 #   db_unreachable repair issue is raised via retry decorator's
 #   on_sustained_fail hook (D-11).
 STALL_THRESHOLD: int = 5
+# POISON_MAX_ATTEMPTS — consecutive non-transient failures after which a
+#   retry_until_success wrapper with an on_poison hook gives up on its input
+#   (issue #20), once they also span POISON_MIN_SECONDS. The time floor gives an
+#   environmental error the classifier does not know (e.g. a TimescaleDB TSxxx
+#   code) a minute to clear before data is dropped. The stall hook is held back
+#   while such a streak is pending, so a poison item does not raise the stalled
+#   repair issue on its way out.
+POISON_MAX_ATTEMPTS: int = 3
+POISON_MIN_SECONDS: float = 60.0
+# POISON_PROBE_ROWS — states per-row fallback circuit breaker. If this many rows
+#   of distinct entities in a poison chunk all fail non-transiently, the fault is
+#   taken to be the database, not the rows: nothing is dropped and the whole
+#   chunk is retried (stall hooks fire), with the per-row path tried again after
+#   the next poison window.
+POISON_PROBE_ROWS: int = 5
 WATCHDOG_INTERVAL_S: float = 10.0
 DB_UNREACHABLE_THRESHOLD_SECONDS: float = 300.0
+
+# Bounds on every blocking worker DB call (issue #14). A call that never returns
+# raises nothing, so neither the watchdog (thread still alive) nor the retry
+# decorator (no exception) notices it. Hypothesis for #14: a half-open TCP
+# connection (libpq's keepalive default is the OS one, 7200 s idle) or a lock
+# wait with no statement_timeout.
+#
+# libpq connection parameters, applied only where the user's DSN does not set
+# them. An idle connection whose peer vanished is declared dead after
+# 30 + 3 * 10 = 60 s; tcp_user_timeout covers the case keepalives cannot, unacked
+# data in flight (Linux only, ignored elsewhere). Neither applies to Unix sockets.
+DB_CONNECT_DEFAULTS: dict[str, int] = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 60_000,  # ms
+}
+# Session statement_timeout for worker reads and writes, so a lock wait becomes
+# QueryCanceled, which the retry decorator treats as transient (logged, stall
+# issue after STALL_THRESHOLD). Applied only when the session has none (DSN
+# options, role or database setting win). Generous: normal statements are
+# single-chunk writes and point reads.
+# Lifted for schema setup, whose DDL and index builds can legitimately run long,
+# and for SELECT_ALL_KNOWN_ENTITIES_SQL, which grows with the hypertable.
+DB_STATEMENT_TIMEOUT_MS: int = 300_000
+# A worker DB call in flight this long is reported as ingestion_stalled by the
+# watchdog. Comfortably above DB_STATEMENT_TIMEOUT_MS plus the TCP timeouts
+# above, so it fires only when those bounds failed. The same threshold applies
+# to the states worker waiting for backfill data that never comes.
+INGESTION_STALL_THRESHOLD_S: float = 600.0
 
 # Config keys
 CONF_DSN = "dsn"
@@ -373,9 +420,7 @@ WHERE label_id = %s AND valid_to IS NULL AND valid_from < %s;
 
 # Idempotent guarded inserts — the ONLY insert path for all four dimensions.
 #
-# WHERE NOT EXISTS(open row) serves two purposes. On the "create" path it means
-# re-running the startup snapshot does not duplicate rows for entities already
-# present. On the "update" paths it makes the close+insert pair replay-safe:
+# WHERE NOT EXISTS(open row) makes the close+insert pair replay-safe:
 # task_done() runs only after the write (meta_worker), so a crash between commit
 # and task_done replays the item. On replay the close matches nothing (its
 # valid_from < guard excludes the row just inserted) and this insert sees that
@@ -459,6 +504,65 @@ SCD2_OPEN_VERSION_SQL = {
     "area": "SELECT valid_from FROM areas WHERE area_id = %s AND valid_to IS NULL;",
     "label": "SELECT valid_from FROM labels WHERE label_id = %s AND valid_to IS NULL;",
 }
+
+# Has this id ever had a version, open or closed? Gates stamping a first version
+# with the registry entry's created_at (issue #19). The entity variant also
+# matches the registry uuid: an entity renamed while HA was down, or restored
+# from deleted_entities under a new entity_id, keeps its entry and created_at,
+# which then predates the new entity_id.
+# %s = id (entity: then %s = ha_entity_uuid).
+SCD2_ANY_VERSION_SQL = {
+    "entity": "SELECT 1 FROM entities WHERE entity_id = %s OR ha_entity_uuid = %s LIMIT 1;",
+    "device": "SELECT 1 FROM devices WHERE device_id = %s LIMIT 1;",
+    "area": "SELECT 1 FROM areas WHERE area_id = %s LIMIT 1;",
+    "label": "SELECT 1 FROM labels WHERE label_id = %s LIMIT 1;",
+}
+
+# Startup sweep (issue #19): close open rows whose id is no longer in the
+# registry, i.e. removed while HA was not running. Same `valid_from < close_ts`
+# ordering guard as SCD2_CLOSE_*. The ::text[] cast lets an empty id list adapt.
+# Count: %s = close_ts, %s = live ids → (open rows, rows the sweep would close).
+# Close: %s = close_ts (valid_to), %s = close_ts (guard), %s = live ids.
+_SCD2_SWEEP_COUNT_SQL = (
+    "SELECT count(*), count(*) FILTER (WHERE valid_from < %s AND {key} <> ALL(%s::text[]))"
+    " FROM {table} WHERE valid_to IS NULL;"
+)
+_SCD2_SWEEP_CLOSE_SQL = (
+    "UPDATE {table} SET valid_to = %s"
+    " WHERE valid_to IS NULL AND valid_from < %s AND {key} <> ALL(%s::text[]);"
+)
+_SCD2_REGISTRY_TABLES = {
+    "entity": ("entities", "entity_id"),
+    "device": ("devices", "device_id"),
+    "area": ("areas", "area_id"),
+    "label": ("labels", "label_id"),
+}
+SCD2_SWEEP_COUNT_SQL = {
+    registry: _SCD2_SWEEP_COUNT_SQL.format(table=table, key=key)
+    for registry, (table, key) in _SCD2_REGISTRY_TABLES.items()
+}
+SCD2_SWEEP_CLOSE_SQL = {
+    registry: _SCD2_SWEEP_CLOSE_SQL.format(table=table, key=key)
+    for registry, (table, key) in _SCD2_REGISTRY_TABLES.items()
+}
+# A sweep that would close more than this fraction of a table's open rows is
+# refused and dead-lettered: an incompletely loaded registry must not end the
+# history of everything it failed to list. Closing at most SCD2_SWEEP_FREE_CLOSES
+# rows is always allowed, so small tables (areas, labels) are not stuck.
+SCD2_SWEEP_MAX_CLOSE_FRACTION = 0.5
+SCD2_SWEEP_FREE_CLOSES = 2
+
+# Session statement_timeout handling (see DB_STATEMENT_TIMEOUT_MS). The default
+# is applied only when nothing else configured one, i.e. the value is still '0'.
+# %s = timeout in ms, as text.
+STATEMENT_TIMEOUT_DEFAULT_SQL = (
+    "SELECT set_config('statement_timeout', %s, false)"
+    " WHERE current_setting('statement_timeout') = '0';"
+)
+STATEMENT_TIMEOUT_SHOW_SQL = "SELECT current_setting('statement_timeout');"
+STATEMENT_TIMEOUT_DISABLE_SQL = "SET statement_timeout = 0;"
+# %s = the value STATEMENT_TIMEOUT_SHOW_SQL returned.
+STATEMENT_TIMEOUT_RESTORE_SQL = "SELECT set_config('statement_timeout', %s, false);"
 
 # D-08-d step 4: watermark read (orchestrator → states worker connection).
 SELECT_WATERMARK_SQL = f"SELECT MAX(last_updated) FROM {TABLE_NAME}"
@@ -717,11 +821,16 @@ HAVING count(*) > 1
 # one and inherit next_from, which equals their own valid_from. So the rows this
 # deletes could never label a state row, and their close times survive in both
 # the quarantine and the pre-repair backup.
+#
+# Payloads compare as jsonb, which ignores key order and numeric formatting. Set
+# fields (extra's lists, `labels`) compare element by element, so this relies on
+# canonical rows: repair_scd2 refuses to run before the integration's one-time
+# canonicalization (CANONICAL_SETS_MIGRATION_ID) has.
 _SCD2_REPAIR_IDENTICAL_DUPES_SQL = """
 WITH grouped AS (
     SELECT {key}::text AS id_value, valid_from,
            count(*) AS versions,
-           count(DISTINCT (to_jsonb(t) - 'valid_from' - 'valid_to')::text) AS payloads
+           count(DISTINCT to_jsonb(t) - 'valid_from' - 'valid_to') AS payloads
       FROM {table} t
      GROUP BY 1, 2
 )
@@ -734,25 +843,27 @@ SELECT id_value, valid_from, versions FROM grouped
 # (DISTINCT ON ... ORDER BY valid_to DESC NULLS FIRST -> the open twin), archives
 # the losers with their full payload, and deletes only rows sharing the
 # survivor's id, valid_from and payload (valid_to excluded — see above).
-# "All payloads in this group are equal" is expressed as min = max over the
-# partition, not count(DISTINCT ...) OVER (...): PostgreSQL rejects DISTINCT in a
-# window function ("DISTINCT is not implemented for window functions").
+# "All payloads in this group are equal" is the same grouped count(DISTINCT)
+# as _SCD2_REPAIR_IDENTICAL_DUPES_SQL, joined back: PostgreSQL rejects DISTINCT
+# in a window function and has no min/max over jsonb.
 _SCD2_REPAIR_COLLAPSE_SQL = """
 WITH ranked AS (
-    SELECT t.ctid AS rid, t.{key}::text AS id_value, t.valid_from,
+    SELECT t.ctid AS rid, t.{key} AS key_value, t.{key}::text AS id_value, t.valid_from,
            to_jsonb(t) AS row_data,
-           row_number() OVER w AS rn,
-           count(*) OVER w AS versions,
-           min((to_jsonb(t) - 'valid_from' - 'valid_to')::text) OVER w
-             = max((to_jsonb(t) - 'valid_from' - 'valid_to')::text) OVER w
-             AS payload_uniform
+           row_number() OVER (PARTITION BY t.{key}, t.valid_from
+                              ORDER BY t.valid_to DESC NULLS FIRST, t.ctid) AS rn
       FROM {table} t
-    WINDOW w AS (PARTITION BY t.{key}, t.valid_from
-                 ORDER BY t.valid_to DESC NULLS FIRST, t.ctid
-                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+),
+uniform AS (
+    SELECT {key} AS key_value, valid_from
+      FROM {table} t
+     GROUP BY 1, 2
+    HAVING count(*) > 1
+       AND count(DISTINCT to_jsonb(t) - 'valid_from' - 'valid_to') = 1
 ),
 losers AS (
-    SELECT * FROM ranked WHERE versions > 1 AND payload_uniform AND rn > 1
+    SELECT r.* FROM ranked r JOIN uniform u USING (key_value, valid_from)
+     WHERE r.rn > 1
 ),
 archived AS (
     INSERT INTO scd2_repair_quarantine (run_id, table_name, id_value, reason, row_data)
@@ -795,11 +906,12 @@ SELECT table_name, reason, count(*) AS rows
 
 # ---- Dead letter (issue #17, #20) --------------------------------------------
 #
-# Where the meta worker puts an item it is about to stop retrying. Two kinds
+# Where the meta worker puts an item it is about to stop retrying. Three kinds
 # reach it: a write the SCD2 constraints refuse (retrying replays the same
-# conflicting row forever, so the queue would wedge) and a registry change that
+# conflicting row forever, so the queue would wedge), a registry change that
 # arrived after a newer version already landed (splicing it in blind is how the
-# intervals got corrupted in the first place).
+# intervals got corrupted in the first place), and any other item that kept
+# failing with a non-transient error (retry.is_transient).
 #
 # Both used to exist only as an in-memory counter and a log line, which meant a
 # restart erased the evidence that anything had been dropped at all. A table
@@ -838,6 +950,34 @@ SELECT reason, count(*) AS rows, max(detected_at) AS latest
 # Reasons, so the writer and the reader cannot drift apart.
 DEADLETTER_REASON_INTEGRITY = "scd2_constraint_rejected"
 DEADLETTER_REASON_OUT_OF_ORDER = "arrived_after_newer_version"
+DEADLETTER_REASON_POISON = "non_transient_error"
+DEADLETTER_REASON_SWEEP_REFUSED = "sweep_refused"
+
+# States counterpart (issue #20): rows the states worker gave up on after a
+# chunk failed non-transiently and the row still failed on its own. `row_data`
+# is TEXT holding JSON, not JSONB: a NUL character in the attributes is a
+# typical reason a row is poison, and jsonb rejects \u0000 just like the
+# states table did — the record of the failure must not fail the same way.
+STATES_DEADLETTER_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS states_deadletter (
+    detected_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reason       TEXT        NOT NULL,
+    entity_id    TEXT,
+    last_updated TIMESTAMPTZ,
+    error        TEXT,
+    row_data     TEXT        NOT NULL
+);
+"""
+
+STATES_DEADLETTER_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_states_deadletter_detected_at
+    ON states_deadletter (detected_at DESC);
+"""
+
+STATES_DEADLETTER_INSERT_SQL = """
+INSERT INTO states_deadletter (reason, entity_id, last_updated, error, row_data)
+VALUES (%s, %s, %s, %s, %s);
+"""
 
 # Undo helper for a quarantined row, documented in the repair script's --help.
 _SCD2_QUARANTINE_RESTORE_SQL = """
@@ -1052,11 +1192,11 @@ UPDATE entities t SET valid_from = p.new_from
 # ---- Extend a late first version back to the first state ---------------------
 #
 # The mirror of the alignment above, and the one place the repair moves a start
-# EARLIER. A first version is stamped when the integration hears of the entity:
-# the registry event fires after HA has already written the first state
-# (sub-millisecond), and an entity created during HA startup is only recorded by
+# EARLIER. Up to 2.4.1 a first version was stamped when the integration heard of
+# the entity: the registry event fires after HA has written the first state
+# (sub-millisecond), and an entity created during HA startup was only recorded by
 # the snapshot, ~30 s later (#19). Those first states fall before every version
-# and get NULL metadata.
+# and get NULL metadata. New first versions start at created_at instead.
 #
 # Two pieces of evidence, both required: a recorded state for this entity_id,
 # and the registry entry's own `created_at` at or before it — the entry existed
@@ -1208,17 +1348,19 @@ SCD2_CHECK_SKIPPED = -1
 # alike the two look). Identical payloads mean the gap could be closed without
 # asserting anything new; differing payloads mean the era genuinely cannot be
 # attributed to either version. The answer drives --merge-identical-gaps, so it
-# must ask exactly the question SCD2_MERGE_PLAN_SQL asks.
+# must ask exactly the question SCD2_MERGE_PLAN_SQL asks. extra compares as
+# jsonb and labels element-wise — see _SCD2_REPAIR_IDENTICAL_DUPES_SQL on why
+# both need canonical rows.
 SCD2_SUSPICIOUS_GAPS_SQL = f"""
 WITH ordered AS (
     SELECT entity_id, valid_from, valid_to,
            (ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
             device_class, unit_of_measurement, disabled_by)::text AS payload,
-           (extra - 'modified_at')::text AS extra_cmp,
+           extra - 'modified_at' AS extra_cmp,
            lead(valid_from) OVER w AS gap_end,
            lead((ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
                  device_class, unit_of_measurement, disabled_by)::text) OVER w AS next_payload,
-           lead((extra - 'modified_at')::text) OVER w AS next_extra
+           lead(extra - 'modified_at') OVER w AS next_extra
     FROM entities t
     WINDOW w AS (PARTITION BY entity_id
                  ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid)),
@@ -1305,13 +1447,13 @@ WITH ordered AS (
     SELECT ctid AS rid, entity_id, valid_from, valid_to,
            (ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
             device_class, unit_of_measurement, disabled_by)::text AS payload,
-           (extra - 'modified_at')::text AS extra_cmp,
+           extra - 'modified_at' AS extra_cmp,
            lead(ctid)       OVER w AS next_rid,
            lead(valid_from) OVER w AS next_from,
            lead(valid_to)   OVER w AS next_to,
            lead((ha_entity_uuid, name, domain, platform, device_id, area_id, labels,
                  device_class, unit_of_measurement, disabled_by)::text) OVER w AS next_payload,
-           lead((extra - 'modified_at')::text) OVER w AS next_extra
+           lead(extra - 'modified_at') OVER w AS next_extra
       FROM entities t
     WINDOW w AS (PARTITION BY entity_id
                  ORDER BY valid_from, (valid_to IS NULL), valid_to, ctid)),
@@ -1360,3 +1502,45 @@ SCD2_MERGE_PLAN_COUNT_SQL = "SELECT count(*) FROM pg_temp.scd2_merge_plan;"
 # schema qualification makes the statement incapable of naming anything but this
 # transaction's own temp table.
 SCD2_MERGE_PLAN_DROP_SQL = "DROP TABLE IF EXISTS pg_temp.scd2_merge_plan;"
+
+
+# ---- Schema migrations -------------------------------------------------------
+#
+# One row per one-time data migration that has completed. Created by
+# sync_setup_schema; checking a migration costs one primary-key lookup.
+SCHEMA_MIGRATIONS_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    id         TEXT        PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+SCHEMA_MIGRATION_APPLIED_SQL = "SELECT 1 FROM schema_migrations WHERE id = %s;"
+SCHEMA_MIGRATION_MARK_SQL = (
+    "INSERT INTO schema_migrations (id) VALUES (%s) ON CONFLICT (id) DO NOTHING;"
+)
+
+# Rewrites `extra` set reprs and unsorted `labels` arrays into the canonical
+# form (canonical.py). Touches no other column, so valid_from/valid_to — and
+# with them the exclusion constraints and open-row unique indexes — are unchanged.
+CANONICAL_SETS_MIGRATION_ID = "0001_canonical_dimension_sets"
+
+_DIM_TABLES_WITH_LABELS = frozenset({"entities", "devices"})
+
+# ctid identifies the row to rewrite; safe because the migration holds
+# SCD2_REPAIR_LOCK_SQL (blocks other writers) for the whole transaction.
+CANONICALIZE_SELECT_SQL = {
+    table: (
+        "SELECT ctid::text AS rid, "
+        + ("labels" if table in _DIM_TABLES_WITH_LABELS else "NULL::text[] AS labels")
+        + f", extra FROM {table};"
+    )
+    for table, _key in SCD2_DIMENSIONS
+}
+CANONICALIZE_UPDATE_SQL = {
+    table: (
+        f"UPDATE {table} SET "
+        + ("labels = %(labels)s, " if table in _DIM_TABLES_WITH_LABELS else "")
+        + "extra = %(extra)s WHERE ctid = %(rid)s::tid;"
+    )
+    for table, _key in SCD2_DIMENSIONS
+}

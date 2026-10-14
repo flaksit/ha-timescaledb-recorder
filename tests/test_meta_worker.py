@@ -10,6 +10,7 @@ from custom_components.timescaledb_recorder.const import (
     SCD2_CLOSE_AREA_SQL,
     SCD2_CLOSE_DEVICE_SQL,
     SCD2_CLOSE_ENTITY_SQL,
+    SCD2_ANY_VERSION_SQL,
     SCD2_CLOSE_LABEL_SQL,
     SCD2_SNAPSHOT_AREA_SQL,
     SCD2_SNAPSHOT_DEVICE_SQL,
@@ -68,12 +69,214 @@ def test_write_item_entity_create_uses_snapshot_sql(mock_psycopg_conn):
     }
     w._write_item_raw(item)
     args = cur.execute.call_args_list
-    # First execute is the snapshot SQL
-    sql, params = args[0].args
-    assert sql == SCD2_SNAPSHOT_ENTITY_SQL
+    # Reconcile: close whatever differs, then the guarded insert.
+    assert [a.args[0] for a in args] == [SCD2_CLOSE_ENTITY_SQL, SCD2_SNAPSHOT_ENTITY_SQL]
+    sql, params = args[1].args
     assert params[0] == "sensor.x"
     # entity_id appears twice: once in SELECT, once in WHERE NOT EXISTS
     assert params[-1] == "sensor.x"
+
+
+# ---------------------------------------------------------------------------
+# Reconcile path and first-version start (issue #19)
+# ---------------------------------------------------------------------------
+
+EVENT_TS = "2026-04-21T12:00:00+00:00"
+CREATED = "2026-04-21 11:59:30.500000+00:00"  # str(datetime), as _build_extra writes it
+
+
+def _entity(action="snapshot", extra='{"created_at": "%s"}' % CREATED, old_id=None,
+            entity_id="sensor.x"):
+    return {
+        "registry": "entity", "action": action,
+        "registry_id": entity_id, "old_id": old_id,
+        "params": [entity_id, "uuid-x", "n", "sensor", "zha", None, None,
+                   [], None, None, None, EVENT_TS, extra],
+        "enqueued_at": EVENT_TS,
+    }
+
+
+def _first_version_worker(mock_psycopg_conn, *, closed: int = 0, history=None, changed=True):
+    """Worker whose close touched `closed` rows and whose history probe returns `history`."""
+    conn, cur = mock_psycopg_conn
+    rl = MagicMock()
+    for name in ("_entity_row_changed", "_device_row_changed",
+                 "_area_row_changed", "_label_row_changed"):
+        getattr(rl, name).return_value = changed
+    w = _make_worker(registry_listener=rl)
+    w._conn = conn
+    rowcounts = iter([closed, 1])  # close, then insert
+    type(cur).rowcount = property(lambda _self: next(rowcounts, 1))
+    cur.fetchone.return_value = history
+    return w, cur
+
+
+def _inserted_valid_from(cur, sql=SCD2_SNAPSHOT_ENTITY_SQL, idx=11):
+    params = next(c.args[1] for c in cur.execute.call_args_list if c.args[0] == sql)
+    return params[idx]
+
+
+@pytest.mark.parametrize("action", ["create", "update", "snapshot"])
+def test_reconcile_actions_write_nothing_when_the_open_row_matches(mock_psycopg_conn, action):
+    """Replaying a snapshot, or any already-applied change, must be a no-op."""
+    w, cur = _first_version_worker(mock_psycopg_conn, changed=False)
+    w._write_item_raw(_entity(action))
+    cur.execute.assert_not_called()
+    assert w.out_of_order_skips == 0
+
+
+def test_snapshot_closes_and_inserts_on_drift(mock_psycopg_conn):
+    """A registry that drifted while HA was down is stamped at snapshot time."""
+    w, cur = _first_version_worker(mock_psycopg_conn, closed=1)
+    w._write_item_raw(_entity())
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert sqls == [SCD2_CLOSE_ENTITY_SQL, SCD2_SNAPSHOT_ENTITY_SQL]
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+
+
+def test_first_version_starts_at_created_at(mock_psycopg_conn):
+    w, cur = _first_version_worker(mock_psycopg_conn, history=None)
+    w._write_item_raw(_entity())
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(CREATED)
+    probe = next(c for c in cur.execute.call_args_list
+                 if c.args[0] == SCD2_ANY_VERSION_SQL["entity"])
+    # The uuid is checked too: a rename while HA was down keeps created_at.
+    assert probe.args[1] == ("sensor.x", "uuid-x")
+
+
+def test_id_with_history_keeps_event_time(mock_psycopg_conn):
+    """A gap after a removal is real; created_at must not paper over it."""
+    w, cur = _first_version_worker(mock_psycopg_conn, history=(1,))
+    w._write_item_raw(_entity("create"))
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+
+
+@pytest.mark.parametrize("extra", [
+    "{}",                                                    # persisted by an older version
+    '{"created_at": "1970-01-01 00:00:00+00:00"}',           # HA's migration sentinel
+    '{"created_at": "2026-04-21 12:00:01+00:00"}',           # after the event: LEAST
+    '{"created_at": "garbage"}',
+])
+def test_unusable_created_at_keeps_event_time_without_probing(mock_psycopg_conn, extra):
+    w, cur = _first_version_worker(mock_psycopg_conn)
+    w._write_item_raw(_entity(extra=extra))
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+    assert SCD2_ANY_VERSION_SQL["entity"] not in [c.args[0] for c in cur.execute.call_args_list]
+
+
+def test_rename_never_uses_created_at(mock_psycopg_conn):
+    """The registry entry predates the new entity_id."""
+    w, cur = _first_version_worker(mock_psycopg_conn, history=None)
+    w._write_item_raw(_entity("update", old_id="sensor.old", entity_id="sensor.new"))
+    assert _inserted_valid_from(cur) == datetime.fromisoformat(EVENT_TS)
+    assert SCD2_ANY_VERSION_SQL["entity"] not in [c.args[0] for c in cur.execute.call_args_list]
+
+
+def test_device_first_version_starts_at_created_at(mock_psycopg_conn):
+    w, cur = _first_version_worker(mock_psycopg_conn, history=None)
+    w._write_item_raw({
+        "registry": "device", "action": "snapshot", "registry_id": "dev-1", "old_id": None,
+        "params": ["dev-1", "n", "m", "mo", None, [], EVENT_TS,
+                   '{"created_at": "%s"}' % CREATED],
+        "enqueued_at": EVENT_TS,
+    })
+    assert _inserted_valid_from(cur, SCD2_SNAPSHOT_DEVICE_SQL, 6) == datetime.fromisoformat(CREATED)
+    probe = next(c for c in cur.execute.call_args_list
+                 if c.args[0] == SCD2_ANY_VERSION_SQL["device"])
+    assert probe.args[1] == ("dev-1",)
+
+
+# ---------------------------------------------------------------------------
+# Startup removal sweep (issue #19)
+# ---------------------------------------------------------------------------
+
+def _sweep_item(live_ids, registry="entity"):
+    return {"registry": registry, "action": "sweep", "registry_id": None, "old_id": None,
+            "params": None, "live_ids": live_ids, "enqueued_at": EVENT_TS}
+
+
+def _sweep_worker(mock_psycopg_conn, open_rows, to_close):
+    conn, cur = mock_psycopg_conn
+    w = _make_worker()
+    w._conn = conn
+    cur.fetchone.return_value = (open_rows, to_close)
+    cur.rowcount = to_close
+    return w, cur
+
+
+def _sqls(cur):
+    return [c.args[0] for c in cur.execute.call_args_list]
+
+
+def test_sweep_closes_rows_missing_from_the_registry(mock_psycopg_conn, caplog):
+    from custom_components.timescaledb_recorder.const import (
+        SCD2_SWEEP_CLOSE_SQL, SCD2_SWEEP_COUNT_SQL)
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=10, to_close=3)
+    with caplog.at_level("INFO"):
+        w._write_item_raw(_sweep_item(["sensor.a"]))
+
+    ts = datetime.fromisoformat(EVENT_TS)
+    assert cur.execute.call_args_list == [
+        call(SCD2_SWEEP_COUNT_SQL["entity"], (ts, ["sensor.a"])),
+        call(SCD2_SWEEP_CLOSE_SQL["entity"], (ts, ts, ["sensor.a"])),
+    ]
+    assert "closed 3 open entity row(s)" in caplog.text
+    w._hass.add_job.assert_not_called()
+
+
+def test_sweep_allows_a_few_closes_on_a_small_table(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import SCD2_SWEEP_CLOSE_SQL
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=3, to_close=2)
+    w._write_item_raw(_sweep_item(["l1"], registry="label"))
+    assert SCD2_SWEEP_CLOSE_SQL["label"] in _sqls(cur)
+
+
+def test_sweep_with_nothing_to_close_writes_nothing(mock_psycopg_conn):
+    """A replayed sweep, or a restart with no removals."""
+    from custom_components.timescaledb_recorder.const import SCD2_SWEEP_CLOSE_SQL
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=5, to_close=0)
+    w._write_item_raw(_sweep_item(["a", "b", "c", "d", "e"]))
+    assert SCD2_SWEEP_CLOSE_SQL["entity"] not in _sqls(cur)
+
+
+def test_sweep_skips_an_empty_registry_listing(mock_psycopg_conn, caplog):
+    from custom_components.timescaledb_recorder.const import (
+        METADATA_DEADLETTER_INSERT_SQL, SCD2_SWEEP_CLOSE_SQL)
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=4, to_close=4)
+    with caplog.at_level("WARNING"):
+        w._write_item_raw(_sweep_item([], registry="area"))
+    assert SCD2_SWEEP_CLOSE_SQL["area"] not in _sqls(cur)
+    assert METADATA_DEADLETTER_INSERT_SQL not in _sqls(cur)
+    assert "area registry listed no entries but 4 row(s) are open" in caplog.text
+
+
+def test_sweep_refuses_to_close_most_open_rows(mock_psycopg_conn, caplog):
+    from custom_components.timescaledb_recorder.const import (
+        DEADLETTER_REASON_SWEEP_REFUSED, METADATA_DEADLETTER_INSERT_SQL, SCD2_SWEEP_CLOSE_SQL)
+    from custom_components.timescaledb_recorder.issues import create_metadata_dropped_issue
+
+    w, cur = _sweep_worker(mock_psycopg_conn, open_rows=100, to_close=51)
+    item = _sweep_item(["sensor.a"])
+    with caplog.at_level("ERROR"):
+        w._write_item_raw(item)
+
+    assert SCD2_SWEEP_CLOSE_SQL["entity"] not in _sqls(cur)
+    dl = [c for c in cur.execute.call_args_list if c.args[0] == METADATA_DEADLETTER_INSERT_SQL]
+    reason, registry, registry_id, error, _item = dl[0].args[1]
+    assert (reason, registry, registry_id) == (DEADLETTER_REASON_SWEEP_REFUSED, "entity", None)
+    assert "51 of 100" in error
+    assert "refused the startup removal sweep" in caplog.text
+    assert call(create_metadata_dropped_issue, w._hass) in w._hass.add_job.call_args_list
+
+
+def test_unknown_action_is_ignored(mock_psycopg_conn):
+    w, cur = _first_version_worker(mock_psycopg_conn)
+    w._write_item_raw(_entity("frobnicate"))
+    cur.execute.assert_not_called()
 
 
 def test_write_item_entity_remove_uses_close_sql(mock_psycopg_conn):
@@ -514,3 +717,230 @@ def test_last_op_updated_before_write_item():
     assert w._last_op == "unknown"
     assert isinstance(w._last_op, str)
     assert isinstance(w._last_retry_attempt, (int, type(None)))
+
+
+# ---------------------------------------------------------------------------
+# Issue #20: poison items are dead-lettered and task_done()d
+# ---------------------------------------------------------------------------
+
+
+def test_poison_item_is_dropped_and_queue_moves_on(mock_psycopg_conn):
+    """An item that keeps failing non-transiently must not wedge the queue:
+    it is dead-lettered, counted, surfaced, and task_done()d so the next item
+    is written."""
+    from custom_components.timescaledb_recorder.const import (
+        DEADLETTER_REASON_POISON,
+        METADATA_DEADLETTER_INSERT_SQL,
+        POISON_MAX_ATTEMPTS,
+    )
+    from custom_components.timescaledb_recorder.issues import create_metadata_dropped_issue
+
+    conn, cur = mock_psycopg_conn
+    bad = {"registry": "entity", "action": "create", "registry_id": "bad.one"}
+    good = {"registry": "entity", "action": "create", "registry_id": "good.one"}
+    meta_queue = MagicMock()
+    meta_queue.get = MagicMock(side_effect=[bad, good, None])
+    w = _make_worker(meta_queue=meta_queue)
+    # Skip the real backoff sleeps; the decorator holds this same Event.
+    w._stop_event.wait = MagicMock(return_value=False)
+    attempts = []
+
+    def dispatch(item):
+        attempts.append(item["registry_id"])
+        if item is bad:
+            raise ValueError("cannot serialise")
+
+    w._dispatch_item = dispatch
+    with patch(
+        "custom_components.timescaledb_recorder.meta_worker.psycopg.connect",
+        return_value=conn,
+    ):
+        w._run_main_loop()
+
+    assert attempts == ["bad.one"] * POISON_MAX_ATTEMPTS + ["good.one"]
+    assert meta_queue.task_done.call_count == 2
+    assert w.poison_drops == 1
+    dl = [c for c in cur.execute.call_args_list if c.args[0] == METADATA_DEADLETTER_INSERT_SQL]
+    assert len(dl) == 1
+    reason, registry, registry_id, error, _item = dl[0].args[1]
+    assert (reason, registry, registry_id) == (DEADLETTER_REASON_POISON, "entity", "bad.one")
+    assert "cannot serialise" in error
+    assert call(create_metadata_dropped_issue, w._hass) in w._hass.add_job.call_args_list
+
+
+def test_transient_failure_is_not_dropped(mock_psycopg_conn):
+    """A transient error keeps the item: retried until it succeeds."""
+    import psycopg
+
+    from custom_components.timescaledb_recorder.const import POISON_MAX_ATTEMPTS
+
+    conn, _cur = mock_psycopg_conn
+    item = {"registry": "entity", "action": "create", "registry_id": "x.y"}
+    meta_queue = MagicMock()
+    meta_queue.get = MagicMock(side_effect=[item, None])
+    w = _make_worker(meta_queue=meta_queue)
+    w._stop_event.wait = MagicMock(return_value=False)
+    errors = [psycopg.OperationalError("down")] * (POISON_MAX_ATTEMPTS + 2)
+
+    def dispatch(_item):
+        if errors:
+            raise errors.pop(0)
+
+    w._dispatch_item = dispatch
+    with patch(
+        "custom_components.timescaledb_recorder.meta_worker.psycopg.connect",
+        return_value=conn,
+    ):
+        w._run_main_loop()
+
+    assert w.poison_drops == 0
+    meta_queue.task_done.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Fresh install: no writes before the states worker has created the schema
+# ---------------------------------------------------------------------------
+
+def test_meta_worker_waits_for_schema_before_reading_the_queue():
+    schema_ready = threading.Event()
+    meta_queue = MagicMock()
+    meta_queue.get.return_value = None  # wake → loop exits
+    w = TimescaledbMetaRecorderThread(
+        hass=MagicMock(), dsn="postgresql://", meta_queue=meta_queue,
+        registry_listener=MagicMock(), stop_event=threading.Event(),
+        schema_ready=schema_ready,
+    )
+    w._migrate = MagicMock(return_value=True)
+    w.start()
+    w.join(timeout=0.2)
+    assert w.is_alive()
+    meta_queue.get.assert_not_called()
+
+    schema_ready.set()
+    w.join(timeout=5)
+    assert not w.is_alive()
+    meta_queue.get.assert_called_once()
+
+
+def test_meta_worker_schema_wait_ends_on_shutdown():
+    stop_event = threading.Event()
+    meta_queue = MagicMock()
+    w = TimescaledbMetaRecorderThread(
+        hass=MagicMock(), dsn="postgresql://", meta_queue=meta_queue,
+        registry_listener=MagicMock(), stop_event=stop_event,
+        schema_ready=threading.Event(),
+    )
+    w.start()
+    stop_event.set()
+    w.join(timeout=5)
+    assert not w.is_alive()
+    meta_queue.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# One-time canonicalization of dimension rows
+# ---------------------------------------------------------------------------
+
+_MW = "custom_components.timescaledb_recorder.meta_worker"
+
+
+def test_migration_runs_before_the_first_queue_item():
+    order = []
+    meta_queue = MagicMock()
+    meta_queue.get.side_effect = lambda: order.append("get")
+    w = _make_worker(meta_queue=meta_queue)
+    w._migrate = MagicMock(side_effect=lambda: order.append("migrate") or True)
+
+    w._run_main_loop()
+
+    assert order == ["migrate", "get"]
+
+
+def test_shutdown_during_migration_reads_no_item():
+    meta_queue = MagicMock()
+    w = _make_worker(meta_queue=meta_queue)
+    w._migrate = MagicMock(return_value=None)
+
+    w._run_main_loop()
+
+    meta_queue.get.assert_not_called()
+
+
+def test_applied_migration_costs_one_lookup(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import (
+        CANONICAL_SETS_MIGRATION_ID,
+        SCHEMA_MIGRATION_APPLIED_SQL,
+    )
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = (1,)
+    w = _make_worker()
+    w._conn = conn
+    with patch(f"{_MW}.canonicalize_dimension_rows") as migrate:
+        assert w._migrate_raw() is True
+
+    migrate.assert_not_called()
+    assert cur.execute.call_args_list == [
+        call(SCHEMA_MIGRATION_APPLIED_SQL, (CANONICAL_SETS_MIGRATION_ID,))]
+
+
+def test_pending_migration_runs_untimed_but_tracked(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import (
+        STATEMENT_TIMEOUT_DISABLE_SQL,
+        STATEMENT_TIMEOUT_RESTORE_SQL,
+    )
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.side_effect = [None, ("5min",)]
+    w = _make_worker()
+    w._conn = conn
+    seen = {}
+
+    def fake_migrate(_conn):
+        seen["last_sql"] = cur.execute.call_args_list[-1].args[0]
+        seen["in_flight"] = w.db_calls.oldest()[0]
+        return {}
+
+    with patch(f"{_MW}.canonicalize_dimension_rows", side_effect=fake_migrate):
+        assert w._migrate() is True
+
+    assert seen == {"last_sql": STATEMENT_TIMEOUT_DISABLE_SQL, "in_flight": "migrate"}
+    assert cur.execute.call_args_list[-1] == call(STATEMENT_TIMEOUT_RESTORE_SQL, ("5min",))
+
+
+def test_failing_migration_does_not_block_ingestion(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import POISON_MAX_ATTEMPTS
+
+    conn, cur = mock_psycopg_conn
+    cur.fetchone.return_value = None
+    meta_queue = MagicMock()
+    meta_queue.get.return_value = None
+    w = _make_worker(meta_queue=meta_queue)
+    w._stop_event.wait = MagicMock(return_value=False)
+    with patch(f"{_MW}.psycopg.connect", return_value=conn), patch(
+        f"{_MW}.canonicalize_dimension_rows", side_effect=ValueError("bug"),
+    ) as migrate:
+        w._run_main_loop()
+
+    assert migrate.call_count == POISON_MAX_ATTEMPTS
+    meta_queue.get.assert_called_once()
+
+
+def test_rehydrate_canonicalizes_items_queued_by_older_versions():
+    import json
+
+    w = _make_worker()
+    entity = w._rehydrate_params("entity", [
+        "x.y", "u", "n", "sensor", "zha", None, None, ["b", "a"], None, None, None,
+        "2026-04-21T12:00:00+00:00", json.dumps({"aliases": "{'z', 'y'}"})])
+    assert entity[7] == ["a", "b"]
+    assert json.loads(entity[-1]) == {"aliases": ["y", "z"]}
+
+    device = w._rehydrate_params("device", [
+        "d", "n", None, None, None, ["b", "a"], "2026-04-21T12:00:00+00:00",
+        json.dumps({"identifiers": "{('hue', '2'), ('hue', '1')}"})])
+    assert device[5] == ["a", "b"]
+    assert json.loads(device[-1]) == {"identifiers": [["hue", "1"], ["hue", "2"]]}
+
+    area = w._rehydrate_params("area", ["a", "A", "2026-04-21T12:00:00+00:00", "{}"])
+    assert area[1:] == ("A", datetime(2026, 4, 21, 12, tzinfo=timezone.utc), "{}")

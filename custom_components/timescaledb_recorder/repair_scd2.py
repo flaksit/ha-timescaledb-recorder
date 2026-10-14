@@ -16,6 +16,10 @@ make every metadata write fail.
     3. --apply        back up, repair, verify, add constraints
     4. --verify-only  confirm, now and after a day of normal operation
 
+Steps 2 and 3 refuse to run until the updated integration has canonicalized
+the dimension rows (it does so once on startup), because they compare row
+payloads. --verify-only compares intervals only and always runs.
+
 --verify-only reports the invariant only. The Ambiguity, Fidelity and Coverage
 sections scan the whole `states` hypertable, so they run under --dry-run and
 --apply but not there, which keeps the recurring check seconds rather than
@@ -87,6 +91,8 @@ from psycopg.types.json import Jsonb  # pyright: ignore[reportMissingImports]
 
 try:
     from .const import (
+        CANONICAL_SETS_MIGRATION_ID,
+        SCHEMA_MIGRATION_APPLIED_SQL,
         SCD2_DIMENSIONS,
         SCD2_ALIGN_START_PREVIEW_SQL,
         SCD2_ALIGN_START_SQL,
@@ -133,6 +139,8 @@ except ImportError:
     # package context does not exist and the relative import fails.
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
     from const import (  # pyright: ignore[reportMissingImports]
+        CANONICAL_SETS_MIGRATION_ID,
+        SCHEMA_MIGRATION_APPLIED_SQL,
         SCD2_DIMENSIONS,
         SCD2_ALIGN_START_PREVIEW_SQL,
         SCD2_ALIGN_START_SQL,
@@ -236,6 +244,20 @@ def print_identity(conn: psycopg.Connection) -> None:
     print(f"  server   : {addr}:{port}")
     print(f"  user     : {user}")
     print(f"  version  : {version.split(',')[0]}")
+
+
+def rows_canonical(conn: psycopg.Connection) -> bool:
+    """Whether the integration's one-time canonicalization of dimension rows has run.
+
+    The payload comparisons (duplicate twins, identical-gap merges) compare
+    `extra` and `labels` as stored. Rows written before canonical serialization
+    hold sets in hash-seed order, so identical versions would look different.
+    """
+    with conn.cursor() as cur:
+        if not _scalar(cur, SCD2_REGCLASS_EXISTS_SQL, ("schema_migrations",)):
+            return False
+        return _scalar(cur, SCHEMA_MIGRATION_APPLIED_SQL,
+                       (CANONICAL_SETS_MIGRATION_ID,)) is not None
 
 
 def run_verification(conn: psycopg.Connection) -> dict[str, dict[str, int]]:
@@ -730,6 +752,19 @@ def main() -> int:
         if verify_only:
             print("\nClean." if clean else "\nInvariant VIOLATED.")
             return 0 if clean else 1
+
+        # Refuse rather than canonicalize here: the integration's migration is
+        # the one code path for it, and running it from this script would put a
+        # mutation before the backups. Step 1 of the run order already starts
+        # the updated integration, which migrates on startup.
+        if not rows_canonical(conn):
+            print(
+                "\nSTOP: the dimension rows have not been canonicalized yet, so "
+                "identical versions can compare as different here. Update the "
+                "integration and restart HA first (step 1); it rewrites them once "
+                "on startup. Then re-run."
+            )
+            return 2
 
         print("\nAmbiguity")
         ambiguous = report_ambiguity(conn)

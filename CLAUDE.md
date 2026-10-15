@@ -1,6 +1,6 @@
 # ha-timescaledb-recorder
 
-Custom Home Assistant integration — writes HA state changes and registry metadata to TimescaleDB. v1.1 milestone: robust ingestion via thread-worker isolation, psycopg3, bounded buffer, HA sqlite backfill.
+Custom Home Assistant integration — writes HA state changes and registry metadata to TimescaleDB. Thread-worker isolation, psycopg3, bounded buffer, HA sqlite backfill.
 
 ## GSD Workflow
 
@@ -35,8 +35,8 @@ Read `.planning/research/SUMMARY.md` before planning any phase. Key constraints:
 ## Tech Stack
 
 - Python 3.14+, uv, direnv
-- HA 2026.10.1 custom component (HACS; minimum in hacs.json)
-- TimescaleDB via psycopg[binary]==3.3.3
+- HA custom component (HACS; minimum HA version in hacs.json)
+- TimescaleDB via psycopg3 (pinned in pyproject.toml and manifest.json; Renovate bumps both together)
 - voluptuous (config validation), attrs (registry serialization)
 - pytest + pytest-asyncio + pytest-homeassistant-custom-component
 

@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      # Lets the *_db test modules run instead of skipping. Pinned (not latest-pg16) so Renovate
+      # proposes upgrades as PRs. Port bound to loopback: tests/db_guard.py refuses non-loopback DSNs.
+      timescaledb:
+        image: timescale/timescaledb:2.30.2-pg16
+        env:
+          POSTGRES_PASSWORD: pw
+          POSTGRES_DB: hatest
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SCD2_TEST_DSN: postgresql://postgres:pw@127.0.0.1:5432/hatest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.14"
+      - run: uv sync --locked
+      - run: uv run pytest

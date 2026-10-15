@@ -22,7 +22,6 @@ from .const import (
     CREATE_DEVICES_IDX_SQL,
     CREATE_AREAS_IDX_SQL,
     CREATE_LABELS_IDX_SQL,
-    MIGRATE_LEGACY_DIM_INDEXES_SQL,
     CREATE_VIEW_STATES_NUMERIC_SQL,
     CREATE_VIEW_STATES_FLAT_SQL,
     METADATA_DEADLETTER_DDL_SQL,
@@ -153,7 +152,6 @@ def sync_setup_schema(
         cur.execute(CREATE_DEVICES_SQL)
         cur.execute(CREATE_AREAS_SQL)
         cur.execute(CREATE_LABELS_SQL)
-        cur.execute(MIGRATE_LEGACY_DIM_INDEXES_SQL)
         cur.execute(CREATE_ENTITIES_IDX_SQL)
         cur.execute(CREATE_ENTITIES_CURRENT_IDX_SQL)
         cur.execute(CREATE_DEVICES_IDX_SQL)

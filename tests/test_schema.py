@@ -5,12 +5,11 @@ from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 31 SQL statements.
+    """sync_setup_schema must execute exactly 30 SQL statements.
 
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
     + 4 dimension table DDL (entities, devices, areas, labels)
-    + 1 legacy dim_ index migration (issue #15)
     + 5 dimension table indexes (entities compound, entities current-row,
       devices, areas, labels)
     + 2 metadata_deadletter DDL (table, index) — issue #17
@@ -19,13 +18,13 @@ def test_create_schema_executes_all_statements(mock_psycopg_conn):
     + 2 convenience views (states_numeric, states_flat)
     + 1 btree_gist extension + 4 SCD2 exclusion constraints (issue #17)
     + 2 lock_timeout set/reset around the constraint DDL
-    = 31 total
+    = 30 total
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 31
+    assert cur.execute.call_count == 30
 
 
 def test_create_schema_order(mock_psycopg_conn):
@@ -54,24 +53,24 @@ def test_create_schema_order(mock_psycopg_conn):
     assert "labels" in calls[10]
     # The dead-letter table is part of setup, not of the failure path that
     # writes to it (issue #17).
-    assert "metadata_deadletter" in calls[17]
-    assert "idx_metadata_deadletter" in calls[18]
-    assert "states_deadletter" in calls[19]
-    assert "idx_states_deadletter" in calls[20]
+    assert "metadata_deadletter" in calls[16]
+    assert "idx_metadata_deadletter" in calls[17]
+    assert "states_deadletter" in calls[18]
+    assert "idx_states_deadletter" in calls[19]
     # The meta worker reads it as soon as schema_ready is set.
-    assert "schema_migrations" in calls[21]
+    assert "schema_migrations" in calls[20]
     # Views come last of the main block — states_flat joins the dimension
     # tables, so they must already exist.
-    assert "CREATE OR REPLACE VIEW states_numeric" in calls[22]
-    assert "CREATE OR REPLACE VIEW states_flat" in calls[23]
+    assert "CREATE OR REPLACE VIEW states_numeric" in calls[21]
+    assert "CREATE OR REPLACE VIEW states_flat" in calls[22]
     # Invariant enforcement follows the tables it constrains (issue #17).
-    assert "btree_gist" in calls[24]
+    assert "btree_gist" in calls[23]
     # ADD CONSTRAINT takes ACCESS EXCLUSIVE — bounded so a long-running reader
     # cannot stall schema setup and, behind it, states ingestion.
-    assert "SET lock_timeout" in calls[25]
+    assert "SET lock_timeout" in calls[24]
     for offset, table in enumerate(("entities", "devices", "areas", "labels")):
-        assert f"excl_{table}_period" in calls[26 + offset]
-    assert "RESET lock_timeout" in calls[30]
+        assert f"excl_{table}_period" in calls[25 + offset]
+    assert "RESET lock_timeout" in calls[29]
 
 
 def test_constraint_failure_does_not_abort_schema_setup(mock_psycopg_conn):
@@ -218,21 +217,6 @@ def test_dim_indexes_created(mock_psycopg_conn):
     assert "idx_devices_device_time" in all_sql
     assert "idx_areas_area_time" in all_sql
     assert "idx_labels_label_time" in all_sql
-
-
-def test_legacy_dim_indexes_migrated_before_create(mock_psycopg_conn):
-    """Legacy index migration must precede CREATE INDEX IF NOT EXISTS, or old installs get duplicate indexes."""
-    from custom_components.timescaledb_recorder.const import (
-        CREATE_ENTITIES_IDX_SQL,
-        MIGRATE_LEGACY_DIM_INDEXES_SQL,
-    )
-
-    conn, cur = mock_psycopg_conn
-    sync_setup_schema(conn)
-
-    executed = [call.args[0] for call in cur.execute.call_args_list]
-    first_create = executed.index(CREATE_ENTITIES_IDX_SQL)
-    assert executed.index(MIGRATE_LEGACY_DIM_INDEXES_SQL) < first_create
 
 
 def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):

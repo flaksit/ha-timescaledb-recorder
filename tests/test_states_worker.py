@@ -3,6 +3,7 @@ import queue
 import re
 import threading
 from datetime import datetime, timezone
+from typing import cast
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -663,7 +664,7 @@ def test_poison_chunk_drops_only_bad_rows(mock_psycopg_conn):
     )
     assert "UntranslatableCharacter" in error
     assert '"entity_id": "bad.row"' in row_data
-    assert call(create_states_dropped_issue, t._hass) in t._hass.add_job.call_args_list
+    assert call(create_states_dropped_issue, t._hass) in cast(MagicMock, t._hass).add_job.call_args_list
 
 
 def test_rows_that_all_fail_are_a_database_fault_not_poison(mock_psycopg_conn):

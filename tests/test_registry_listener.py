@@ -1,6 +1,7 @@
 """Unit tests for RegistryListener (registry relay + SCD2 change-detection helpers)."""
 import asyncio
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -36,6 +37,7 @@ def test_to_json_safe_converts_datetime_to_iso():
     """datetime values in params must be converted to ISO-8601 strings."""
     t = datetime(2026, 4, 21, 12, 0, tzinfo=timezone.utc)
     out = _to_json_safe(("x.y", t, None, [1, 2]))
+    assert out is not None
     assert isinstance(out[1], str)
     assert out[1] == "2026-04-21T12:00:00+00:00"
     assert out[0] == "x.y"
@@ -217,7 +219,7 @@ print(json.dumps({
 """
 
 
-def _probe_under_seed(seed: int) -> dict:
+def _probe_under_seed(seed: int) -> dict[str, Any]:
     import json
     import os
     import subprocess
@@ -722,7 +724,7 @@ async def test_stop_falls_back_to_a_blocking_append(listener, mock_meta_queue,
     listener._handle_entity_registry_updated(event)
 
     mock_meta_queue.put_many_async = AsyncMock(side_effect=OSError("executor gone"))
-    appended: list = []
+    appended: list[dict[str, Any]] = []
     mock_meta_queue.put_many = MagicMock(side_effect=appended.extend)
 
     await listener.async_stop()

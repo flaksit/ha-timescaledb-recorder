@@ -25,11 +25,11 @@ import queue
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
-import voluptuous as vol
+import probatio
 
-from homeassistant.components import recorder as ha_recorder
+from homeassistant.helpers import recorder as ha_recorder
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
@@ -40,6 +40,7 @@ from homeassistant.helpers.entityfilter import (
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.reload import async_integration_yaml_config
 from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.typing import ConfigType
 
 from .backfill import backfill_orchestrator
 from .const import (
@@ -73,27 +74,27 @@ _LOGGER = logging.getLogger(__name__)
 # Voluptuous schema for one include/exclude block inside the YAML config.
 # Each key is optional — missing keys default to an empty list so
 # convert_include_exclude_filter always receives well-formed dicts.
-_FILTER_SCHEMA_INNER = vol.Schema({
-    vol.Optional("domains", default=[]): vol.All(list, [cv.string]),
-    vol.Optional("entities", default=[]): vol.All(list, [cv.string]),
-    vol.Optional("entity_globs", default=[]): vol.All(list, [cv.string]),
+_FILTER_SCHEMA_INNER = probatio.Schema({
+    probatio.Optional("domains", default=[]): probatio.All(list, [cv.string]),
+    probatio.Optional("entities", default=[]): probatio.All(list, [cv.string]),
+    probatio.Optional("entity_globs", default=[]): probatio.All(list, [cv.string]),
 })
 
 # CONFIG_SCHEMA is required for HA to call async_setup before async_setup_entry.
 # ALLOW_EXTRA lets other integrations' top-level keys pass through validation —
 # HA validates the full configuration.yaml against every component's schema.
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema({
-            vol.Optional("include"): _FILTER_SCHEMA_INNER,
-            vol.Optional("exclude"): _FILTER_SCHEMA_INNER,
+        DOMAIN: probatio.Schema({
+            probatio.Optional("include"): _FILTER_SCHEMA_INNER,
+            probatio.Optional("exclude"): _FILTER_SCHEMA_INNER,
         }),
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Store YAML filter config in hass.data before config entries are set up.
 
     HA guarantees async_setup runs before any async_setup_entry call for this
@@ -138,14 +139,14 @@ class TimescaledbRecorderData:
     registry_listener: RegistryListener
     live_queue: OverflowQueue
     meta_queue: PersistentQueue
-    backfill_queue: queue.Queue
+    backfill_queue: queue.Queue[Any]
     backfill_request: asyncio.Event
     stop_event: threading.Event
     loop_stop_event: asyncio.Event
-    orchestrator_task: asyncio.Task | None
-    overflow_watcher_task: asyncio.Task | None
-    recorder_watcher_task: asyncio.Task | None
-    watchdog_task: asyncio.Task | None  # D-05-a: spawned in setup, cancelled first in unload
+    orchestrator_task: asyncio.Task[None] | None
+    overflow_watcher_task: asyncio.Task[None] | None
+    recorder_watcher_task: asyncio.Task[None] | None
+    watchdog_task: asyncio.Task[None] | None  # D-05-a: spawned in setup, cancelled first in unload
     # Spawn-factory inputs — set during async_setup_entry; used by
     # watchdog.spawn_states_worker / spawn_meta_worker to reconstruct
     # workers with the same args after a crash (D-05-c).
@@ -260,7 +261,7 @@ async def _recorder_watcher(
 def _make_orchestrator_done_callback(
     hass: HomeAssistant,
     runtime: TimescaledbRecorderData,
-    orchestrator_kwargs: dict,
+    orchestrator_kwargs: dict[str, Any],
 ):
     """Return the done-callback closure for the orchestrator task.
 
@@ -273,7 +274,7 @@ def _make_orchestrator_done_callback(
     because calling exception() on a cancelled task raises CancelledError
     (RESEARCH Pitfall 1).
     """
-    def _on_orchestrator_done(task: asyncio.Task) -> None:
+    def _on_orchestrator_done(task: asyncio.Task[None]) -> None:
         # Cancelled task — normal shutdown or explicit cancel; nothing to do.
         if task.cancelled():
             return
@@ -334,7 +335,7 @@ async def async_setup_entry(
     loop_stop_event = asyncio.Event()
     backfill_request = asyncio.Event()
     live_queue = OverflowQueue(maxsize=LIVE_QUEUE_MAXSIZE)
-    backfill_queue: queue.Queue = queue.Queue(maxsize=BACKFILL_QUEUE_MAXSIZE)
+    backfill_queue: queue.Queue[Any] = queue.Queue(maxsize=BACKFILL_QUEUE_MAXSIZE)
 
     # RegistryListener constructed before workers — meta_worker holds a reference
     # for SCD2 change-detection helpers. StateListener needs live_queue.
@@ -433,13 +434,16 @@ async def async_setup_entry(
     )
 
     def _spawn_orchestrator() -> None:
-        orchestrator_kwargs = dict(
+        states_worker = data.states_worker
+        if states_worker is None:
+            raise AssertionError("orchestrator spawned before the states worker")
+        orchestrator_kwargs: dict[str, Any] = dict(
             hass=hass,
             live_queue=live_queue,
             backfill_queue=backfill_queue,
             backfill_request=backfill_request,
-            read_watermark=data.states_worker.read_watermark,
-            all_entities_reader=data.states_worker.read_all_known_entities,
+            read_watermark=states_worker.read_watermark,
+            all_entities_reader=states_worker.read_all_known_entities,
             entity_filter=entity_filter,
             stop_event=loop_stop_event,
             threading_stop_event=stop_event,  # Plan 05 kwarg

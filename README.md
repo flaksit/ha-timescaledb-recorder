@@ -517,6 +517,8 @@ Each table is repaired in one transaction under `SHARE ROW EXCLUSIVE` with a 10-
 
 `uv run pytest` runs the suite. The `*_db` test modules skip unless `SCD2_TEST_DSN` points at a scratch TimescaleDB on loopback; see the docstring of `tests/test_scd2_invariant_db.py` for the Docker command.
 
-CI (`.github/workflows/ci.yml`) runs the full suite, DB modules included, against a TimescaleDB service container.
+`uv run basedpyright` type-checks the project (config in `pyproject.toml`); it must report 0 errors.
+
+CI (`.github/workflows/ci.yml`) runs basedpyright and the full suite, DB modules included, against a TimescaleDB service container.
 
 [Renovate](https://docs.renovatebot.com/) (`renovate.json`) opens weekly PRs for GitHub Actions, the CI TimescaleDB image, Python dependencies and `uv.lock`. It bumps psycopg in `pyproject.toml` and `manifest.json` together; merging such a PR changes what users' HA installs on the next release. The `hacs.json` minimum HA version is not managed — raise it by hand.

@@ -530,18 +530,19 @@ _SCD2_SWEEP_CLOSE_SQL = (
     "UPDATE {table} SET valid_to = %s"
     " WHERE valid_to IS NULL AND valid_from < %s AND {key} <> ALL(%s::text[]);"
 )
+# cast below: as for _per_dimension, all inputs are module literals.
 _SCD2_REGISTRY_TABLES = {
     "entity": ("entities", "entity_id"),
     "device": ("devices", "device_id"),
     "area": ("areas", "area_id"),
     "label": ("labels", "label_id"),
 }
-SCD2_SWEEP_COUNT_SQL = {
-    registry: _SCD2_SWEEP_COUNT_SQL.format(table=table, key=key)
+SCD2_SWEEP_COUNT_SQL: dict[str, LiteralString] = {
+    registry: cast(LiteralString, _SCD2_SWEEP_COUNT_SQL.format(table=table, key=key))
     for registry, (table, key) in _SCD2_REGISTRY_TABLES.items()
 }
-SCD2_SWEEP_CLOSE_SQL = {
-    registry: _SCD2_SWEEP_CLOSE_SQL.format(table=table, key=key)
+SCD2_SWEEP_CLOSE_SQL: dict[str, LiteralString] = {
+    registry: cast(LiteralString, _SCD2_SWEEP_CLOSE_SQL.format(table=table, key=key))
     for registry, (table, key) in _SCD2_REGISTRY_TABLES.items()
 }
 # A sweep that would close more than this fraction of a table's open rows is
@@ -682,17 +683,20 @@ SCD2_DIMENSIONS = (
     ("labels", "label_id"),
 )
 
-# cast: str.format() drops LiteralString, which psycopg requires of query text.
-# Sound here because every input is a module literal (see SCD2_DIMENSIONS).
-SCD2_EXCLUDE_CONSTRAINT_SQL: dict[str, LiteralString] = {
-    table: cast(LiteralString, _SCD2_EXCLUDE_CONSTRAINT_SQL.format(table=table, key=key))
-    for table, key in SCD2_DIMENSIONS
-}
 
-SCD2_OPEN_UNIQUE_IDX_SQL: dict[str, LiteralString] = {
-    table: cast(LiteralString, _SCD2_OPEN_UNIQUE_IDX_SQL.format(table=table, key=key))
-    for table, key in SCD2_DIMENSIONS
-}
+
+def _per_dimension(template: LiteralString) -> dict[str, LiteralString]:
+    """Bind a {table}/{key} template to every SCD2 dimension."""
+    # cast: str.format() drops LiteralString, which psycopg requires of query text.
+    # Sound here because every input is a module literal (see SCD2_DIMENSIONS).
+    return {
+        table: cast(LiteralString, template.format(table=table, key=key))
+        for table, key in SCD2_DIMENSIONS
+    }
+
+
+SCD2_EXCLUDE_CONSTRAINT_SQL = _per_dimension(_SCD2_EXCLUDE_CONSTRAINT_SQL)
+SCD2_OPEN_UNIQUE_IDX_SQL = _per_dimension(_SCD2_OPEN_UNIQUE_IDX_SQL)
 
 
 # ----------------------------------------------------------------------------
@@ -792,7 +796,7 @@ SCD2_REGCLASS_EXISTS_SQL = "SELECT to_regclass(%s) IS NOT NULL;"
 # Table lock for the repair transaction. meta_worker writes on its own connection
 # and a concurrent UPDATE would move a row's ctid out from under the plan.
 # SHARE ROW EXCLUSIVE blocks writers but not readers.
-SCD2_REPAIR_LOCK_SQL = "LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE;"
+SCD2_REPAIR_LOCK_SQL = _per_dimension("LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE;")
 SCD2_REPAIR_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '10s';"
 
 # ---- Ambiguity reporting -----------------------------------------------------
@@ -1119,9 +1123,8 @@ SELECT e.{key}::text AS ref_id, count(*) AS entity_versions
  ORDER BY 2 DESC;
 """
 
-SCD2_DIM_UNCOVERED_REFS_SQL = {
-    "areas": _SCD2_DIM_UNCOVERED_REFS_SQL.format(table="areas", key="area_id"),
-    "devices": _SCD2_DIM_UNCOVERED_REFS_SQL.format(table="devices", key="device_id"),
+SCD2_DIM_UNCOVERED_REFS_SQL: dict[str, LiteralString] = {
+    table: _per_dimension(_SCD2_DIM_UNCOVERED_REFS_SQL)[table] for table in ("areas", "devices")
 }
 
 # ---- Align an entity's first version to its device ---------------------------
@@ -1279,14 +1282,6 @@ UPDATE devices t SET valid_from = p.new_from
   FROM dplan p WHERE t.ctid = p.rid;
 """
 )
-
-
-def _per_dimension(template: str) -> dict[str, str]:
-    """Bind a {table}/{key} template to every SCD2 dimension."""
-    return {
-        table: template.format(table=table, key=key)
-        for table, key in SCD2_DIMENSIONS
-    }
 
 
 SCD2_REPAIR_REBUILD_SQL = _per_dimension(_SCD2_REPAIR_REBUILD_SQL)
@@ -1529,16 +1524,19 @@ _DIM_TABLES_WITH_LABELS = frozenset({"entities", "devices"})
 
 # ctid identifies the row to rewrite; safe because the migration holds
 # SCD2_REPAIR_LOCK_SQL (blocks other writers) for the whole transaction.
-CANONICALIZE_SELECT_SQL = {
-    table: (
+# cast: table names come from SCD2_DIMENSIONS (see _per_dimension).
+CANONICALIZE_SELECT_SQL: dict[str, LiteralString] = {
+    table: cast(
+        LiteralString,
         "SELECT ctid::text AS rid, "
         + ("labels" if table in _DIM_TABLES_WITH_LABELS else "NULL::text[] AS labels")
         + f", extra FROM {table};"
     )
     for table, _key in SCD2_DIMENSIONS
 }
-CANONICALIZE_UPDATE_SQL = {
-    table: (
+CANONICALIZE_UPDATE_SQL: dict[str, LiteralString] = {
+    table: cast(
+        LiteralString,
         f"UPDATE {table} SET "
         + ("labels = %(labels)s, " if table in _DIM_TABLES_WITH_LABELS else "")
         + "extra = %(extra)s WHERE ctid = %(rid)s::tid;"

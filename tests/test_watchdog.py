@@ -25,12 +25,14 @@ import asyncio
 import inspect
 import threading
 from dataclasses import dataclass, field
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from homeassistant.core import CoreState
 
+from custom_components.timescaledb_recorder import TimescaledbRecorderData
 from custom_components.timescaledb_recorder.const import INGESTION_STALL_THRESHOLD_S
 from custom_components.timescaledb_recorder.watchdog import (
     _check_stalls,
@@ -124,7 +126,7 @@ async def test_watchdog_returns_immediately_when_loop_stop_event_preset():
     )
     runtime.loop_stop_event.set()
 
-    await watchdog_loop(hass, runtime)
+    await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     # No polling happened
     states_w.is_alive.assert_not_called()
@@ -171,7 +173,7 @@ async def test_watchdog_no_action_when_both_workers_alive():
             raise asyncio.TimeoutError
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     # notify must NOT have been called since both workers were alive
     mock_notify.assert_not_called()
@@ -224,7 +226,7 @@ async def test_watchdog_respawns_dead_states_worker():
             raise asyncio.TimeoutError
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     # Runtime reference must be replaced with the new thread
     assert runtime.states_worker is new_thread
@@ -272,7 +274,7 @@ async def test_watchdog_respawns_dead_meta_worker():
             raise asyncio.TimeoutError
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     assert runtime.meta_worker is new_thread
     new_thread.start.assert_called_once()
@@ -318,7 +320,7 @@ async def test_watchdog_fires_notify_with_last_exception_and_context():
             raise asyncio.TimeoutError
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     mock_notify.assert_called_once_with(
         hass,
@@ -384,7 +386,7 @@ async def test_watchdog_sleeps_5s_before_respawn():
             raise asyncio.TimeoutError
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     # Verify: notify → sleep(5) → start
     assert ("notify", "states_worker") in call_order
@@ -434,7 +436,7 @@ async def test_watchdog_skips_respawn_when_stop_event_set():
             raise asyncio.TimeoutError
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     mock_notify.assert_not_called()
     mock_sleep.assert_not_called()
@@ -492,7 +494,7 @@ async def test_watchdog_defensive_none_exc_and_missing_context():
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
             # Must NOT raise
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     # notify must have been called with exc=None (default from getattr)
     mock_notify.assert_called_once_with(
@@ -546,7 +548,7 @@ async def test_watchdog_poll_body_exception_does_not_kill_loop():
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
             # Must NOT raise despite AttributeError inside poll body
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     # Loop ran at least 2 cycles (call_count >= 2 before stopping)
     assert call_count >= 2, f"Expected at least 2 cycles, got {call_count}"
@@ -588,7 +590,7 @@ async def test_watchdog_polls_cadence_interruptible_by_loop_stop_event():
             raise asyncio.TimeoutError
 
         with patch("asyncio.wait_for", side_effect=_patched_wait_for):
-            await watchdog_loop(hass, runtime)
+            await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     # states_worker.is_alive should have been called at least twice (3 poll cycles)
     assert states_w.is_alive.call_count >= 2
@@ -611,7 +613,7 @@ async def test_watchdog_does_not_remove_fired_stop_listener():
         stop_event=threading.Event(),
     )
 
-    task = asyncio.create_task(watchdog_loop(hass, runtime))
+    task = asyncio.create_task(watchdog_loop(hass, cast(TimescaledbRecorderData, runtime)))
     await asyncio.sleep(0)
     on_ha_stop = hass.bus.async_listen_once.call_args.args[1]
     on_ha_stop(None)
@@ -634,7 +636,7 @@ async def test_watchdog_removes_unfired_stop_listener():
     )
     runtime.loop_stop_event.set()
 
-    await watchdog_loop(hass, runtime)
+    await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
 
     remover.assert_called_once_with()
 
@@ -671,7 +673,7 @@ def test_spawn_states_worker_uses_runtime_fields():
         mock_instance = MagicMock()
         MockThread.return_value = mock_instance
 
-        result = spawn_states_worker(hass, runtime)
+        result = spawn_states_worker(hass, cast(TimescaledbRecorderData, runtime))
 
     MockThread.assert_called_once_with(
         hass=hass,
@@ -711,7 +713,7 @@ def test_spawn_meta_worker_uses_runtime_fields():
         mock_instance = MagicMock()
         MockThread.return_value = mock_instance
 
-        result = spawn_meta_worker(hass, runtime)
+        result = spawn_meta_worker(hass, cast(TimescaledbRecorderData, runtime))
 
     MockThread.assert_called_once_with(
         hass=hass,
@@ -745,8 +747,8 @@ def test_spawn_factories_do_not_start_thread():
         MockStates.return_value = mock_states_instance
         MockMeta.return_value = mock_meta_instance
 
-        states_result = spawn_states_worker(hass, runtime)
-        meta_result = spawn_meta_worker(hass, runtime)
+        states_result = spawn_states_worker(hass, cast(TimescaledbRecorderData, runtime))
+        meta_result = spawn_meta_worker(hass, cast(TimescaledbRecorderData, runtime))
 
     # .start() must NOT have been called by the factory
     mock_states_instance.start.assert_not_called()
@@ -876,5 +878,5 @@ async def test_stall_check_exception_does_not_kill_loop():
     with patch(f"{_WD}._check_stalls", side_effect=RuntimeError("bug")) as check, patch(
         "asyncio.wait_for", side_effect=_patched_wait_for
     ):
-        await watchdog_loop(hass, runtime)
+        await watchdog_loop(hass, cast(TimescaledbRecorderData, runtime))
     assert check.call_count == 2

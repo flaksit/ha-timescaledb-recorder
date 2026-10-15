@@ -17,7 +17,7 @@ from custom_components.timescaledb_recorder import db  # noqa: E402
 from custom_components.timescaledb_recorder.retry import is_transient  # noqa: E402
 from tests.db_guard import assert_disposable  # noqa: E402
 
-DSN = os.environ.get("SCD2_TEST_DSN")
+DSN = os.environ.get("SCD2_TEST_DSN", "")
 
 pytestmark = [
     pytest.mark.skipif(not DSN, reason="SCD2_TEST_DSN not set"),

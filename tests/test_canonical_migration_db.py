@@ -7,12 +7,14 @@ import json
 import os
 import threading
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 pytest.importorskip("psycopg")
 import psycopg  # noqa: E402  pyright: ignore[reportMissingImports]
+from psycopg.rows import dict_row  # noqa: E402  pyright: ignore[reportMissingImports]
 from psycopg.types.json import Jsonb  # noqa: E402  pyright: ignore[reportMissingImports]
 
 from custom_components.timescaledb_recorder import const, repair_scd2  # noqa: E402
@@ -30,7 +32,7 @@ from custom_components.timescaledb_recorder.registry_listener import (  # noqa: 
 from custom_components.timescaledb_recorder.schema import setup_scd2_constraints  # noqa: E402
 from tests.db_guard import assert_disposable  # noqa: E402
 
-DSN = os.environ.get("SCD2_TEST_DSN")
+DSN = os.environ.get("SCD2_TEST_DSN", "")
 
 pytestmark = [
     pytest.mark.skipif(not DSN, reason="SCD2_TEST_DSN not set"),
@@ -88,8 +90,8 @@ def _entity(cur, eid, vf, vt, extra, labels=None, name="N", uuid="u1"):
          None if extra is None else Jsonb(extra)))
 
 
-def _rows(conn, table: str) -> list[dict]:
-    with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+def _rows(conn, table: str) -> list[dict[str, Any]]:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(f"SELECT xmin::text AS xmin, * FROM {table} ORDER BY 2, valid_from")
         return cur.fetchall()
 
@@ -163,7 +165,7 @@ def test_marker_prevents_a_second_run(conn):
     assert _rows(conn, "entities")[0]["extra"]["aliases"] == "{'b', 'a'}"
 
 
-def _device_item(entry, valid_from: datetime) -> dict:
+def _device_item(entry, valid_from: datetime) -> dict[str, Any]:
     params = RegistryListener(hass=MagicMock())._extract_device_params(entry, valid_from)
     return {"registry": "device", "action": "snapshot", "registry_id": entry.id,
             "old_id": None, "params": _to_json_safe(params),

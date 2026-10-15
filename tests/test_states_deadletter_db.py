@@ -11,6 +11,7 @@ import os
 import queue
 import threading
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,7 +28,7 @@ from custom_components.timescaledb_recorder.states_worker import (  # noqa: E402
 from custom_components.timescaledb_recorder.worker import StateRow  # noqa: E402
 from tests.db_guard import assert_disposable  # noqa: E402
 
-DSN = os.environ.get("SCD2_TEST_DSN")
+DSN = os.environ.get("SCD2_TEST_DSN", "")
 
 pytestmark = [
     pytest.mark.skipif(not DSN, reason="SCD2_TEST_DSN not set"),
@@ -47,7 +48,7 @@ def conn():
         yield c
 
 
-def _row(eid: str, attributes: dict, state: str = "on") -> StateRow:
+def _row(eid: str, attributes: dict[str, Any], state: str = "on") -> StateRow:
     return StateRow(entity_id=eid, state=state, attributes=attributes,
                     last_updated=T0, last_changed=T0)
 

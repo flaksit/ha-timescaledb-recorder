@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -94,7 +94,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         hass: HomeAssistant,
         dsn: str,
         live_queue: "OverflowQueue",
-        backfill_queue: queue.Queue,
+        backfill_queue: queue.Queue[Any],
         backfill_request: "asyncio.Event",
         stop_event: threading.Event,
         *,
@@ -126,7 +126,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         # Populated by outer try/except in run() when an unhandled exception escapes
         # the main loop.
         self._last_exception: Exception | None = None
-        self._last_context: dict = {
+        self._last_context: dict[str, Any] = {
             "at": None,
             "mode": "init",
             "retry_attempt": None,
@@ -542,9 +542,9 @@ class TimescaledbStateRecorderThread(threading.Thread):
             )
         self._hass.add_job(create_states_dropped_issue, self._hass)
 
-    def _slice_to_rows(self, slice_dict: dict) -> list[StateRow]:
+    def _slice_to_rows(self, slice_dict: dict[str, list[Any]]) -> list[StateRow]:
         """Merge per-entity lists, sort by last_updated, convert to StateRow (D-04-d)."""
-        all_states: list = []
+        all_states: list[Any] = []
         for states in slice_dict.values():
             all_states.extend(states)
         all_states.sort(key=lambda s: s.last_updated)

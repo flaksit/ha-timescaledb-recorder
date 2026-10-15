@@ -37,8 +37,9 @@ Read `.planning/research/SUMMARY.md` before planning any phase. Key constraints:
 - Python 3.14+, uv, direnv
 - HA custom component (HACS; minimum HA version in hacs.json)
 - TimescaleDB via psycopg3 (pinned in pyproject.toml and manifest.json; Renovate bumps both together)
-- voluptuous (config validation), attrs (registry serialization)
+- probatio (config validation; HA's voluptuous replacement), attrs (registry serialization)
 - pytest + pytest-asyncio + pytest-homeassistant-custom-component
+- basedpyright (`uv run basedpyright`, 0 errors enforced in CI)
 
 ## Project Conventions
 

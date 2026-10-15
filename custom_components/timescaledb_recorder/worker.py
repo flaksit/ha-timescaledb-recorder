@@ -24,7 +24,7 @@ class StateRow:
 
     entity_id: str
     state: str
-    attributes: dict
+    attributes: dict[str, Any]
     last_updated: datetime
     last_changed: datetime
 

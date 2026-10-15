@@ -17,7 +17,7 @@ def test_state_row_is_frozen():
     r = StateRow(entity_id="x.y", state="on", attributes={"a": 1},
                  last_updated=t, last_changed=t)
     with pytest.raises((AttributeError, Exception)):
-        r.state = "off"
+        r.state = "off"  # pyright: ignore[reportAttributeAccessIssue]  # proves frozen
 
 
 def test_state_row_slots_saves_memory():
@@ -30,7 +30,7 @@ def test_state_row_slots_saves_memory():
     r = StateRow(entity_id="x.y", state="on", attributes={},
                  last_updated=t, last_changed=t)
     with pytest.raises((AttributeError, TypeError)):
-        r.unknown_attr = 123  # slots=True rejects new attrs
+        r.unknown_attr = 123  # pyright: ignore[reportAttributeAccessIssue]  # slots=True rejects new attrs
 
 
 def test_from_state_copies_attributes_dict():

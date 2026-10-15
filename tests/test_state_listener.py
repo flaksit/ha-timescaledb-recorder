@@ -153,7 +153,7 @@ def test_stop_is_sync(listener):
 def test_listener_enqueue_never_raises_when_queue_full(hass):
     """OverflowQueue must absorb overflow without raising — @callback safety (D-02-b)."""
     q = OverflowQueue(maxsize=1)
-    entity_filter = lambda _eid: True
+    entity_filter = _make_filter()
     sl = StateListener(hass=hass, queue=q, entity_filter=entity_filter)
     event = MagicMock()
     new_state = MagicMock()

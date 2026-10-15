@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import psycopg
 import pytest
@@ -139,10 +139,10 @@ def test_track_names_op_after_function_and_preserves_qualname():
     seen = []
 
     def _insert_chunk_raw(x):
-        seen.append(tracker.oldest()[0])
+        seen.append(tracker.oldest())
         return x * 2
 
     wrapped = tracker.track(_insert_chunk_raw)
     assert wrapped(3) == 6
-    assert seen == ["insert_chunk"]
+    assert seen == [("insert_chunk", ANY)]
     assert wrapped.__qualname__ == _insert_chunk_raw.__qualname__

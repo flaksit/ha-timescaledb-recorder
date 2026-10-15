@@ -34,7 +34,7 @@ import json
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, LiteralString
 
 import psycopg
 import psycopg.rows
@@ -97,12 +97,20 @@ _VALID_FROM_INDEX = {
 }
 
 # (close, guarded insert) per registry.
-_SCD2_SQL = {
+_SCD2_SQL: dict[str, tuple[LiteralString, LiteralString]] = {
     "entity": (SCD2_CLOSE_ENTITY_SQL, SCD2_SNAPSHOT_ENTITY_SQL),
     "device": (SCD2_CLOSE_DEVICE_SQL, SCD2_SNAPSHOT_DEVICE_SQL),
     "area": (SCD2_CLOSE_AREA_SQL, SCD2_SNAPSHOT_AREA_SQL),
     "label": (SCD2_CLOSE_LABEL_SQL, SCD2_SNAPSHOT_LABEL_SQL),
 }
+
+def _require_params(action: str, params: tuple[Any, ...] | None) -> tuple[Any, ...]:
+    """params of an action that writes a version; only remove and sweep carry none."""
+    if params is None:
+        # Non-transient, so retry_until_success dead-letters the item.
+        raise ValueError(f"metadata item with action {action!r} carries no params")
+    return params
+
 
 # labels slot per registry that has one (see _extract_*_params). extra is last.
 _LABELS_INDEX = {
@@ -144,7 +152,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         # so watchdog can read these even if run() never executes. (MEDIUM-8)
         # meta_worker has no mode state machine, so mode is always None.
         self._last_exception: Exception | None = None
-        self._last_context: dict = {
+        self._last_context: dict[str, Any] = {
             "at": None,
             "mode": None,       # meta_worker has no mode state machine
             "retry_attempt": None,
@@ -397,7 +405,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
     # Dispatch (D-05-c)
     # ------------------------------------------------------------------
 
-    def _write_item_raw(self, item: dict) -> None:
+    def _write_item_raw(self, item: dict[str, Any]) -> None:
         """Dispatch one item, dropping items the SCD2 invariant refuses.
 
         Raises on any other error. Called as self._write_item (the
@@ -427,7 +435,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             )
             self._dead_letter(item, DEADLETTER_REASON_INTEGRITY, str(err))
 
-    def _drop_poison_item(self, exc: Exception, item: dict) -> None:
+    def _drop_poison_item(self, exc: Exception, item: dict[str, Any]) -> None:
         """retry_until_success on_poison hook: give up on an item that cannot be written."""
         self.poison_drops += 1
         _LOGGER.error(
@@ -437,7 +445,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         )
         self._dead_letter(item, DEADLETTER_REASON_POISON, repr(exc))
 
-    def _dead_letter(self, item: dict, reason: str, error: str) -> None:
+    def _dead_letter(self, item: dict[str, Any], reason: str, error: str) -> None:
         """Record an item the worker is about to stop trying to write.
 
         Best-effort by construction: it runs on a connection that has just
@@ -462,7 +470,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             )
         self._hass.add_job(create_metadata_dropped_issue, self._hass)
 
-    def _dispatch_item(self, item: dict) -> None:
+    def _dispatch_item(self, item: dict[str, Any]) -> None:
         """Route one item to the per-registry SCD2 path."""
         registry = item["registry"]
         action = item["action"]
@@ -479,9 +487,9 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         elif action == "remove":
             self._process_remove(registry, registry_id, close_ts)
         elif action == "update" and old_id is not None:
-            self._process_rename(registry, registry_id, old_id, params, close_ts)
+            self._process_rename(registry, registry_id, old_id, _require_params(action, params), close_ts)
         elif action in _RECONCILE_ACTIONS:
-            self._process_reconcile(registry, registry_id, params, close_ts)
+            self._process_reconcile(registry, registry_id, _require_params(action, params), close_ts)
         else:
             _LOGGER.warning("Unknown action in metadata item: %s", action)
 
@@ -593,7 +601,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
 
     @staticmethod
     def _close_timestamp(
-        registry: str, params: tuple | None, enqueued_at: str | None = None
+        registry: str, params: tuple[Any, ...] | None, enqueued_at: str | None = None
     ) -> datetime:
         """Timestamp used to expire the outgoing version — always event time.
 
@@ -624,7 +632,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
                 )
         return datetime.now(timezone.utc)
 
-    def _rehydrate_params(self, registry: str, params: list | None) -> tuple | None:
+    def _rehydrate_params(self, registry: str, params: list[Any] | None) -> tuple[Any, ...] | None:
         """Convert JSON-safe params list back to a tuple with datetime in the
         valid_from slot. Returns None if params is None (remove actions).
 
@@ -653,7 +661,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
     # can be renamed, so only entity items ever carry an old_id.
     # ------------------------------------------------------------------
 
-    def _row_changed(self, registry: str, dict_cur, registry_id: str, params: tuple) -> bool:
+    def _row_changed(self, registry: str, dict_cur, registry_id: str, params: tuple[Any, ...]) -> bool:
         """The registry listener's change detection — the one definition of "same version"."""
         comparators = {
             "entity": self._registry_listener._entity_row_changed,
@@ -671,7 +679,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             cur.execute(close_sql, (close_ts, registry_id, close_ts))
             self._note_removal_skipped(cur, registry, registry_id, close_ts)
 
-    def _process_sweep(self, item: dict, registry: str, live_ids: list[str],
+    def _process_sweep(self, item: dict[str, Any], registry: str, live_ids: list[str],
                        close_ts: datetime) -> None:
         """Close every open row whose id the registry no longer holds, at close_ts.
 
@@ -682,7 +690,10 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         conn = self.get_db_connection()
         with conn.transaction(), conn.cursor() as cur:
             cur.execute(SCD2_SWEEP_COUNT_SQL[registry], (close_ts, live_ids))
-            open_rows, to_close = cur.fetchone()
+            row = cur.fetchone()
+            if row is None:
+                raise AssertionError("count query returned no row")
+            open_rows, to_close = row
             if open_rows and not live_ids:
                 _LOGGER.warning(
                     "%s: %s registry listed no entries but %d row(s) are open; "
@@ -710,7 +721,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
         )
 
     def _process_rename(self, registry: str, registry_id: str, old_id: str,
-                        params: tuple, close_ts: datetime) -> None:
+                        params: tuple[Any, ...], close_ts: datetime) -> None:
         """Close the old id and insert under the new one, atomically.
 
         Always stamped at event time, never created_at: the registry entry
@@ -724,7 +735,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             self._note_version_skipped(cur, registry, registry_id, close_ts, params)
 
     def _process_reconcile(self, registry: str, registry_id: str,
-                           params: tuple, close_ts: datetime) -> None:
+                           params: tuple[Any, ...], close_ts: datetime) -> None:
         """Make the open version match `params`: create, update and snapshot.
 
         No open row → insert; open row equal → nothing; differs → close+insert at
@@ -749,7 +760,7 @@ class TimescaledbMetaRecorderThread(threading.Thread):
             self._note_version_skipped(cur, registry, registry_id, close_ts, params)
 
     def _first_version_params(self, cur, registry: str, registry_id: str,
-                              params: tuple) -> tuple:
+                              params: tuple[Any, ...]) -> tuple[Any, ...]:
         """Start an id's first version at its registry entry's created_at.
 
         The event, and even more so the startup snapshot, arrives after HA has

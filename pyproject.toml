@@ -9,8 +9,16 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
+    "basedpyright==1.40.2",
     "psycopg[binary]==3.3.3",
     "pytest>=9.0",
     "pytest-asyncio>=0.24",
     "pytest-homeassistant-custom-component==0.13.372",
 ]
+
+[tool.basedpyright]
+# "standard" plus a few cheap, high-signal rules. The "recommended"/"all" sets add thousands of
+# reportUnknown*/reportAny warnings driven by HA/psycopg/MagicMock typing, which are noise here.
+typeCheckingMode = "standard"
+reportMissingTypeArgument = "error"
+reportUnnecessaryTypeIgnoreComment = "error"

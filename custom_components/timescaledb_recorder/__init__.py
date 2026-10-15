@@ -223,15 +223,11 @@ async def _overflow_watcher(
 def _sync_recorder_issue(hass: HomeAssistant, was_available: bool | None) -> bool:
     """Raise or clear the recorder_disabled issue if availability changed; return it.
 
-    Available means HA's recorder is loaded and Recorder.enabled is True.
-    KeyError from get_instance means the recorder integration is not loaded.
-    was_available=None forces a sync: the issue registry persists across
+    The recorder is a manifest dependency, so it is always loaded here; it is
+    unavailable only while disabled via recorder.disable. was_available=None forces a sync: the issue registry persists across
     restarts, so a stale issue from a previous run must be cleared at setup.
     """
-    try:
-        available = bool(ha_recorder.get_instance(hass).enabled)
-    except KeyError:
-        available = False
+    available = bool(ha_recorder.get_instance(hass).enabled)
     if available != was_available:
         if available:
             clear_recorder_disabled_issue(hass)
@@ -408,11 +404,10 @@ async def async_setup_entry(
 
     async_at_started(hass, _enqueue_registry_snapshot)
 
-    # D-11: recorder_disabled detection. Backfill requires HA's sqlite
-    # recorder; raise a repair issue while it is not loaded or disabled, clear
-    # it when it is available (OBS-03). after_dependencies orders our setup
-    # after the recorder's, and Recorder.enabled starts True, so a recorder
-    # that is merely still starting does not raise the issue.
+    # D-11: recorder_disabled detection. Backfill reads HA's recorder; raise a
+    # repair issue while it is disabled, clear it when re-enabled (OBS-03).
+    # The recorder is a manifest dependency: HA sets it up before us and
+    # refuses to set us up if it fails, so get_instance cannot raise here.
     recorder_available = _sync_recorder_issue(hass, None)
     data.recorder_watcher_task = hass.async_create_background_task(
         _recorder_watcher(hass, loop_stop_event, recorder_available),

@@ -5,7 +5,7 @@
   "documentation": "https://github.com/flaksit/ha-timescaledb-recorder",
   "issue_tracker": "https://github.com/flaksit/ha-timescaledb-recorder/issues",
   "codeowners": ["@flaksit"],
-  "after_dependencies": ["recorder"],
+  "dependencies": ["recorder"],
   "requirements": ["psycopg[binary]==3.3.3"],
   "config_flow": true,
   "integration_type": "service",

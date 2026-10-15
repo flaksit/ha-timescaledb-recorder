@@ -902,53 +902,6 @@ async def test_orchestrator_relaunch_aborts_if_stop_event_set_during_sleep():
 # Phase 3: recorder_disabled check
 # ---------------------------------------------------------------------------
 
-async def test_recorder_disabled_check_fires_issue_on_keyerror(hass, mock_entry):
-    """create_recorder_disabled_issue must be called when recorder.get_instance raises KeyError."""
-    with patch(
-        "custom_components.timescaledb_recorder.PersistentQueue"
-    ) as MockPQ, patch(
-        "custom_components.timescaledb_recorder.TimescaledbMetaRecorderThread"
-    ), patch(
-        "custom_components.timescaledb_recorder.TimescaledbStateRecorderThread"
-    ), patch(
-        "custom_components.timescaledb_recorder.RegistryListener"
-    ) as MockRL, patch(
-        "custom_components.timescaledb_recorder.StateListener"
-    ) as MockSL, patch(
-        "custom_components.timescaledb_recorder._overflow_watcher", new=AsyncMock(),
-    ), patch(
-        "custom_components.timescaledb_recorder.spawn_states_worker"
-    ) as mock_spawn_sw, patch(
-        "custom_components.timescaledb_recorder.spawn_meta_worker"
-    ) as mock_spawn_mw, patch(
-        "custom_components.timescaledb_recorder.watchdog_loop", return_value=None,
-    ), patch(
-        "custom_components.timescaledb_recorder.ha_recorder",
-    ) as mock_recorder, patch(
-        "custom_components.timescaledb_recorder.create_recorder_disabled_issue",
-    ) as mock_create_issue, patch(
-        "custom_components.timescaledb_recorder._recorder_watcher",
-        new=AsyncMock(),
-    ):
-        MockPQ.return_value.join = AsyncMock()
-        MockRL.return_value.async_start = AsyncMock()  # registry_listener
-        MockSL.return_value.async_start = MagicMock()
-
-        mock_spawn_sw.return_value = MagicMock()
-        mock_spawn_sw.return_value.start = MagicMock()
-        mock_spawn_sw.return_value.read_watermark = MagicMock()
-        mock_spawn_sw.return_value.read_open_entities = MagicMock()
-        mock_spawn_mw.return_value = MagicMock()
-        mock_spawn_mw.return_value.start = MagicMock()
-
-        # Recorder not loaded — raises KeyError
-        mock_recorder.get_instance.side_effect = KeyError("recorder")
-
-        await async_setup_entry(hass, mock_entry)
-
-    mock_create_issue.assert_called_once_with(hass)
-
-
 async def test_recorder_disabled_check_fires_issue_when_enabled_false(hass, mock_entry):
     """create_recorder_disabled_issue must be called when recorder instance has enabled=False."""
     with patch(
@@ -1093,7 +1046,7 @@ async def test_recorder_disabled_spawns_watcher_task(hass, mock_entry):
         mock_spawn_mw.return_value = MagicMock()
         mock_spawn_mw.return_value.start = MagicMock()
 
-        mock_recorder.get_instance.side_effect = KeyError("recorder")
+        mock_recorder.get_instance.return_value = MagicMock(enabled=False)
 
         # Track what async_create_background_task was called with
         created_coros = []
@@ -1110,18 +1063,14 @@ async def test_recorder_disabled_spawns_watcher_task(hass, mock_entry):
     )
 
 
-def _recorder_mock(mock_recorder, state):
-    """Configure the patched ha_recorder: state is "missing", True or False."""
-    if state == "missing":
-        mock_recorder.get_instance.side_effect = KeyError("recorder")
-    else:
-        mock_recorder.get_instance.return_value = MagicMock(enabled=state)
+def _recorder_mock(mock_recorder, enabled):
+    """Configure the patched ha_recorder's instance with the given enabled flag."""
+    mock_recorder.get_instance.return_value = MagicMock(enabled=enabled)
 
 
 @pytest.mark.parametrize(
     ("state", "was_available", "expected", "created", "cleared"),
     [
-        ("missing", None, False, True, False),
         (False, None, False, True, False),
         (True, None, True, False, True),   # clears an issue persisted from a previous run
         (True, False, True, False, True),  # recorder.enable after recorder.disable

@@ -151,8 +151,8 @@ def clear_db_unreachable_issue(hass: HomeAssistant) -> None:
 def create_recorder_disabled_issue(hass: HomeAssistant) -> None:
     """Register the recorder_disabled repair issue (D-11).
 
-    Fired while HA's sqlite recorder is not loaded or is disabled (setup
-    check + recorder watcher in __init__.py). Severity WARNING — the integration still operates, but backfill
+    Fired while HA's recorder is disabled via recorder.disable (setup check
+    + recorder watcher in __init__.py). Severity WARNING — the integration still operates, but backfill
     after a DB outage is unavailable. Idempotent.
     """
     ir.async_create_issue(

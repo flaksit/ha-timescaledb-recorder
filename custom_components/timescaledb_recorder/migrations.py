@@ -43,7 +43,7 @@ def canonicalize_dimension_rows(conn: psycopg.Connection) -> dict[str, int]:
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.execute(SCD2_REPAIR_LOCK_TIMEOUT_SQL)
-                cur.execute(SCD2_REPAIR_LOCK_SQL.format(table=table))
+                cur.execute(SCD2_REPAIR_LOCK_SQL[table])
             rewritten[table] = _canonicalize_table(conn, table)
             if table == last:
                 with conn.cursor() as cur:

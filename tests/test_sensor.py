@@ -319,7 +319,7 @@ def test_last_write_sensor_is_diagnostic_timestamp():
     assert sensor.entity_category == EntityCategory.DIAGNOSTIC
     assert sensor.should_poll is False
     assert sensor.unique_id == "test_entry_id_last_write"
-    assert sensor.device_info["identifiers"] == {("timescaledb_recorder", "test_entry_id")}
+    assert (sensor.device_info or {}).get("identifiers") == {("timescaledb_recorder", "test_entry_id")}
 
 
 @pytest.mark.asyncio
@@ -333,7 +333,7 @@ async def test_last_write_sensor_reads_runtime_stats_on_timer():
     entry.runtime_data.states_stats = StatesWriteStats()
     sensor = TimescaledbLastWriteSensor(entry)
     sensor.hass = MagicMock()
-    sensor.async_write_ha_state = MagicMock()
+    sensor.async_write_ha_state = MagicMock()  # pyright: ignore[reportAttributeAccessIssue]  # stub HA state write
 
     with patch(
         "custom_components.timescaledb_recorder.sensor.async_track_time_interval",

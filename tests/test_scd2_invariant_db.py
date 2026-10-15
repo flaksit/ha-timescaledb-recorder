@@ -19,12 +19,14 @@ that, which repairs in place instead of rebuilding.
 import os
 import threading
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 pytest.importorskip("psycopg")
 import psycopg  # noqa: E402  pyright: ignore[reportMissingImports]
+from psycopg.types.json import Jsonb  # noqa: E402  pyright: ignore[reportMissingImports]
 
 from custom_components.timescaledb_recorder import const, repair_scd2  # noqa: E402
 from custom_components.timescaledb_recorder.meta_worker import (  # noqa: E402
@@ -35,7 +37,7 @@ from custom_components.timescaledb_recorder.registry_listener import (  # noqa: 
 )
 from tests.db_guard import assert_disposable  # noqa: E402
 
-DSN = os.environ.get("SCD2_TEST_DSN")
+DSN = os.environ.get("SCD2_TEST_DSN", "")
 
 pytestmark = [
     pytest.mark.skipif(not DSN, reason="SCD2_TEST_DSN not set"),
@@ -126,7 +128,7 @@ def damaged(conn):
     return conn
 
 
-def _violations(conn) -> dict:
+def _violations(conn) -> dict[str, int]:
     """Total offending rows per dimension across every verification check."""
     results = repair_scd2.run_verification(conn)
     return {t: sum(v.values()) for t, v in results.items()}
@@ -137,7 +139,7 @@ def _repair(conn, run: str = "test", collapse: bool = False) -> None:
         repair_scd2.repair_table(conn, table, run, run, collapse)
 
 
-def _snapshot(conn) -> list:
+def _snapshot(conn) -> list[tuple[Any, ...]]:
     with conn.cursor() as cur:
         cur.execute("SELECT entity_id, name, valid_from, valid_to FROM entities"
                     " ORDER BY entity_id, valid_from, name")
@@ -560,7 +562,7 @@ T2 = T1 + timedelta(seconds=5)
 SNAP = T1 + timedelta(seconds=30)
 
 
-def _rows(conn, entity_id: str) -> list:
+def _rows(conn, entity_id: str) -> list[tuple[Any, ...]]:
     with conn.cursor() as cur:
         cur.execute("SELECT name, valid_from, valid_to FROM entities"
                     " WHERE entity_id = %s ORDER BY valid_from", (entity_id,))
@@ -680,7 +682,7 @@ def _sweep(registry, live_ids, ts=SNAP):
             "params": None, "live_ids": live_ids, "enqueued_at": ts.isoformat()}
 
 
-def _open_ids(conn) -> list:
+def _open_ids(conn) -> list[str]:
     with conn.cursor() as cur:
         cur.execute("SELECT entity_id FROM entities WHERE valid_to IS NULL ORDER BY 1")
         return [r[0] for r in cur.fetchall()]
@@ -1211,7 +1213,7 @@ def _add_state(conn, entity_id: str, ts: datetime) -> None:
                     " VALUES (%s,%s,%s,'1')", (ts, ts, entity_id))
 
 
-def _starts(conn, entity_id: str) -> list:
+def _starts(conn, entity_id: str) -> list[datetime]:
     with conn.cursor() as cur:
         cur.execute("SELECT valid_from FROM entities WHERE entity_id = %s"
                     " ORDER BY valid_from", (entity_id,))
@@ -1296,8 +1298,8 @@ def test_alignment_alone_makes_apply_mutate(damaged, monkeypatch):
 LATE_FROM = BASE + timedelta(days=60)
 
 
-def _created(ts: datetime) -> psycopg.types.json.Jsonb:
-    return psycopg.types.json.Jsonb({"created_at": ts.isoformat()})
+def _created(ts: datetime) -> Jsonb:
+    return Jsonb({"created_at": ts.isoformat()})
 
 
 def _add_late(conn, entity_id: str, created_at: datetime, first_state: datetime,
@@ -1317,7 +1319,7 @@ def _add_late_device(conn, device_id: str, created_at: datetime) -> None:
                     (device_id, LATE_FROM, _created(created_at)))
 
 
-def _device_starts(conn, device_id: str) -> list:
+def _device_starts(conn, device_id: str) -> list[datetime]:
     with conn.cursor() as cur:
         cur.execute("SELECT valid_from FROM devices WHERE device_id = %s"
                     " ORDER BY valid_from", (device_id,))

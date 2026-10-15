@@ -11,8 +11,8 @@ async def test_show_form():
     flow = TimescaledbConfigFlow()
     flow.hass = MagicMock()
     result = await flow.async_step_user(None)
-    assert result["type"] == "form"
-    assert result["step_id"] == "user"
+    assert result.get("type") == "form"
+    assert result.get("step_id") == "user"
 
 
 async def test_valid_dsn():
@@ -24,9 +24,9 @@ async def test_valid_dsn():
         new=AsyncMock(return_value=mock_conn),
     ):
         result = await flow.async_step_user({CONF_DSN: "postgresql://user:pass@localhost/db"})
-    assert result["type"] == "create_entry"
-    assert result["title"] == "TimescaleDB"
-    assert result["data"][CONF_DSN] == "postgresql://user:pass@localhost/db"
+    assert result.get("type") == "create_entry"
+    assert result.get("title") == "TimescaleDB"
+    assert result.get("data") == {CONF_DSN: "postgresql://user:pass@localhost/db"}
     mock_conn.close.assert_awaited_once()
 
 
@@ -38,5 +38,5 @@ async def test_invalid_dsn():
         new=AsyncMock(side_effect=Exception("connection refused")),
     ):
         result = await flow.async_step_user({CONF_DSN: "postgresql://bad/db"})
-    assert result["type"] == "form"
-    assert result["errors"]["base"] == "cannot_connect"
+    assert result.get("type") == "form"
+    assert result.get("errors") == {"base": "cannot_connect"}

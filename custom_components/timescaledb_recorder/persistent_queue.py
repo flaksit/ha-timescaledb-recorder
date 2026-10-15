@@ -62,7 +62,7 @@ class PersistentQueue:
         """
         return self._size
 
-    def put(self, item: dict) -> None:
+    def put(self, item: dict[str, Any]) -> None:
         """Blocking producer path: append JSON line, fsync, notify consumer.
 
         Called from any thread. Holds _lock for the duration of the append.
@@ -79,7 +79,7 @@ class PersistentQueue:
             self._size += 1
             self._cond.notify_all()
 
-    async def put_async(self, item: dict) -> None:
+    async def put_async(self, item: dict[str, Any]) -> None:
         """Async producer path for event-loop callers (syncer @callbacks).
 
         D-03-c: offloads blocking file I/O to the default executor so the event
@@ -88,7 +88,7 @@ class PersistentQueue:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.put, item)
 
-    def put_many(self, items: list[dict]) -> None:
+    def put_many(self, items: list[dict[str, Any]]) -> None:
         """Batched producer: append N JSON lines with ONE fsync and ONE notify.
 
         Issue #11: HA bootstrap was blocked by N synchronous fsyncs during the
@@ -112,7 +112,7 @@ class PersistentQueue:
             self._size += len(items)
             self._cond.notify_all()
 
-    async def put_many_async(self, items: list[dict]) -> None:
+    async def put_many_async(self, items: list[dict[str, Any]]) -> None:
         """Async batched producer — parity with put_async, single fsync.
 
         Used by RegistryListener._flush_buffer to write each drained batch,
@@ -128,7 +128,7 @@ class PersistentQueue:
     # Consumer paths (D-03-d, D-03-e, D-03-f, D-03-g)
     # ------------------------------------------------------------------
 
-    def get(self) -> dict | None:
+    def get(self) -> dict[str, Any] | None:
         """Block until an item is available; return the front item WITHOUT
         removing it from disk.
 

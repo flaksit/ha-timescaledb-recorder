@@ -83,7 +83,7 @@ def retry_until_success(
     stall_threshold: int = STALL_THRESHOLD,
     poison_max_attempts: int = POISON_MAX_ATTEMPTS,
     poison_min_seconds: float | None = None,
-) -> Callable:
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Retry decorator for thread-worker DB calls.
 
     IMPORTANT: This decorator uses threading.Event.wait(backoff) which is a
@@ -146,7 +146,7 @@ def retry_until_success(
         - Returns None if stop_event is set during a backoff wait (D-07-e).
     """
 
-    def decorator(fn: Callable) -> Callable:
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             attempts = 0

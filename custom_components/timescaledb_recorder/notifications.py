@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import traceback
+from typing import Any
 
 from homeassistant.components import persistent_notification
 from homeassistant.core import HomeAssistant
@@ -50,7 +51,7 @@ def notify_watchdog_recovery(
     hass: HomeAssistant,
     component: str,
     exc: BaseException | None,
-    context: dict | None = None,
+    context: dict[str, Any] | None = None,
 ) -> None:
     """Fire a persistent_notification + full-traceback log for a watchdog-
     driven recovery event. Safe to call directly on the event loop; from a
@@ -128,7 +129,7 @@ def notify_watchdog_recovery(
 def notify_backfill_gap(
     hass: HomeAssistant,
     reason: str,
-    details: dict | None = None,
+    details: dict[str, Any] | None = None,
 ) -> None:
     """Fire a persistent_notification for recorder-retention overrun (D-08).
 

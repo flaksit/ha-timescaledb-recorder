@@ -23,6 +23,7 @@ SCD2_ALLOW_DESTRUCTIVE=1 says the target really is disposable.
 import os
 import threading
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -39,7 +40,7 @@ from custom_components.timescaledb_recorder.registry_listener import (  # noqa: 
 )
 from tests.db_guard import assert_disposable  # noqa: E402
 
-DSN = os.environ.get("SCD2_REAL_COPY_DSN")
+DSN = os.environ.get("SCD2_REAL_COPY_DSN", "")
 
 pytestmark = [
     pytest.mark.skipif(not DSN, reason="SCD2_REAL_COPY_DSN not set"),
@@ -52,7 +53,7 @@ pytestmark = [
 _RUN = datetime.now(timezone.utc).strftime("pytest%Y%m%d%H%M%S")
 
 
-def _clean() -> dict:
+def _clean() -> dict[str, int]:
     return {t: 0 for t, _key in const.SCD2_DIMENSIONS}
 
 
@@ -83,11 +84,11 @@ def baseline(conn):
     }
 
 
-def _violations(conn) -> dict:
+def _violations(conn) -> dict[str, int]:
     return {t: sum(v.values()) for t, v in repair_scd2.run_verification(conn).items()}
 
 
-def _row_counts(conn) -> dict:
+def _row_counts(conn) -> dict[str, int]:
     out = {}
     with conn.cursor() as cur:
         for table, _key in const.SCD2_DIMENSIONS:
@@ -96,7 +97,7 @@ def _row_counts(conn) -> dict:
     return out
 
 
-def _gap_set(conn) -> set:
+def _gap_set(conn) -> set[tuple[Any, ...]]:
     """Every period an entity's history leaves uncovered, as (id, start, end).
 
     "The repair preserves gaps" was asserted only on synthetic data, where the
@@ -123,9 +124,9 @@ def _gap_set(conn) -> set:
         return set(cur.fetchall())
 
 
-def _eras(conn) -> dict:
+def _eras(conn) -> dict[str, list[tuple[datetime, datetime | None]]]:
     """Every recorded interval per entity_id, open rows as (from, None)."""
-    out: dict = {}
+    out: dict[str, list[tuple[datetime, datetime | None]]] = {}
     with conn.cursor() as cur:
         cur.execute("SELECT entity_id, valid_from, valid_to FROM entities")
         for entity_id, valid_from, valid_to in cur.fetchall():
@@ -133,13 +134,13 @@ def _eras(conn) -> dict:
     return out
 
 
-def _covers(eras: list, start, end) -> bool:
+def _covers(eras: list[tuple[datetime, datetime | None]], start, end) -> bool:
     """Does any era overlap [start, end)?"""
     return any(era_from < end and (era_to is None or era_to > start)
                for era_from, era_to in eras)
 
 
-def _valid_from_checksum(conn) -> dict:
+def _valid_from_checksum(conn) -> dict[str, str]:
     """Fingerprint of every (id, valid_from) pair — the field repair must not write."""
     out = {}
     with conn.cursor() as cur:
@@ -151,7 +152,7 @@ def _valid_from_checksum(conn) -> dict:
     return out
 
 
-def _starts(conn) -> dict:
+def _starts(conn) -> dict[str, list[tuple[str, datetime]]]:
     """Every (id, valid_from) pair per table, for diffing what the repair moved."""
     out = {}
     with conn.cursor() as cur:

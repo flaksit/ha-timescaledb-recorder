@@ -9,11 +9,12 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class OverflowQueue(queue.Queue):
+class OverflowQueue(queue.Queue[Any]):
     """FIFO queue whose put_nowait drops the newest item on full instead of raising.
 
     Consumers:
@@ -48,7 +49,7 @@ class OverflowQueue(queue.Queue):
         # Monotonically increasing — sensors track deltas externally.
         self._total_dropped: int = 0
 
-    def put_nowait(self, item) -> None:  # type: ignore[override]
+    def put_nowait(self, item: Any) -> None:
         """Non-blocking enqueue. Drops the item silently on full.
 
         Never raises queue.Full. First drop per outage logs a single warning

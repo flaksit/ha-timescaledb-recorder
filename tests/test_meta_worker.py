@@ -2,7 +2,8 @@
 import re
 import threading
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, call, patch
+from typing import cast
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -222,7 +223,7 @@ def test_sweep_closes_rows_missing_from_the_registry(mock_psycopg_conn, caplog):
         call(SCD2_SWEEP_CLOSE_SQL["entity"], (ts, ts, ["sensor.a"])),
     ]
     assert "closed 3 open entity row(s)" in caplog.text
-    w._hass.add_job.assert_not_called()
+    cast(MagicMock, w._hass).add_job.assert_not_called()
 
 
 def test_sweep_allows_a_few_closes_on_a_small_table(mock_psycopg_conn):
@@ -270,7 +271,7 @@ def test_sweep_refuses_to_close_most_open_rows(mock_psycopg_conn, caplog):
     assert (reason, registry, registry_id) == (DEADLETTER_REASON_SWEEP_REFUSED, "entity", None)
     assert "51 of 100" in error
     assert "refused the startup removal sweep" in caplog.text
-    assert call(create_metadata_dropped_issue, w._hass) in w._hass.add_job.call_args_list
+    assert call(create_metadata_dropped_issue, w._hass) in cast(MagicMock, w._hass).add_job.call_args_list
 
 
 def test_unknown_action_is_ignored(mock_psycopg_conn):
@@ -765,7 +766,7 @@ def test_poison_item_is_dropped_and_queue_moves_on(mock_psycopg_conn):
     reason, registry, registry_id, error, _item = dl[0].args[1]
     assert (reason, registry, registry_id) == (DEADLETTER_REASON_POISON, "entity", "bad.one")
     assert "cannot serialise" in error
-    assert call(create_metadata_dropped_issue, w._hass) in w._hass.add_job.call_args_list
+    assert call(create_metadata_dropped_issue, w._hass) in cast(MagicMock, w._hass).add_job.call_args_list
 
 
 def test_transient_failure_is_not_dropped(mock_psycopg_conn):
@@ -786,7 +787,7 @@ def test_transient_failure_is_not_dropped(mock_psycopg_conn):
         if errors:
             raise errors.pop(0)
 
-    w._dispatch_item = dispatch
+    w._dispatch_item = dispatch  # pyright: ignore[reportAttributeAccessIssue]  # stub the per-item step
     with patch(
         "custom_components.timescaledb_recorder.meta_worker.psycopg.connect",
         return_value=conn,
@@ -898,13 +899,13 @@ def test_pending_migration_runs_untimed_but_tracked(mock_psycopg_conn):
 
     def fake_migrate(_conn):
         seen["last_sql"] = cur.execute.call_args_list[-1].args[0]
-        seen["in_flight"] = w.db_calls.oldest()[0]
+        seen["in_flight"] = w.db_calls.oldest()
         return {}
 
     with patch(f"{_MW}.canonicalize_dimension_rows", side_effect=fake_migrate):
         assert w._migrate() is True
 
-    assert seen == {"last_sql": STATEMENT_TIMEOUT_DISABLE_SQL, "in_flight": "migrate"}
+    assert seen == {"last_sql": STATEMENT_TIMEOUT_DISABLE_SQL, "in_flight": ("migrate", ANY)}
     assert cur.execute.call_args_list[-1] == call(STATEMENT_TIMEOUT_RESTORE_SQL, ("5min",))
 
 
@@ -933,14 +934,17 @@ def test_rehydrate_canonicalizes_items_queued_by_older_versions():
     entity = w._rehydrate_params("entity", [
         "x.y", "u", "n", "sensor", "zha", None, None, ["b", "a"], None, None, None,
         "2026-04-21T12:00:00+00:00", json.dumps({"aliases": "{'z', 'y'}"})])
+    assert entity is not None
     assert entity[7] == ["a", "b"]
     assert json.loads(entity[-1]) == {"aliases": ["y", "z"]}
 
     device = w._rehydrate_params("device", [
         "d", "n", None, None, None, ["b", "a"], "2026-04-21T12:00:00+00:00",
         json.dumps({"identifiers": "{('hue', '2'), ('hue', '1')}"})])
+    assert device is not None
     assert device[5] == ["a", "b"]
     assert json.loads(device[-1]) == {"identifiers": [["hue", "1"], ["hue", "2"]]}
 
     area = w._rehydrate_params("area", ["a", "A", "2026-04-21T12:00:00+00:00", "{}"])
+    assert area is not None
     assert area[1:] == ("A", datetime(2026, 4, 21, 12, tzinfo=timezone.utc), "{}")

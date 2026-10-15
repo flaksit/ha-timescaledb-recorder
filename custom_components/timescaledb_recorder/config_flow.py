@@ -1,6 +1,6 @@
 """Config flow and options flow for TimescaleDB Recorder."""
 import psycopg
-import voluptuous as vol
+import probatio
 
 from homeassistant import config_entries
 
@@ -40,7 +40,7 @@ class TimescaledbConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={CONF_DSN: dsn},
                 )
 
-        schema = vol.Schema({vol.Required(CONF_DSN): str})
+        schema = probatio.Schema({probatio.Required(CONF_DSN): str})
         return self.async_show_form(
             step_id="user",
             data_schema=schema,
@@ -67,22 +67,22 @@ class TimescaledbOptionsFlow(config_entries.OptionsFlow):
 
         current = self._config_entry.options
 
-        schema = vol.Schema({
-            vol.Optional(
+        schema = probatio.Schema({
+            probatio.Optional(
                 CONF_BATCH_SIZE,
                 default=current.get(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE),
-            ): vol.All(int, vol.Range(min=1, max=10000)),
-            vol.Optional(
+            ): probatio.All(int, probatio.Range(min=1, max=10000)),
+            probatio.Optional(
                 CONF_FLUSH_INTERVAL,
                 default=current.get(CONF_FLUSH_INTERVAL, DEFAULT_FLUSH_INTERVAL),
-            ): vol.All(int, vol.Range(min=1, max=300)),
-            vol.Optional(
+            ): probatio.All(int, probatio.Range(min=1, max=300)),
+            probatio.Optional(
                 CONF_CHUNK_INTERVAL,
                 default=current.get(CONF_CHUNK_INTERVAL, DEFAULT_CHUNK_INTERVAL_DAYS),
-            ): vol.All(int, vol.Range(min=1, max=365)),
-            vol.Optional(
+            ): probatio.All(int, probatio.Range(min=1, max=365)),
+            probatio.Optional(
                 CONF_COMPRESS_AFTER,
                 default=current.get(CONF_COMPRESS_AFTER, DEFAULT_COMPRESS_AFTER_HOURS),
-            ): vol.All(int, vol.Range(min=1, max=720)),
+            ): probatio.All(int, probatio.Range(min=1, max=720)),
         })
         return self.async_show_form(step_id="init", data_schema=schema)

@@ -12,10 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from homeassistant.components.binary_sensor import (
-    BinarySensorDeviceClass,
-    BinarySensorEntity,
-)
+from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -76,10 +74,6 @@ class TimescaledbBufferOverflowSensor(BinarySensorEntity):
             )
         )
 
-    @property
-    def is_on(self) -> bool | None:
-        return self._attr_is_on
-
 
 class TimescaledbStatesWorkerAliveSensor(BinarySensorEntity):
     """States worker liveness: on when the worker thread is running.
@@ -125,10 +119,6 @@ class TimescaledbStatesWorkerAliveSensor(BinarySensorEntity):
             )
         )
 
-    @property
-    def is_on(self) -> bool | None:
-        return self._attr_is_on
-
 
 class TimescaledbMetaWorkerAliveSensor(BinarySensorEntity):
     """Metadata worker liveness: on when the worker thread is running.
@@ -167,10 +157,6 @@ class TimescaledbMetaWorkerAliveSensor(BinarySensorEntity):
                 self.hass, SIGNAL_WORKER_STATE_CHANGE, _handle_worker_change,
             )
         )
-
-    @property
-    def is_on(self) -> bool | None:
-        return self._attr_is_on
 
 
 async def async_setup_entry(

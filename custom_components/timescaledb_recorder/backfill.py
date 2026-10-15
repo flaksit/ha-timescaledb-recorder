@@ -12,11 +12,11 @@ import logging
 import queue
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Any, Callable
 
-from homeassistant.components import recorder
+from homeassistant.helpers import recorder
 from homeassistant.components.recorder import history as recorder_history
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 
 from .issues import clear_buffer_dropping_issue
 from .notifications import notify_backfill_gap
@@ -38,7 +38,7 @@ def _fetch_slice_raw(
     entities: set[str],
     t_start: datetime,
     t_end: datetime,
-) -> dict:
+) -> dict[str, list[State | dict[str, Any]]]:
     """Return dict[entity_id -> list[HA State]] for all state rows in [t_start, t_end).
 
     D-08-e: runs in the HA recorder executor pool. include_start_time_state=False
@@ -68,10 +68,10 @@ async def backfill_orchestrator(
     hass: HomeAssistant,
     *,
     live_queue,                                      # OverflowQueue
-    backfill_queue: queue.Queue,
+    backfill_queue: queue.Queue[Any],
     backfill_request: asyncio.Event,
     read_watermark: Callable[[], "datetime | None"],  # sync; runs in executor
-    all_entities_reader: Callable[[], set],            # sync; runs in executor
+    all_entities_reader: Callable[[], set[str]],            # sync; runs in executor
     entity_filter: Callable[[str], bool],
     stop_event: asyncio.Event,
     threading_stop_event: threading.Event,           # NEW — used by retry wrap for _fetch_slice_raw

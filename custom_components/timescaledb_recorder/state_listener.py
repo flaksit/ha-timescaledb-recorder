@@ -1,7 +1,7 @@
 """StateListener: thin event relay that enqueues state changes to the worker queue."""
 import logging
 
-from homeassistant.core import HomeAssistant, Event, callback
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.helpers.entityfilter import EntityFilter
 
 from .overflow_queue import OverflowQueue
@@ -42,7 +42,7 @@ class StateListener:
         )
 
     @callback
-    def _handle_state_changed(self, event: Event) -> None:
+    def _handle_state_changed(self, event: Event[EventStateChangedData]) -> None:
         """Handle state_changed events — synchronous, never awaits.
 
         put_nowait() is non-blocking and thread-safe from an asyncio @callback context.

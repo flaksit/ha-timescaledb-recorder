@@ -85,9 +85,10 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
+from typing import Any, LiteralString, cast
 
-import psycopg  # pyright: ignore[reportMissingImports]
-from psycopg.types.json import Jsonb  # pyright: ignore[reportMissingImports]
+import psycopg
+from psycopg.types.json import Jsonb
 
 try:
     from .const import (
@@ -138,7 +139,7 @@ except ImportError:
     # Executed as a plain script (docker exec python3 .../repair_scd2.py), so the
     # package context does not exist and the relative import fails.
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
-    from const import (  # pyright: ignore[reportMissingImports]
+    from const import (
         CANONICAL_SETS_MIGRATION_ID,
         SCHEMA_MIGRATION_APPLIED_SQL,
         SCD2_DIMENSIONS,
@@ -221,10 +222,18 @@ def _redact(dsn: str) -> str:
     return re.sub(r"(?i)\bpassword\s*=\s*('(?:[^']|'')*'|\S+)", "password=***", dsn)
 
 
-def _scalar(cur, sql: str, params: tuple = ()) -> object:
+def _scalar(cur: psycopg.Cursor[Any], sql: LiteralString, params: tuple[object, ...] = ()) -> Any:
     cur.execute(sql, params)
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def _one_row(cur: psycopg.Cursor[Any]) -> Any:
+    """fetchone() for a query that always yields a row (aggregates, server info)."""
+    row = cur.fetchone()
+    if row is None:
+        raise AssertionError("query returned no row")
+    return row
 
 
 def print_identity(conn: psycopg.Connection) -> None:
@@ -239,7 +248,7 @@ def print_identity(conn: psycopg.Connection) -> None:
             "SELECT current_database(), inet_server_addr(), inet_server_port(),"
             " current_user, version()"
         )
-        db, addr, port, user, version = cur.fetchone()
+        db, addr, port, user, version = _one_row(cur)
     print(f"  database : {db}")
     print(f"  server   : {addr}:{port}")
     print(f"  user     : {user}")
@@ -521,8 +530,9 @@ def repair_table(
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(SCD2_REPAIR_LOCK_TIMEOUT_SQL)
-            cur.execute(SCD2_REPAIR_LOCK_SQL.format(table=table))
-            cur.execute(SCD2_REPAIR_BACKUP_SQL.format(backup=backup, table=table))
+            cur.execute(SCD2_REPAIR_LOCK_SQL[table])
+            # cast: format() drops LiteralString; backup is table + a generated timestamp.
+            cur.execute(cast(LiteralString, SCD2_REPAIR_BACKUP_SQL.format(backup=backup, table=table)))
 
             if collapse_duplicates:
                 cur.execute(SCD2_REPAIR_COLLAPSE_SQL[table], (run_id,))
@@ -594,12 +604,11 @@ def merge_identical_gaps(conn: psycopg.Connection, run_id: str) -> int:
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(SCD2_REPAIR_LOCK_TIMEOUT_SQL)
-            cur.execute(SCD2_REPAIR_LOCK_SQL.format(table="entities"))
+            cur.execute(SCD2_REPAIR_LOCK_SQL["entities"])
             for _pass in range(20):     # bounded: real chains are 1-2 links deep
                 cur.execute(SCD2_MERGE_PLAN_DROP_SQL)
                 cur.execute(SCD2_MERGE_PLAN_SQL)
-                cur.execute(SCD2_MERGE_PLAN_COUNT_SQL)
-                pending = cur.fetchone()[0]
+                pending = _scalar(cur, SCD2_MERGE_PLAN_COUNT_SQL)
                 if not pending:
                     break
                 # Archive, then DELETE, then extend. Extending first would leave

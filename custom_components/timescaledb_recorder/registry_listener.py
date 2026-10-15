@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from itertools import chain
-from typing import Callable
+from typing import Any, Callable
 
 import attrs
 import psycopg
@@ -52,7 +52,7 @@ _AREA_TYPED_KEYS = frozenset({"id", "name"})
 _LABEL_TYPED_KEYS = frozenset({"label_id", "name", "color"})
 
 
-def _build_extra(entry, exclude_keys: frozenset) -> str:
+def _build_extra(entry, exclude_keys: frozenset[str]) -> str:
     """Serialize non-typed registry entry fields to a JSONB string.
 
     Tries attrs.asdict() first (HA EntityEntry/DeviceEntry use @attr.s), then
@@ -88,7 +88,7 @@ _EXTRA_COMPARE_IGNORE = frozenset({"modified_at"})
 def _extra_changed(stored, new_json: str) -> bool:
     """Return True if extra JSONB changed in a way that warrants a new SCD2 row.
 
-    `stored` may be a str or dict (DB drivers may return JSONB columns as either).
+    `stored` may be a str or dict[str, Any] (DB drivers may return JSONB columns as either).
     Ignores fields in _EXTRA_COMPARE_IGNORE (e.g. modified_at) which HA updates
     on every internal write regardless of whether user-visible metadata changed.
     Stored rows are canonical (migrations.canonicalize_dimension_rows), so the
@@ -99,11 +99,11 @@ def _extra_changed(stored, new_json: str) -> bool:
     return _without_ignored(stored_dict) != _without_ignored(new_dict)
 
 
-def _without_ignored(extra: dict) -> dict:
+def _without_ignored(extra: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in extra.items() if k not in _EXTRA_COMPARE_IGNORE}
 
 
-def _to_json_safe(params: tuple | list | None) -> list | None:
+def _to_json_safe(params: tuple[Any, ...] | list[Any] | None) -> list[Any] | None:
     """Convert params tuple to a JSON-serializable list.
 
     datetime → isoformat() string (meta_worker._rehydrate_params reverses this).
@@ -159,21 +159,29 @@ class RegistryListener:
     ) -> None:
         self._hass = hass
         self._meta_queue: PersistentQueue | None = meta_queue
-        self._cancel_listeners: list[Callable] = []
-        # Registry references — set in async_start(), used in event handlers
-        self._entity_reg = None
-        self._device_reg = None
-        self._area_reg = None
-        self._label_reg = None
+        self._cancel_listeners: list[Callable[[], None]] = []
+        # Registry references — assigned in async_start(), used in event handlers.
+        # Declared without a None default so handlers need no narrowing; nothing
+        # reads them before async_start().
+        self._entity_reg: er.EntityRegistry
+        self._device_reg: dr.DeviceRegistry
+        self._area_reg: ar.AreaRegistry
+        self._label_reg: lr.LabelRegistry
         # Ordered hand-off to the meta queue (issue #17). Handlers append here
         # synchronously; _drain_loop is the only reader and the only writer to
         # the PersistentQueue, so event order survives all the way to the worker.
-        self._buffer: list[dict] = []
+        self._buffer: list[dict[str, Any]] = []
         self._buffer_ready = asyncio.Event()
-        self._drain_task: asyncio.Task | None = None
+        self._drain_task: asyncio.Task[None] | None = None
         # (append task, its batch) while an enqueue is in flight, so a cancelled
         # flush can be settled rather than guessed at.
-        self._inflight: tuple[asyncio.Task, list[dict]] | None = None
+        self._inflight: tuple[asyncio.Task[None], list[dict[str, Any]]] | None = None
+
+    @property
+    def _queue(self) -> PersistentQueue:
+        if self._meta_queue is None:
+            raise AssertionError("meta queue used before bind_meta_queue()")
+        return self._meta_queue
 
     def bind_meta_queue(self, q: PersistentQueue) -> None:
         """Wire the PersistentQueue after construction. Used by __init__.py
@@ -211,8 +219,8 @@ class RegistryListener:
             ("device", chain(self._device_reg.devices, self._device_reg.child_devices),
              self._extract_device_params, lambda e: e.id),
         )
-        items: list[dict] = []
-        sweeps: list[dict] = []
+        items: list[dict[str, Any]] = []
+        sweeps: list[dict[str, Any]] = []
         for registry, entries, extract, key in sources:
             entries = list(entries)
             items.extend(
@@ -240,7 +248,7 @@ class RegistryListener:
         self._buffer_ready.set()
 
     @callback
-    def _enqueue(self, item: dict) -> None:
+    def _enqueue(self, item: dict[str, Any]) -> None:
         """Append one item to the ordered buffer and wake the drain task.
 
         Must stay synchronous. The moment this awaits, two events can interleave
@@ -299,7 +307,7 @@ class RegistryListener:
         # already running in the executor. Requeuing on cancellation would then
         # append the same items twice. Instead the in-flight append is recorded
         # so async_stop can await its real outcome and requeue only if it failed.
-        append = asyncio.ensure_future(self._meta_queue.put_many_async(batch))
+        append = asyncio.ensure_future(self._queue.put_many_async(batch))
         self._inflight = (append, batch)
         try:
             await asyncio.shield(append)
@@ -319,7 +327,7 @@ class RegistryListener:
         else:
             self._inflight = None
 
-    def _requeue(self, batch: list[dict]) -> None:
+    def _requeue(self, batch: list[dict[str, Any]]) -> None:
         """Put an unpersisted batch back at the front, preserving order."""
         self._buffer = batch + self._buffer
         self._buffer_ready.set()
@@ -382,7 +390,7 @@ class RegistryListener:
     # Field extraction helpers
     # ------------------------------------------------------------------
 
-    def _extract_entity_params(self, entry, valid_from: datetime) -> tuple:
+    def _extract_entity_params(self, entry, valid_from: datetime) -> tuple[Any, ...]:
         """Extract positional parameters for entity SQL (snapshot + insert).
 
         Parameter order matches SCD2_SNAPSHOT_ENTITY_SQL / SCD2_INSERT_ENTITY_SQL:
@@ -413,7 +421,7 @@ class RegistryListener:
             extra,
         )
 
-    def _extract_device_params(self, entry, valid_from: datetime) -> tuple:
+    def _extract_device_params(self, entry, valid_from: datetime) -> tuple[Any, ...]:
         """Extract positional parameters for device SQL.
 
         $1=device_id, $2=name, $3=manufacturer, $4=model,
@@ -436,7 +444,7 @@ class RegistryListener:
             extra,
         )
 
-    def _extract_area_params(self, entry, valid_from: datetime) -> tuple:
+    def _extract_area_params(self, entry, valid_from: datetime) -> tuple[Any, ...]:
         """Extract positional parameters for area SQL.
 
         $1=area_id, $2=name, $3=valid_from, $4=extra
@@ -444,7 +452,7 @@ class RegistryListener:
         extra = _build_extra(entry, _AREA_TYPED_KEYS)
         return (entry.id, entry.name, valid_from, extra)
 
-    def _extract_label_params(self, entry, valid_from: datetime) -> tuple:
+    def _extract_label_params(self, entry, valid_from: datetime) -> tuple[Any, ...]:
         """Extract positional parameters for label SQL.
 
         $1=label_id, $2=name, $3=color, $4=valid_from, $5=extra
@@ -457,7 +465,7 @@ class RegistryListener:
     # ------------------------------------------------------------------
 
     def _entity_row_changed(
-        self, cur: psycopg.Cursor[psycopg.rows.DictRow], entity_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], entity_id: str, new_params: tuple[Any, ...]
     ) -> bool:
         """Return True if the current open entity row differs from new_params.
 
@@ -483,7 +491,7 @@ class RegistryListener:
         )
 
     def _device_row_changed(
-        self, cur: psycopg.Cursor[psycopg.rows.DictRow], device_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], device_id: str, new_params: tuple[Any, ...]
     ) -> bool:
         """Return True if the current open device row differs from new_params.
 
@@ -504,7 +512,7 @@ class RegistryListener:
         )
 
     def _area_row_changed(
-        self, cur: psycopg.Cursor[psycopg.rows.DictRow], area_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], area_id: str, new_params: tuple[Any, ...]
     ) -> bool:
         """Return True if the current open area row differs from new_params.
 
@@ -520,7 +528,7 @@ class RegistryListener:
         )
 
     def _label_row_changed(
-        self, cur: psycopg.Cursor[psycopg.rows.DictRow], label_id: str, new_params: tuple
+        self, cur: psycopg.Cursor[psycopg.rows.DictRow], label_id: str, new_params: tuple[Any, ...]
     ) -> bool:
         """Return True if the current open label row differs from new_params.
 
@@ -541,7 +549,7 @@ class RegistryListener:
     # ------------------------------------------------------------------
 
     @callback
-    def _handle_entity_registry_updated(self, event: Event) -> None:
+    def _handle_entity_registry_updated(self, event: Event[er.EventEntityRegistryUpdatedData]) -> None:
         """Extract entity registry params and enqueue to PersistentQueue (D-08: extract in event loop)."""
         action = event.data["action"]
         entity_id = event.data["entity_id"]
@@ -577,7 +585,7 @@ class RegistryListener:
     # ------------------------------------------------------------------
 
     @callback
-    def _handle_device_registry_updated(self, event: Event) -> None:
+    def _handle_device_registry_updated(self, event: Event[dr.EventDeviceRegistryUpdatedData]) -> None:
         """Extract device registry params and enqueue to PersistentQueue."""
         action = event.data["action"]
         device_id = event.data["device_id"]
@@ -611,7 +619,7 @@ class RegistryListener:
     # ------------------------------------------------------------------
 
     @callback
-    def _handle_area_registry_updated(self, event: Event) -> None:
+    def _handle_area_registry_updated(self, event: Event[ar.EventAreaRegistryUpdatedData]) -> None:
         """Extract area registry params and enqueue to PersistentQueue.
 
         Reorder events (action="reorder") are skipped — these only affect UI ordering,
@@ -625,6 +633,8 @@ class RegistryListener:
         # it surfaces unexpected event shapes immediately rather than silently propagating None,
         # which would cause NULL = NULL in SQL (matches zero rows) and hide the bug.
         area_id = event.data["area_id"]
+        if area_id is None:
+            raise AssertionError(f"area registry {action} event without area_id")
 
         if action == "remove":
             params = None
@@ -655,7 +665,7 @@ class RegistryListener:
     # ------------------------------------------------------------------
 
     @callback
-    def _handle_label_registry_updated(self, event: Event) -> None:
+    def _handle_label_registry_updated(self, event: Event[lr.EventLabelRegistryUpdatedData]) -> None:
         """Extract label registry params and enqueue to PersistentQueue."""
         action = event.data["action"]
         label_id = event.data["label_id"]
@@ -735,7 +745,7 @@ class RegistryListener:
         if not batch:
             return
         try:
-            self._meta_queue.put_many(batch)
+            self._queue.put_many(batch)
         except Exception:  # noqa: BLE001
             self._buffer = batch
             _LOGGER.exception(

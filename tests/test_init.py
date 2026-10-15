@@ -12,6 +12,8 @@ These tests verify that:
 """
 import asyncio
 import dataclasses
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -523,7 +525,7 @@ async def test_setup_passes_threading_stop_event_to_orchestrator(hass, mock_entr
     captured_kwargs = {}
 
     # Capture every async_at_started registration so we can fire the orchestrator one.
-    registered_callbacks: list = []
+    registered_callbacks: list[Callable[..., Any]] = []
 
     def _record_at_started(_hass, cb):
         registered_callbacks.append(cb)

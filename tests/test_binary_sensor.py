@@ -6,6 +6,7 @@ dispatcher infrastructure.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -59,7 +60,7 @@ def _make_hass() -> MagicMock:
     return hass
 
 
-async def _add_to_hass(sensor, hass: MagicMock) -> dict[str, object]:
+async def _add_to_hass(sensor, hass: MagicMock) -> dict[str, Callable[[], None]]:
     """Call async_added_to_hass and return a dict of {signal: callback}.
 
     Patches async_dispatcher_connect to intercept each subscription call,
@@ -74,7 +75,7 @@ async def _add_to_hass(sensor, hass: MagicMock) -> dict[str, object]:
     # does not need to set up the full entity lifecycle.
     sensor.async_on_remove = MagicMock()
 
-    captured: dict[str, object] = {}
+    captured: dict[str, Callable[[], None]] = {}
 
     def _mock_connect(hass_arg, signal, callback_fn):
         captured[signal] = callback_fn
@@ -124,7 +125,7 @@ async def test_buffer_overflow_push():
     sensor = TimescaledbBufferOverflowSensor(entry)
 
     # Stub async_write_ha_state so tests don't need a full HA entity context.
-    sensor.async_write_ha_state = MagicMock()
+    sensor.async_write_ha_state = MagicMock()  # pyright: ignore[reportAttributeAccessIssue]  # stub HA state write
 
     callbacks = await _add_to_hass(sensor, hass)
     assert sensor.is_on is False
@@ -169,7 +170,7 @@ async def test_states_worker_push_update():
     entry = _make_entry(states_alive=False)
     hass = _make_hass()
     sensor = TimescaledbStatesWorkerAliveSensor(entry)
-    sensor.async_write_ha_state = MagicMock()
+    sensor.async_write_ha_state = MagicMock()  # pyright: ignore[reportAttributeAccessIssue]  # stub HA state write
 
     callbacks = await _add_to_hass(sensor, hass)
     assert sensor.is_on is False

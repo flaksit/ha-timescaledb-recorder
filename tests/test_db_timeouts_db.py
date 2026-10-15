@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("psycopg")
 import psycopg  # noqa: E402  pyright: ignore[reportMissingImports]
+from psycopg.conninfo import make_conninfo  # noqa: E402  pyright: ignore[reportMissingImports]
 
 from custom_components.timescaledb_recorder import db  # noqa: E402
 from custom_components.timescaledb_recorder.retry import is_transient  # noqa: E402
@@ -52,7 +53,8 @@ def test_connect_applies_statement_timeout_and_tcp_bounds(conn, socket_enabled):
 
 
 def test_user_statement_timeout_is_kept():
-    c = db.connect(DSN + " options='-c statement_timeout=1234'")
+    # make_conninfo, not string concatenation: DSN may be a URL, which takes no key=value suffix.
+    c = db.connect(make_conninfo(DSN, options="-c statement_timeout=1234"))
     try:
         assert _show(c, "statement_timeout") == "1234ms"
     finally:

@@ -14,7 +14,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 ## Prerequisites
 
 - Home Assistant 2026.10.1 or later
-- The built-in HA recorder integration must be enabled — the integration uses the recorder's Python API for automatic gap detection and backfill (any recorder backend works).
+- The built-in HA recorder integration — declared as a dependency, so HA loads it automatically. The integration uses the recorder's Python API for automatic gap detection and backfill (any recorder backend works).
 - The standalone [`backfill_gaps.py`](#backfilling-historical-gaps) (optional use) script requires the default SQLite backend.
 - A running PostgreSQL + TimescaleDB instance > 2.18 (the [TimescaleDB HA app](https://github.com/flaksic/hass-timescaledb) is the intended companion)
 - The DSN user must have `CREATE TABLE` privileges — use the `homeassistant` role created by the app, **not** `homeassistant_rw` which is read/write only and lacks DDL rights
@@ -373,7 +373,7 @@ template:
 | `ingestion_stalled` | error | a worker made no progress for 10 min without an error: a DB call still in flight, or the states worker waiting for backfill data | when the worker moves again |
 | `buffer_dropping` | warning | live buffer full | when the catch-up backfill starts |
 | `states_dropped`, `metadata_dropped` | error | data rejected and dead-lettered | never (inspect the dead-letter table) |
-| `recorder_disabled` | warning | HA recorder not loaded | when it loads |
+| `recorder_disabled` | warning | HA recorder disabled via `recorder.disable` | within a minute of it being enabled again |
 
 A worker thread that dies is restarted by the watchdog with a persistent notification.
 

@@ -68,7 +68,7 @@
     },
     "recorder_disabled": {
       "title": "Home Assistant recorder integration is disabled",
-      "description": "The Home Assistant recorder integration is not loaded or has been disabled. The TimescaleDB recorder relies on HA's sqlite recorder as a safety net for backfilling state changes after a database outage. Without it, events dropped during a TimescaleDB outage cannot be recovered. To fix this, re-enable the recorder integration in your configuration and restart Home Assistant."
+      "description": "The Home Assistant recorder has been disabled with the `recorder.disable` action. The TimescaleDB recorder relies on HA's recorder as a safety net for backfilling state changes after a database outage. While it is disabled, events dropped during a TimescaleDB outage cannot be recovered. To fix this, run the `recorder.enable` action; this issue clears within a minute."
     },
     "metadata_dropped": {
       "title": "TimescaleDB recorder dropped a metadata change",

@@ -373,7 +373,7 @@ template:
 | `ingestion_stalled` | error | a worker made no progress for 10 min without an error: a DB call still in flight, or the states worker waiting for backfill data | when the worker moves again |
 | `buffer_dropping` | warning | live buffer full | when the catch-up backfill starts |
 | `states_dropped`, `metadata_dropped` | error | data rejected and dead-lettered | never (inspect the dead-letter table) |
-| `recorder_disabled` | warning | HA recorder not loaded | when it loads |
+| `recorder_disabled` | warning | HA recorder not loaded, or disabled via `recorder.disable` | within a minute of it being enabled again |
 
 A worker thread that dies is restarted by the watchdog with a persistent notification.
 

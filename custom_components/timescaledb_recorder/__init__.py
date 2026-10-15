@@ -12,8 +12,8 @@ Phase 3 additions:
 - watchdog_loop task spawned after workers are running (D-05-a).
 - Orchestrator task gets add_done_callback for crash recovery with 5s
   throttled relaunch to prevent notification storm (D-04, MEDIUM-6).
-- recorder_disabled one-shot check at setup + auto-clear background task
-  that waits for recorder availability (D-11, OBS-03, HIGH-1).
+- recorder_disabled check at setup + watcher task that re-checks on an
+  interval and raises/clears the issue on change (D-11, OBS-03, HIGH-1).
 - async_unload_entry cancels and awaits watchdog_task BEFORE orchestrator
   to prevent respawn race during shutdown (MEDIUM-12).
 """
@@ -121,6 +121,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 # reactive work via backfill_request.
 _OVERFLOW_WATCH_INTERVAL_S = 0.5
 
+# Poll interval for the recorder watcher. HA fires no event when the recorder
+# is enabled/disabled (recorder.enable / recorder.disable only flip
+# Recorder.enabled), so polling is the only public-API way to notice. The
+# issue is informational; a minute of lag is fine.
+_RECORDER_WATCH_INTERVAL_S = 60
+
 
 @dataclass
 class TimescaledbRecorderData:
@@ -138,6 +144,7 @@ class TimescaledbRecorderData:
     loop_stop_event: asyncio.Event
     orchestrator_task: asyncio.Task | None
     overflow_watcher_task: asyncio.Task | None
+    recorder_watcher_task: asyncio.Task | None
     watchdog_task: asyncio.Task | None  # D-05-a: spawned in setup, cancelled first in unload
     # Spawn-factory inputs — set during async_setup_entry; used by
     # watchdog.spawn_states_worker / spawn_meta_worker to reconstruct
@@ -212,41 +219,46 @@ async def _overflow_watcher(
         last_seen = now
 
 
-async def _wait_for_recorder_and_clear(hass: HomeAssistant) -> None:
-    """Wait for the HA recorder to become available and clear recorder_disabled issue.
+@callback
+def _sync_recorder_issue(hass: HomeAssistant, was_available: bool | None) -> bool:
+    """Raise or clear the recorder_disabled issue if availability changed; return it.
 
-    Spawned as a background task when create_recorder_disabled_issue fires at setup
-    time. Uses recorder.async_wait_recorder (HA 2023+, available in HA 2026.3.4) to
-    block until the recorder is ready, then clears the repair issue if enabled.
-
-    Falls back to a logged no-op if async_wait_recorder is unavailable in future HA
-    versions. The hasattr check prevents AttributeError on unexpected version skew.
-
-    (Cross-AI review 2026-04-23, concern HIGH-1 — OBS-03 auto-clear requirement.)
+    Available means HA's recorder is loaded and Recorder.enabled is True.
+    KeyError from get_instance means the recorder integration is not loaded.
+    was_available=None forces a sync: the issue registry persists across
+    restarts, so a stale issue from a previous run must be cleared at setup.
     """
     try:
-        if not hasattr(ha_recorder, "async_wait_recorder"):
-            _LOGGER.debug(
-                "ha_recorder.async_wait_recorder not available — "
-                "recorder_disabled issue will require manual dismissal"
+        available = bool(ha_recorder.get_instance(hass).enabled)
+    except KeyError:
+        available = False
+    if available != was_available:
+        if available:
+            clear_recorder_disabled_issue(hass)
+        else:
+            create_recorder_disabled_issue(hass)
+    return available
+
+
+async def _recorder_watcher(
+    hass: HomeAssistant,
+    stop_event: asyncio.Event,
+    was_available: bool,
+) -> None:
+    """Re-check recorder availability every _RECORDER_WATCH_INTERVAL_S (D-11, OBS-03).
+
+    HA has no public "wait for recorder" API and fires no event on
+    recorder.enable / recorder.disable, so this polls. Runs until stop_event.
+    """
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=_RECORDER_WATCH_INTERVAL_S,
             )
             return
-        recorder_instance = await ha_recorder.async_wait_recorder(hass)
-        if recorder_instance is not None and recorder_instance.enabled:
-            clear_recorder_disabled_issue(hass)
-            _LOGGER.info(
-                "HA recorder became available — clearing recorder_disabled repair issue"
-            )
-        else:
-            _LOGGER.debug(
-                "async_wait_recorder returned %r — recorder_disabled issue stays raised",
-                recorder_instance,
-            )
-    except Exception:  # noqa: BLE001
-        _LOGGER.debug(
-            "recorder wait task raised — recorder_disabled issue will stay raised",
-            exc_info=True,
-        )
+        except TimeoutError:
+            pass
+        was_available = _sync_recorder_issue(hass, was_available)
 
 
 def _make_orchestrator_done_callback(
@@ -348,6 +360,7 @@ async def async_setup_entry(
         loop_stop_event=loop_stop_event,
         orchestrator_task=None,
         overflow_watcher_task=None,
+        recorder_watcher_task=None,
         watchdog_task=None,
         dsn=dsn,
         chunk_interval_days=chunk_interval_days,
@@ -395,18 +408,16 @@ async def async_setup_entry(
 
     async_at_started(hass, _enqueue_registry_snapshot)
 
-    # D-11: recorder_disabled detection — one-shot check at setup. Backfill
-    # requires HA's sqlite recorder; if it's not loaded or disabled, raise a
-    # repair issue. The auto-clear background task waits for the recorder to
-    # become available and clears the issue automatically (OBS-03 / HIGH-1).
-    try:
-        _recorder_check = ha_recorder.get_instance(hass)
-        if not _recorder_check.enabled:
-            create_recorder_disabled_issue(hass)
-            hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="timescaledb_recorder_wait_recorder")
-    except KeyError:
-        create_recorder_disabled_issue(hass)
-        hass.async_create_background_task(_wait_for_recorder_and_clear(hass), name="timescaledb_recorder_wait_recorder")
+    # D-11: recorder_disabled detection. Backfill requires HA's sqlite
+    # recorder; raise a repair issue while it is not loaded or disabled, clear
+    # it when it is available (OBS-03). after_dependencies orders our setup
+    # after the recorder's, and Recorder.enabled starts True, so a recorder
+    # that is merely still starting does not raise the issue.
+    recorder_available = _sync_recorder_issue(hass, None)
+    data.recorder_watcher_task = hass.async_create_background_task(
+        _recorder_watcher(hass, loop_stop_event, recorder_available),
+        name="timescaledb_recorder_recorder_watcher",
+    )
 
     # Spawn the overflow watcher now that workers are running; it fires the
     # D-10-b repair issue on first overflow flip until orchestrator clears it.
@@ -496,7 +507,7 @@ async def async_unload_entry(
       during teardown. Must complete before orchestrator cancel so the watchdog
       cannot attempt a restart after workers are torn down. (MEDIUM-12.)
     Step 2: cancel orchestrator task; await its cancellation
-    Step 2b: cancel overflow watcher task
+    Step 2b: cancel overflow watcher and recorder watcher tasks
     Step 3: stop HA listeners (ingester + syncer) so no new events enqueue
     Step 4: wake meta worker's Condition wait (D-13-b step 3)
     Step 5: join states_worker (30s), then meta_worker (30s) — WATCH-02 safe
@@ -530,13 +541,14 @@ async def async_unload_entry(
         except asyncio.CancelledError:
             pass
 
-    # Step 2b: cancel overflow watcher.
-    if data.overflow_watcher_task is not None:
-        data.overflow_watcher_task.cancel()
-        try:
-            await data.overflow_watcher_task
-        except asyncio.CancelledError:
-            pass
+    # Step 2b: cancel overflow and recorder watchers.
+    for task in (data.overflow_watcher_task, data.recorder_watcher_task):
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     # Step 3: stop event-loop-side producers so no new events enqueue during
     # the thread join. Guard against None in case setup failed before these

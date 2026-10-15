@@ -154,7 +154,7 @@ def test_custom_chunk_interval(mock_psycopg_conn):
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn, chunk_interval_days=14)
 
-    assert cur.execute.call_args_list[1].args[1] == (14,)
+    assert cur.execute.call_args_list[1].args[1] == {"chunk_days": 14}
 
 
 def test_custom_compress_after(mock_psycopg_conn):
@@ -162,7 +162,7 @@ def test_custom_compress_after(mock_psycopg_conn):
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn, compress_after_hours=48)
 
-    assert cur.execute.call_args_list[4].args[1][0] == 48
+    assert cur.execute.call_args_list[4].args[1]["compress_hours"] == 48
 
 
 def test_schedule_interval_is_half_compress_after(mock_psycopg_conn):
@@ -171,13 +171,13 @@ def test_schedule_interval_is_half_compress_after(mock_psycopg_conn):
 
     # compress_after=2h → schedule=1h
     sync_setup_schema(conn, compress_after_hours=2)
-    assert cur.execute.call_args_list[4].args[1] == (2, 1)
+    assert cur.execute.call_args_list[4].args[1] == {"compress_hours": 2, "schedule_hours": 1}
 
     cur.execute.reset_mock()
 
     # compress_after=48h → schedule=12h (capped)
     sync_setup_schema(conn, compress_after_hours=48)
-    assert cur.execute.call_args_list[4].args[1] == (48, 12)
+    assert cur.execute.call_args_list[4].args[1] == {"compress_hours": 48, "schedule_hours": 12}
 
 
 def test_default_values(mock_psycopg_conn):
@@ -187,8 +187,8 @@ def test_default_values(mock_psycopg_conn):
 
     calls = cur.execute.call_args_list
 
-    assert calls[1].args[1] == (7,)
-    assert calls[4].args[1] == (2, 1)  # schedule_interval = compress_after // 2 = 1h
+    assert calls[1].args[1] == {"chunk_days": 7}
+    assert calls[4].args[1] == {"compress_hours": 2, "schedule_hours": 1}  # schedule_interval = compress_after // 2 = 1h
 
 
 def test_dim_tables_ddl_executed(mock_psycopg_conn):

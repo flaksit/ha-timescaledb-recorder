@@ -51,15 +51,19 @@ _DEVICE_TYPED_KEYS = frozenset({
 _AREA_TYPED_KEYS = frozenset({"id", "name"})
 _LABEL_TYPED_KEYS = frozenset({"label_id", "name", "color"})
 
+# compat_aliases: HA keeps it only to write the pre-1.22 `aliases` storage key;
+# `aliases` carries the same data and more.
+_ENTITY_EXTRA_EXCLUDED_KEYS = _ENTITY_TYPED_KEYS | {"compat_aliases"}
+
 
 def _build_extra(entry, exclude_keys: frozenset[str]) -> str:
     """Serialize non-typed registry entry fields to a JSONB string.
 
     Tries attrs.asdict() first (HA EntityEntry/DeviceEntry use @attr.s), then
     dataclasses.fields() for __slots__ dataclasses (AreaEntry, LabelEntry), then
-    falls back to __dict__ as a last resort. Sets become sorted lists; the
-    default=str encoder handles the remaining HA types (enums, datetime,
-    nested dataclasses).
+    falls back to __dict__ as a last resort. Sets become sorted lists;
+    _json_default handles the remaining HA types (enums, datetime, nested
+    dataclasses).
     """
     try:
         raw = attrs.asdict(entry)
@@ -76,7 +80,16 @@ def _build_extra(entry, exclude_keys: frozenset[str]) -> str:
         k: v for k, v in raw.items()
         if k not in exclude_keys and not k.startswith("_")
     }
-    return json.dumps(canonical(filtered), default=str)
+    return json.dumps(canonical(filtered), default=_json_default)
+
+
+def _json_default(value: object) -> object:
+    """JSON form of a value json cannot encode natively.
+
+    COMPUTED_NAME (an alias entry meaning "the entity's computed name") becomes
+    null, as in HA's own storage and websocket API; str() would store its repr.
+    """
+    return None if value is er.COMPUTED_NAME else str(value)
 
 
 # Fields present in extra that change on every HA internal registry write without
@@ -404,7 +417,7 @@ class RegistryListener:
         # depend on PYTHONHASHSEED (the repair SQL compares arrays element-wise).
         labels = canonical_labels(list(entry.labels))
         disabled_by = entry.disabled_by.value if entry.disabled_by is not None else None
-        extra = _build_extra(entry, _ENTITY_TYPED_KEYS)
+        extra = _build_extra(entry, _ENTITY_EXTRA_EXCLUDED_KEYS)
         return (
             entry.entity_id,
             entry.id,

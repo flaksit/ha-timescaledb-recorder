@@ -281,6 +281,27 @@ def test_extra_changed_compares_parsed_objects():
     assert _extra_changed({"aliases": "{'a'}"}, json.dumps({"aliases": ["a"]}))
 
 
+def test_entity_extra_stores_aliases_like_ha_storage():
+    """COMPUTED_NAME is null in aliases (HA's own form); compat_aliases is not stored."""
+    import json
+    from homeassistant.helpers import entity_registry as er
+
+    entry = er.RegistryEntry(
+        entity_id="sensor.x", unique_id="u", platform="p",
+        aliases=["foo", er.COMPUTED_NAME], compat_aliases=["foo"],
+        capabilities=None, config_entry_id=None, config_subentry_id=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), device_id=None,
+        disabled_by=None, entity_category=None, has_entity_name=False, hidden_by=None,
+        id="i", object_id_base=None, options=None, original_device_class=None,
+        original_icon=None, original_name=None, suggested_object_id=None,
+        supported_features=0, translation_key=None, unit_of_measurement=None,
+    )
+    extra = json.loads(RegistryListener(hass=MagicMock())._extract_entity_params(
+        entry, datetime.now(timezone.utc))[-1])
+    assert extra["aliases"] == ["foo", None]
+    assert "compat_aliases" not in extra
+
+
 # ---------------------------------------------------------------------------
 # Entity registry callback → dict enqueue (live mode)
 # ---------------------------------------------------------------------------

@@ -68,8 +68,8 @@ def conn():
         assert_disposable(c)
         _drop(c)
         with c.cursor() as cur:
-            for ddl in (const.CREATE_DIM_ENTITIES_SQL, const.CREATE_DIM_DEVICES_SQL,
-                        const.CREATE_DIM_AREAS_SQL, const.CREATE_DIM_LABELS_SQL,
+            for ddl in (const.CREATE_ENTITIES_SQL, const.CREATE_DEVICES_SQL,
+                        const.CREATE_AREAS_SQL, const.CREATE_LABELS_SQL,
                         const.CREATE_TABLE_SQL, const.SCHEMA_MIGRATIONS_DDL_SQL,
                         const.SCD2_QUARANTINE_DDL_SQL):
                 cur.execute(ddl)

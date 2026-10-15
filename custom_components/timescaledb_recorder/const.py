@@ -18,7 +18,8 @@ SIGNAL_HEALTH_CHANGE = f"{DOMAIN}_health_change"
 DEFAULT_BATCH_SIZE = 200
 DEFAULT_FLUSH_INTERVAL = 10  # seconds
 DEFAULT_CHUNK_INTERVAL_DAYS = 7
-# 2 hours keeps at most ~1 day of uncompressed data on disk (2-day chunk + 12h policy window).
+# The policy compresses only closed chunks, so the live chunk (up to DEFAULT_CHUNK_INTERVAL_DAYS)
+# stays uncompressed; 2 hours bounds how long a just-closed chunk lingers uncompressed.
 DEFAULT_COMPRESS_AFTER_HOURS = 2
 
 # Phase 2 ingestion tunables (D-04-e, D-06-a, D-01-a, D-01-b). These are
@@ -175,7 +176,7 @@ ON CONFLICT (last_updated, entity_id) DO UPDATE
 # All tables are idempotent (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS)
 # so they can safely execute on every integration startup (D-11).
 
-CREATE_DIM_ENTITIES_SQL = """
+CREATE_ENTITIES_SQL = """
 CREATE TABLE IF NOT EXISTS entities (
     entity_id           TEXT        NOT NULL,
     ha_entity_uuid      TEXT        NOT NULL,
@@ -194,7 +195,7 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 """
 
-CREATE_DIM_DEVICES_SQL = """
+CREATE_DEVICES_SQL = """
 CREATE TABLE IF NOT EXISTS devices (
     device_id   TEXT        NOT NULL,
     name        TEXT,
@@ -208,7 +209,7 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 """
 
-CREATE_DIM_AREAS_SQL = """
+CREATE_AREAS_SQL = """
 CREATE TABLE IF NOT EXISTS areas (
     area_id    TEXT        NOT NULL,
     name       TEXT,
@@ -218,7 +219,7 @@ CREATE TABLE IF NOT EXISTS areas (
 );
 """
 
-CREATE_DIM_LABELS_SQL = """
+CREATE_LABELS_SQL = """
 CREATE TABLE IF NOT EXISTS labels (
     label_id   TEXT        NOT NULL,
     name       TEXT,
@@ -229,34 +230,44 @@ CREATE TABLE IF NOT EXISTS labels (
 );
 """
 
+# Installs created before the dim_ prefix was dropped have these index names.
+# Rename instead of letting CREATE INDEX IF NOT EXISTS add a duplicate under the
+# new name. Must run before the CREATE_*_IDX_SQL statements below.
+RENAME_LEGACY_DIM_INDEXES_SQL = """
+ALTER INDEX IF EXISTS idx_dim_entities_entity_time RENAME TO idx_entities_entity_time;
+ALTER INDEX IF EXISTS idx_dim_entities_current RENAME TO idx_entities_current;
+ALTER INDEX IF EXISTS idx_dim_devices_device_time RENAME TO idx_devices_device_time;
+ALTER INDEX IF EXISTS idx_dim_labels_label_time RENAME TO idx_labels_label_time;
+"""
+
 # Indexes for dimension tables.
 # Compound index on (id, valid_from DESC) supports history range scans.
 # Partial index WHERE valid_to IS NULL supports fast current-row lookups
 # (the primary access pattern for Grafana joins in Phase 7).
-CREATE_DIM_ENTITIES_IDX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_dim_entities_entity_time
+CREATE_ENTITIES_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_entities_entity_time
     ON entities (entity_id, valid_from DESC);
 """
 
 # Partial index — avoids scanning historical rows when only current state is needed.
-CREATE_DIM_ENTITIES_CURRENT_IDX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_dim_entities_current
+CREATE_ENTITIES_CURRENT_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_entities_current
     ON entities (entity_id)
     WHERE valid_to IS NULL;
 """
 
-CREATE_DIM_DEVICES_IDX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_dim_devices_device_time
+CREATE_DEVICES_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_devices_device_time
     ON devices (device_id, valid_from DESC);
 """
 
-CREATE_DIM_AREAS_IDX_SQL = """
+CREATE_AREAS_IDX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_areas_area_time
     ON areas (area_id, valid_from DESC);
 """
 
-CREATE_DIM_LABELS_IDX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_dim_labels_label_time
+CREATE_LABELS_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_labels_label_time
     ON labels (label_id, valid_from DESC);
 """
 

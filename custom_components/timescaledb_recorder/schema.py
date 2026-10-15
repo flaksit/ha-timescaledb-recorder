@@ -13,15 +13,16 @@ from .const import (
     DEFAULT_CHUNK_INTERVAL_DAYS,
     DEFAULT_COMPRESS_AFTER_HOURS,
     SET_COMPRESSION_SQL,
-    CREATE_DIM_ENTITIES_SQL,
-    CREATE_DIM_DEVICES_SQL,
-    CREATE_DIM_AREAS_SQL,
-    CREATE_DIM_LABELS_SQL,
-    CREATE_DIM_ENTITIES_IDX_SQL,
-    CREATE_DIM_ENTITIES_CURRENT_IDX_SQL,
-    CREATE_DIM_DEVICES_IDX_SQL,
-    CREATE_DIM_AREAS_IDX_SQL,
-    CREATE_DIM_LABELS_IDX_SQL,
+    CREATE_ENTITIES_SQL,
+    CREATE_DEVICES_SQL,
+    CREATE_AREAS_SQL,
+    CREATE_LABELS_SQL,
+    CREATE_ENTITIES_IDX_SQL,
+    CREATE_ENTITIES_CURRENT_IDX_SQL,
+    CREATE_DEVICES_IDX_SQL,
+    CREATE_AREAS_IDX_SQL,
+    CREATE_LABELS_IDX_SQL,
+    RENAME_LEGACY_DIM_INDEXES_SQL,
     CREATE_VIEW_STATES_NUMERIC_SQL,
     CREATE_VIEW_STATES_FLAT_SQL,
     METADATA_DEADLETTER_DDL_SQL,
@@ -155,15 +156,16 @@ def sync_setup_schema(
 
         # Dimension tables for SCD2 metadata sync (Phase 4).
         # All DDL is idempotent — safe to re-execute on every startup (D-11).
-        cur.execute(CREATE_DIM_ENTITIES_SQL)
-        cur.execute(CREATE_DIM_DEVICES_SQL)
-        cur.execute(CREATE_DIM_AREAS_SQL)
-        cur.execute(CREATE_DIM_LABELS_SQL)
-        cur.execute(CREATE_DIM_ENTITIES_IDX_SQL)
-        cur.execute(CREATE_DIM_ENTITIES_CURRENT_IDX_SQL)
-        cur.execute(CREATE_DIM_DEVICES_IDX_SQL)
-        cur.execute(CREATE_DIM_AREAS_IDX_SQL)
-        cur.execute(CREATE_DIM_LABELS_IDX_SQL)
+        cur.execute(CREATE_ENTITIES_SQL)
+        cur.execute(CREATE_DEVICES_SQL)
+        cur.execute(CREATE_AREAS_SQL)
+        cur.execute(CREATE_LABELS_SQL)
+        cur.execute(RENAME_LEGACY_DIM_INDEXES_SQL)
+        cur.execute(CREATE_ENTITIES_IDX_SQL)
+        cur.execute(CREATE_ENTITIES_CURRENT_IDX_SQL)
+        cur.execute(CREATE_DEVICES_IDX_SQL)
+        cur.execute(CREATE_AREAS_IDX_SQL)
+        cur.execute(CREATE_LABELS_IDX_SQL)
 
         # Where the workers record an item they give up on. Created here,
         # not by the workers, so the drop path can assume it exists — a worker

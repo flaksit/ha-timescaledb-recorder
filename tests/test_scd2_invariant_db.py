@@ -106,8 +106,8 @@ def damaged(conn):
                     ("%_prerepair_%",))
         for (name,) in cur.fetchall():
             cur.execute(f"DROP TABLE IF EXISTS {name} CASCADE")
-        for ddl in (const.CREATE_DIM_ENTITIES_SQL, const.CREATE_DIM_DEVICES_SQL,
-                    const.CREATE_DIM_AREAS_SQL, const.CREATE_DIM_LABELS_SQL,
+        for ddl in (const.CREATE_ENTITIES_SQL, const.CREATE_DEVICES_SQL,
+                    const.CREATE_AREAS_SQL, const.CREATE_LABELS_SQL,
                     const.CREATE_TABLE_SQL, const.SCD2_QUARANTINE_DDL_SQL,
                     const.SCD2_QUARANTINE_IDX_SQL,
                     const.METADATA_DEADLETTER_DDL_SQL,
@@ -390,8 +390,8 @@ def clean_db(conn):
         cur.execute("DROP TABLE IF EXISTS entities, devices, areas, labels, states,"
                     " scd2_repair_quarantine, metadata_deadletter, schema_migrations"
                     " CASCADE")
-        for ddl in (const.CREATE_DIM_ENTITIES_SQL, const.CREATE_DIM_DEVICES_SQL,
-                    const.CREATE_DIM_AREAS_SQL, const.CREATE_DIM_LABELS_SQL,
+        for ddl in (const.CREATE_ENTITIES_SQL, const.CREATE_DEVICES_SQL,
+                    const.CREATE_AREAS_SQL, const.CREATE_LABELS_SQL,
                     const.CREATE_TABLE_SQL, const.METADATA_DEADLETTER_DDL_SQL,
                     const.SCHEMA_MIGRATIONS_DDL_SQL):
             cur.execute(ddl)

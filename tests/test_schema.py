@@ -151,21 +151,19 @@ def test_falls_back_to_unique_index_without_btree_gist(mock_psycopg_conn):
 
 
 def test_custom_chunk_interval(mock_psycopg_conn):
-    """Custom chunk_interval_days must appear in the hypertable SQL."""
+    """Custom chunk_interval_days must be bound to the hypertable SQL."""
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn, chunk_interval_days=14)
 
-    hypertable_sql = cur.execute.call_args_list[1].args[0]
-    assert "14 days" in hypertable_sql
+    assert cur.execute.call_args_list[1].args[1] == (14,)
 
 
 def test_custom_compress_after(mock_psycopg_conn):
-    """Custom compress_after_hours must appear in the compression policy SQL."""
+    """Custom compress_after_hours must be bound to the compression policy SQL."""
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn, compress_after_hours=48)
 
-    policy_sql = cur.execute.call_args_list[4].args[0]
-    assert "48 hours" in policy_sql
+    assert cur.execute.call_args_list[4].args[1][0] == 48
 
 
 def test_schedule_interval_is_half_compress_after(mock_psycopg_conn):
@@ -174,15 +172,13 @@ def test_schedule_interval_is_half_compress_after(mock_psycopg_conn):
 
     # compress_after=2h → schedule=1h
     sync_setup_schema(conn, compress_after_hours=2)
-    policy_sql = cur.execute.call_args_list[4].args[0]
-    assert "1 hours" in policy_sql
+    assert cur.execute.call_args_list[4].args[1] == (2, 1)
 
     cur.execute.reset_mock()
 
     # compress_after=48h → schedule=12h (capped)
     sync_setup_schema(conn, compress_after_hours=48)
-    policy_sql = cur.execute.call_args_list[4].args[0]
-    assert "12 hours" in policy_sql
+    assert cur.execute.call_args_list[4].args[1] == (48, 12)
 
 
 def test_default_values(mock_psycopg_conn):
@@ -190,11 +186,10 @@ def test_default_values(mock_psycopg_conn):
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
 
-    calls = [call.args[0] for call in cur.execute.call_args_list]
+    calls = cur.execute.call_args_list
 
-    assert "7 days" in calls[1]
-    assert "2 hours" in calls[4]
-    assert "1 hours" in calls[4]  # schedule_interval = compress_after // 2 = 1h
+    assert calls[1].args[1] == (7,)
+    assert calls[4].args[1] == (2, 1)  # schedule_interval = compress_after // 2 = 1h
 
 
 def test_dim_tables_ddl_executed(mock_psycopg_conn):

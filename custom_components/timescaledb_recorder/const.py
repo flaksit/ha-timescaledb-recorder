@@ -1,5 +1,7 @@
 """Constants for the TimescaleDB Recorder integration."""
 
+from typing import LiteralString, cast
+
 DOMAIN = "timescaledb_recorder"
 
 # Platform list — forwarded in async_setup_entry and unloaded in async_unload_entry.
@@ -113,10 +115,10 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
 );
 """
 
-# {chunk_days} must be formatted before execution
+# Param: (chunk_days,)
 CREATE_HYPERTABLE_SQL = f"""
 SELECT create_hypertable('{TABLE_NAME}', 'last_updated',
-    chunk_time_interval => INTERVAL '{{chunk_days}} days',
+    chunk_time_interval => make_interval(days => %s),
     if_not_exists => TRUE);
 """
 
@@ -131,13 +133,13 @@ REMOVE_COMPRESSION_POLICY_SQL = f"""
 SELECT remove_compression_policy('{TABLE_NAME}', if_exists => TRUE);
 """
 
-# {compress_hours} and {schedule_hours} must be formatted before execution.
+# Params: (compress_hours, schedule_hours).
 # schedule_hours = max(1, min(12, compress_hours // 2)) — runs at half the
 # compression window, capped at 12 h to avoid excessive polling.
 ADD_COMPRESSION_POLICY_SQL = f"""
 SELECT add_compression_policy('{TABLE_NAME}',
-    INTERVAL '{{compress_hours}} hours',
-    schedule_interval => INTERVAL '{{schedule_hours}} hours');
+    make_interval(hours => %s),
+    schedule_interval => make_interval(hours => %s));
 """
 
 CREATE_INDEX_SQL = f"""
@@ -694,13 +696,15 @@ SCD2_DIMENSIONS = (
     ("labels", "label_id"),
 )
 
-SCD2_EXCLUDE_CONSTRAINT_SQL = {
-    table: _SCD2_EXCLUDE_CONSTRAINT_SQL.format(table=table, key=key)
+# cast: str.format() drops LiteralString, which psycopg requires of query text.
+# Sound here because every input is a module literal (see SCD2_DIMENSIONS).
+SCD2_EXCLUDE_CONSTRAINT_SQL: dict[str, LiteralString] = {
+    table: cast(LiteralString, _SCD2_EXCLUDE_CONSTRAINT_SQL.format(table=table, key=key))
     for table, key in SCD2_DIMENSIONS
 }
 
-SCD2_OPEN_UNIQUE_IDX_SQL = {
-    table: _SCD2_OPEN_UNIQUE_IDX_SQL.format(table=table, key=key)
+SCD2_OPEN_UNIQUE_IDX_SQL: dict[str, LiteralString] = {
+    table: cast(LiteralString, _SCD2_OPEN_UNIQUE_IDX_SQL.format(table=table, key=key))
     for table, key in SCD2_DIMENSIONS
 }
 

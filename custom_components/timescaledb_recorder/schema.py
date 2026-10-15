@@ -140,17 +140,10 @@ def sync_setup_schema(
     schedule_hours = max(1, min(12, compress_after_hours // 2))
     with conn.cursor() as cur:
         cur.execute(CREATE_TABLE_SQL)
-        cur.execute(
-            CREATE_HYPERTABLE_SQL.format(chunk_days=chunk_interval_days)
-        )
+        cur.execute(CREATE_HYPERTABLE_SQL, (chunk_interval_days,))
         cur.execute(SET_COMPRESSION_SQL)
         cur.execute(REMOVE_COMPRESSION_POLICY_SQL)
-        cur.execute(
-            ADD_COMPRESSION_POLICY_SQL.format(
-                compress_hours=compress_after_hours,
-                schedule_hours=schedule_hours,
-            )
-        )
+        cur.execute(ADD_COMPRESSION_POLICY_SQL, (compress_after_hours, schedule_hours))
         cur.execute(CREATE_INDEX_SQL)
         cur.execute(CREATE_UNIQUE_INDEX_SQL)    # D-09-a: Phase 2 — enables ON CONFLICT DO NOTHING dedup
 

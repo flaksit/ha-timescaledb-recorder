@@ -32,11 +32,6 @@ import probatio
 from homeassistant.helpers import recorder as ha_recorder
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.entityfilter import (
-    convert_filter,
-    convert_include_exclude_filter,
-)
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.reload import async_integration_yaml_config
 from homeassistant.helpers.start import async_at_started
@@ -55,6 +50,7 @@ from .const import (
     PLATFORMS,
     SIGNAL_OVERFLOW_CHANGE,
 )
+from .entity_filter import FILTER_SCHEMA, build_entity_filter
 from .state_listener import StateListener
 from .issues import (
     clear_recorder_disabled_issue,
@@ -71,24 +67,12 @@ from .watchdog import spawn_meta_worker, spawn_states_worker, watchdog_loop
 
 _LOGGER = logging.getLogger(__name__)
 
-# Voluptuous schema for one include/exclude block inside the YAML config.
-# Each key is optional — missing keys default to an empty list so
-# convert_include_exclude_filter always receives well-formed dicts.
-_FILTER_SCHEMA_INNER = probatio.Schema({
-    probatio.Optional("domains", default=[]): probatio.All(list, [cv.string]),
-    probatio.Optional("entities", default=[]): probatio.All(list, [cv.string]),
-    probatio.Optional("entity_globs", default=[]): probatio.All(list, [cv.string]),
-})
-
 # CONFIG_SCHEMA is required for HA to call async_setup before async_setup_entry.
 # ALLOW_EXTRA lets other integrations' top-level keys pass through validation —
 # HA validates the full configuration.yaml against every component's schema.
 CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: probatio.Schema({
-            probatio.Optional("include"): _FILTER_SCHEMA_INNER,
-            probatio.Optional("exclude"): _FILTER_SCHEMA_INNER,
-        }),
+        DOMAIN: FILTER_SCHEMA,
     },
     extra=probatio.ALLOW_EXTRA,
 )
@@ -172,22 +156,7 @@ def _get_entity_filter(hass: HomeAssistant, entry):
     is now the authoritative source, stored by async_setup before this runs.
     Falls back to pass-all when no YAML filter is configured.
     """
-    raw_filter = hass.data.get(DOMAIN, {}).get("filter", {})
-    if raw_filter:
-        _EMPTY_BLOCK = {"domains": [], "entities": [], "entity_globs": []}
-        normalized = {
-            "include": raw_filter.get("include", _EMPTY_BLOCK),
-            "exclude": raw_filter.get("exclude", _EMPTY_BLOCK),
-        }
-        return convert_include_exclude_filter(normalized)
-    return convert_filter({
-        "include_domains": [],
-        "include_entity_globs": [],
-        "include_entities": [],
-        "exclude_domains": [],
-        "exclude_entity_globs": [],
-        "exclude_entities": [],
-    })
+    return build_entity_filter(hass.data.get(DOMAIN, {}).get("filter", {}))
 
 
 async def _overflow_watcher(

@@ -163,13 +163,14 @@ async def backfill_orchestrator(
         #     written by previous cycles.
         # hass.states supplements for non-registry entities not yet in states (first
         # run only — after the first successful cycle they appear in states).
+        # The filter applies to the union: the entities table lists every registry
+        # entity, excluded ones included, and the recorder has their history.
         all_db_entities = await hass.async_add_executor_job(all_entities_reader)
-        state_machine_entities: set[str] = {
-            state.entity_id
-            for state in hass.states.async_all()
-            if entity_filter(state.entity_id)
+        entities = {
+            entity_id
+            for entity_id in all_db_entities | {state.entity_id for state in hass.states.async_all()}
+            if entity_filter(entity_id)
         }
-        entities = all_db_entities | state_machine_entities
         if not entities:
             _LOGGER.info("backfill: no entities to query, skipping")
             await hass.async_add_executor_job(backfill_queue.put, BACKFILL_DONE)

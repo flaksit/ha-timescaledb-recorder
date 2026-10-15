@@ -419,6 +419,8 @@ docker exec homeassistant python3 /config/custom_components/timescaledb_recorder
 
 No arguments needed. The script auto-detects the SQLite database path and reads the TimescaleDB DSN from the integration config. `psycopg[binary]` is already present in the HA container once the integration is installed.
 
+By default only entities the integration records are backfilled: the script reads the `include`/`exclude` filter from the `timescaledb_recorder` section of `configuration.yaml`, resolving `!include` and `!secret` the way HA does. `--entities` overrides the filter.
+
 Optional arguments:
 
 | Argument | Default | Description |
@@ -429,7 +431,8 @@ Optional arguments:
 | `--end ISO8601` | latest SQLite row | End of backfill window (inclusive, precision-snapped) |
 | `--bucket-minutes M` | `60` | Time bucket width; larger = fewer PG queries, more memory |
 | `--batch-size N` | `500` | Rows per INSERT batch |
-| `--entities ENTITY_IDS` | all | Comma-separated entity_ids to backfill |
+| `--entities ENTITY_IDS` | all recorded | Comma-separated entity_ids to backfill; overrides the filter |
+| `--ha-config DIR` | `/config` | HA config directory holding `configuration.yaml` |
 | `--dry-run` | off | Show what would be inserted without writing |
 
 The script is safe to run while HA is active — SQLite is opened read-only and re-running is idempotent. Each bucket does a cheap `COUNT(*)` comparison first; buckets already in sync are skipped with no row fetches.

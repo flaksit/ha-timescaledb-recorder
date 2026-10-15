@@ -9,6 +9,12 @@ From the HA host terminal (SSH addon):
 No arguments needed — auto-detects SQLite path (/config/home-assistant_v2.db)
 and reads the DSN from the timescaledb_recorder integration config.
 
+Only entities the integration records are backfilled: the include/exclude
+filter is read from the timescaledb_recorder section of configuration.yaml
+(--ha-config), exactly as the integration applies it. --entities takes
+precedence: the listed entities are backfilled whether the filter excludes them
+or not, and configuration.yaml is not read.
+
 Requires psycopg[binary] — already present in the HA container once the
 timescaledb_recorder integration is installed.
 
@@ -29,7 +35,8 @@ Algorithm (per bucket)
 1. Fast COUNT(*) in SQLite (no join).
 2. Fast COUNT(*) in TimescaleDB.
 3. If counts match → skip (no gaps possible without count divergence).
-4. If --entities set and counts differ → filtered re-count before row fetches.
+4. If an entity set applies (filter or --entities) and counts differ → filtered
+   re-count before row fetches.
 5. Fetch candidate rows from SQLite for the bucket.
 6. Fetch (entity_id, last_updated) fingerprints from TimescaleDB.
 7. Set-subtract; insert missing rows in batches inside transactions.
@@ -43,10 +50,19 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
+
+try:
+    from .entity_filter import FILTER_SCHEMA, build_entity_filter
+except ImportError:
+    # Executed as a plain script, so the package context does not exist and the
+    # relative import fails.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from entity_filter import FILTER_SCHEMA, build_entity_filter
 
 # states has no unique constraint; deduplication handled by fingerprint
 # comparison before this INSERT runs. Placeholders are %s (psycopg3 style).
@@ -60,7 +76,7 @@ SELECT COUNT(*) FROM states
 WHERE last_updated >= %s AND last_updated < %s
 """
 
-# Filtered count — only used when --entities is set and full counts differ.
+# Filtered count — only used when an entity set applies and full counts differ.
 PG_COUNT_FILTERED_SQL = """
 SELECT COUNT(*) FROM states
 WHERE last_updated >= %s AND last_updated < %s
@@ -81,14 +97,17 @@ SELECT COUNT(*) FROM states
 WHERE last_updated_ts >= :start_ts AND last_updated_ts < :end_ts
 """
 
-# Filtered count — join required to access entity_id. Only used when --entities
-# is set AND the fast counts differ (avoids the join in the common case).
+# Filtered count — join required to access entity_id. Only used when an entity
+# set applies AND the fast counts differ (avoids the join in the common case).
+# All qmark: sqlite3 refuses to mix named placeholders with a parameter sequence.
 SQLITE_COUNT_FILTERED_SQL = """
 SELECT COUNT(*) FROM states s
 JOIN states_meta sm ON sm.metadata_id = s.metadata_id
-WHERE s.last_updated_ts >= :start_ts AND s.last_updated_ts < :end_ts
+WHERE s.last_updated_ts >= ? AND s.last_updated_ts < ?
   AND sm.entity_id IN ({placeholders})
 """
+
+SQLITE_ENTITY_IDS_SQL = "SELECT entity_id FROM states_meta"
 
 # In modern HA (2023.3+) entity_id lives in states_meta, not states directly.
 # COALESCE: last_changed_ts is NULL when it equals last_updated_ts (HA normalises
@@ -177,7 +196,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=500, metavar="N",
                    help="Rows per INSERT batch (default: 500).")
     p.add_argument("--entities", metavar="ENTITY_IDS", default=None,
-                   help="Comma-separated entity_ids to backfill. Default: all.")
+                   help="Comma-separated entity_ids to backfill, regardless of the integration's filter. "
+                        "Default: all the integration records.")
+    p.add_argument("--ha-config", metavar="DIR", default=_DEFAULT_HA_CONFIG,
+                   help=f"HA config dir holding configuration.yaml (default: {_DEFAULT_HA_CONFIG}).")
     p.add_argument("--dry-run", action="store_true",
                    help="Show what would be inserted without writing to TimescaleDB.")
     p.add_argument("--verbose", action="store_true",
@@ -297,6 +319,7 @@ def insert_batches(
 
 
 _DEFAULT_SQLITE = "/config/home-assistant_v2.db"
+_DEFAULT_HA_CONFIG = "/config"
 _HA_CONFIG_ENTRIES = "/config/.storage/core.config_entries"
 _HA_DOMAIN = "timescaledb_recorder"
 
@@ -319,6 +342,34 @@ def _detect_pg_dsn() -> str:
     )
 
 
+def load_entity_filter(config_dir: str) -> Callable[[str], bool]:
+    """The integration's include/exclude filter from configuration.yaml.
+
+    HA's own loader resolves !include and !secret. Runs inside the HA container,
+    where the homeassistant package is installed.
+    """
+    from homeassistant.util.yaml import Secrets, load_yaml
+
+    config = load_yaml(Path(config_dir) / "configuration.yaml", Secrets(Path(config_dir))) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"{config_dir}/configuration.yaml is not a mapping")
+    return build_entity_filter(FILTER_SCHEMA(config.get(_HA_DOMAIN) or {}))
+
+
+def resolve_entity_set(
+    known_entity_ids: set[str],
+    entity_filter: Callable[[str], bool],
+) -> set[str] | None:
+    """Entity ids the filter lets through; None means all of them (no filtering needed)."""
+    allowed = {e for e in known_entity_ids if entity_filter(e)}
+    return None if allowed == known_entity_ids else allowed
+
+
+def fetch_sqlite_entity_ids(db_path: str) -> set[str]:
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        return {r[0] for r in conn.execute(SQLITE_ENTITY_IDS_SQL)}
+
+
 def main() -> None:
     args = parse_args()
     sqlite_path = str(Path(args.sqlite or _DEFAULT_SQLITE).expanduser().resolve())
@@ -327,10 +378,16 @@ def main() -> None:
     safe_dsn = re.sub(r"(://[^:@]+:)[^@]+(@)", r"\1***\2", pg_dsn) if "@" in pg_dsn else pg_dsn
     print(f"PG DSN: {safe_dsn}")
 
-    entities_filter: set[str] | None = (
-        {e.strip() for e in args.entities.split(",") if e.strip()}
-        if args.entities else None
-    )
+    entities_filter: set[str] | None
+    if args.entities:
+        entities_filter = {e.strip() for e in args.entities.split(",") if e.strip()}
+    else:
+        entities_filter = resolve_entity_set(
+            fetch_sqlite_entity_ids(sqlite_path), load_entity_filter(args.ha_config),
+        )
+    if entities_filter is not None and not entities_filter:
+        print("No entities left to backfill.")
+        return
 
     # ── Time window ───────────────────────────────────────────────────────────
     print("Detecting time range from SQLite …")
@@ -368,7 +425,7 @@ def main() -> None:
                 continue
 
             pg_count = pg_bucket_count(pg_conn, start_dt, end_dt)
-            if pg_count != sq_count and entities_filter:
+            if pg_count != sq_count and entities_filter is not None:
                 # Other entities may explain the mismatch — recount with filter.
                 sq_count = sqlite_bucket_count(sqlite_path, ts, bucket_end, entities_filter)
                 pg_count = pg_bucket_count(pg_conn, start_dt, end_dt, entities_filter)
@@ -423,8 +480,9 @@ def main() -> None:
             print(" done.")
 
 
-try:
-    main()
-except Exception as exc:
-    print(f"Error: {exc}", file=sys.stderr)
-    sys.exit(1)
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)

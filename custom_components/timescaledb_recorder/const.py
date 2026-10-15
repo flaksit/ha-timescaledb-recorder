@@ -115,10 +115,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
 );
 """
 
-# Param: (chunk_days,)
 CREATE_HYPERTABLE_SQL = f"""
 SELECT create_hypertable('{TABLE_NAME}', 'last_updated',
-    chunk_time_interval => make_interval(days => %s),
+    chunk_time_interval => make_interval(days => %(chunk_days)s),
     if_not_exists => TRUE);
 """
 
@@ -133,13 +132,10 @@ REMOVE_COMPRESSION_POLICY_SQL = f"""
 SELECT remove_compression_policy('{TABLE_NAME}', if_exists => TRUE);
 """
 
-# Params: (compress_hours, schedule_hours).
-# schedule_hours = max(1, min(12, compress_hours // 2)) — runs at half the
-# compression window, capped at 12 h to avoid excessive polling.
 ADD_COMPRESSION_POLICY_SQL = f"""
 SELECT add_compression_policy('{TABLE_NAME}',
-    make_interval(hours => %s),
-    schedule_interval => make_interval(hours => %s));
+    make_interval(hours => %(compress_hours)s),
+    schedule_interval => make_interval(hours => %(schedule_hours)s));
 """
 
 CREATE_INDEX_SQL = f"""

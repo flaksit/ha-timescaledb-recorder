@@ -11,8 +11,9 @@ and reads the DSN from the timescaledb_recorder integration config.
 
 Only entities the integration records are backfilled: the include/exclude
 filter is read from the timescaledb_recorder section of configuration.yaml
-(--ha-config), exactly as the integration applies it. --entities narrows
-that set further; it cannot add excluded entities.
+(--ha-config), exactly as the integration applies it. --entities takes
+precedence: the listed entities are backfilled whether the filter excludes them
+or not, and configuration.yaml is not read.
 
 Requires psycopg[binary] — already present in the HA container once the
 timescaledb_recorder integration is installed.
@@ -195,7 +196,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=500, metavar="N",
                    help="Rows per INSERT batch (default: 500).")
     p.add_argument("--entities", metavar="ENTITY_IDS", default=None,
-                   help="Comma-separated entity_ids to backfill. Default: all the integration records.")
+                   help="Comma-separated entity_ids to backfill, regardless of the integration's filter. "
+                        "Default: all the integration records.")
     p.add_argument("--ha-config", metavar="DIR", default=_DEFAULT_HA_CONFIG,
                    help=f"HA config dir holding configuration.yaml (default: {_DEFAULT_HA_CONFIG}).")
     p.add_argument("--dry-run", action="store_true",
@@ -357,15 +359,9 @@ def load_entity_filter(config_dir: str) -> Callable[[str], bool]:
 def resolve_entity_set(
     known_entity_ids: set[str],
     entity_filter: Callable[[str], bool],
-    requested: set[str] | None,
 ) -> set[str] | None:
-    """Entity ids to backfill; None means all of them (no filtering needed)."""
+    """Entity ids the filter lets through; None means all of them (no filtering needed)."""
     allowed = {e for e in known_entity_ids if entity_filter(e)}
-    if requested is not None:
-        refused = sorted(e for e in requested if not entity_filter(e))
-        if refused:
-            print(f"Excluded by the integration's filter, skipped: {', '.join(refused)}")
-        return {e for e in requested if entity_filter(e)}
     return None if allowed == known_entity_ids else allowed
 
 
@@ -382,13 +378,13 @@ def main() -> None:
     safe_dsn = re.sub(r"(://[^:@]+:)[^@]+(@)", r"\1***\2", pg_dsn) if "@" in pg_dsn else pg_dsn
     print(f"PG DSN: {safe_dsn}")
 
-    requested: set[str] | None = (
-        {e.strip() for e in args.entities.split(",") if e.strip()}
-        if args.entities else None
-    )
-    entities_filter = resolve_entity_set(
-        fetch_sqlite_entity_ids(sqlite_path), load_entity_filter(args.ha_config), requested,
-    )
+    entities_filter: set[str] | None
+    if args.entities:
+        entities_filter = {e.strip() for e in args.entities.split(",") if e.strip()}
+    else:
+        entities_filter = resolve_entity_set(
+            fetch_sqlite_entity_ids(sqlite_path), load_entity_filter(args.ha_config),
+        )
     if entities_filter is not None and not entities_filter:
         print("No entities left to backfill.")
         return

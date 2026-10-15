@@ -36,18 +36,12 @@ def test_load_entity_filter_without_domain_config_passes_all(tmp_path):
 
 
 def test_resolve_entity_set_pass_all_needs_no_filtering():
-    assert resolve_entity_set(KNOWN, lambda _e: True, None) is None
+    assert resolve_entity_set(KNOWN, lambda _e: True) is None
 
 
 def test_resolve_entity_set_drops_excluded_entities():
     keep = lambda e: not e.startswith("sensor.solar_surplus")  # noqa: E731
-    assert resolve_entity_set(KNOWN, keep, None) == {"sensor.kept", "sun.sun"}
-
-
-def test_resolve_entity_set_requested_cannot_add_excluded(capsys):
-    keep = lambda e: not e.startswith("sensor.solar_surplus")  # noqa: E731
-    assert resolve_entity_set(KNOWN, keep, {"sensor.kept", "sensor.solar_surplus"}) == {"sensor.kept"}
-    assert "sensor.solar_surplus" in capsys.readouterr().out
+    assert resolve_entity_set(KNOWN, keep) == {"sensor.kept", "sun.sun"}
 
 
 @pytest.fixture

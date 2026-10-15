@@ -36,7 +36,7 @@ Read `.planning/research/SUMMARY.md` before planning any phase. Key constraints:
 
 - Python 3.14+, uv, direnv
 - HA 2026.10.1 custom component (HACS; minimum in hacs.json)
-- TimescaleDB via psycopg[binary]==3.3.3 (v1.1) — replacing asyncpg 0.31.0
+- TimescaleDB via psycopg[binary]==3.3.3
 - voluptuous (config validation), attrs (registry serialization)
 - pytest + pytest-asyncio + pytest-homeassistant-custom-component
 

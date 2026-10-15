@@ -512,3 +512,11 @@ A second `--apply` changes nothing.
 ### If it fails
 
 Each table is repaired in one transaction under `SHARE ROW EXCLUSIVE` with a 10-second `lock_timeout`, backup included. HA can keep running; if the metadata worker holds the lock, the repair times out having changed nothing — run it again. Any interruption leaves the current table untouched and earlier tables repaired, each consistent on its own; re-running converges.
+
+## Development
+
+`uv run pytest` runs the suite. The `*_db` test modules skip unless `SCD2_TEST_DSN` points at a scratch TimescaleDB on loopback; see the docstring of `tests/test_scd2_invariant_db.py` for the Docker command.
+
+CI (`.github/workflows/ci.yml`) runs the full suite, DB modules included, against a TimescaleDB service container.
+
+[Renovate](https://docs.renovatebot.com/) (`renovate.json`) opens weekly PRs for GitHub Actions, the CI TimescaleDB image, Python dependencies and `uv.lock`. It bumps psycopg in `pyproject.toml` and `manifest.json` together; merging such a PR changes what users' HA installs on the next release. The `hacs.json` minimum HA version is not managed — raise it by hand.

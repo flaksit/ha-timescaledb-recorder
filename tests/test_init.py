@@ -41,6 +41,14 @@ def mock_entry():
     return entry
 
 
+def _discard_task(coro: Any, *_args: Any, **_kwargs: Any) -> MagicMock:
+    """Stand-in for hass.async_create_*task: nothing runs the coroutine, so close it
+    rather than leave it to be reported as never awaited."""
+    if asyncio.iscoroutine(coro):
+        coro.close()
+    return MagicMock()
+
+
 # conftest provides `hass` fixture — override here with the fields needed for
 # async_setup_entry (config.path, bus.async_listen_once, async_create_task).
 @pytest.fixture
@@ -52,8 +60,8 @@ def hass():
     h.bus.async_listen_once = MagicMock()
     # Run the job inline so executor-built objects (PersistentQueue) are real mocks.
     h.async_add_executor_job = AsyncMock(side_effect=lambda func, *args: func(*args))
-    h.async_create_task = MagicMock()
-    h.async_create_background_task = MagicMock()
+    h.async_create_task = MagicMock(side_effect=_discard_task)
+    h.async_create_background_task = MagicMock(side_effect=_discard_task)
     h.config = MagicMock()
     h.config.path = MagicMock(return_value="/tmp/ha_tsdb_test/metadata_queue.jsonl")
     # Platform setup/unload calls added by SENSOR-01 — must be awaitable.
@@ -497,7 +505,7 @@ async def test_setup_creates_watchdog_task(hass, mock_entry):
 
         def _capture_bg_task(coro, *, name=None):
             created_bg_tasks.append(coro)
-            return MagicMock()
+            return _discard_task(coro)
 
         hass.async_create_background_task = MagicMock(side_effect=_capture_bg_task)
 
@@ -711,6 +719,7 @@ def test_orchestrator_done_callback_fires_notify_and_schedules_relaunch():
     from custom_components.timescaledb_recorder import _make_orchestrator_done_callback
 
     hass = MagicMock()
+    hass.async_create_background_task = MagicMock(side_effect=_discard_task)
     runtime = MagicMock()
     runtime.stop_event = MagicMock()
     runtime.stop_event.is_set.return_value = False
@@ -783,7 +792,9 @@ async def test_orchestrator_relaunch_sleeps_5s_before_new_task():
     ), patch(
         "custom_components.timescaledb_recorder.asyncio.sleep", new=mock_sleep,
     ), patch(
-        "custom_components.timescaledb_recorder.backfill_orchestrator",
+        # Plain MagicMock: patch() would build an AsyncMock whose coroutine the
+        # mocked task creator never runs.
+        "custom_components.timescaledb_recorder.backfill_orchestrator", new_callable=MagicMock,
     ) as mock_borch:
         mock_borch.return_value = object()
         cb(task)
@@ -829,7 +840,8 @@ async def test_orchestrator_relaunch_rerequests_backfill_only_mid_backfill(in_ba
     with patch("custom_components.timescaledb_recorder.notify_watchdog_recovery"), patch(
         "custom_components.timescaledb_recorder.asyncio.sleep", new=AsyncMock(),
     ), patch(
-        "custom_components.timescaledb_recorder.backfill_orchestrator", return_value=object(),
+        "custom_components.timescaledb_recorder.backfill_orchestrator",
+        new_callable=MagicMock, return_value=object(),
     ):
         cb(task)
         await created[0]
@@ -1054,7 +1066,7 @@ async def test_recorder_disabled_spawns_watcher_task(hass, mock_entry):
         created_coros = []
         def _capture(coro, *, name=None):
             created_coros.append(coro)
-            return MagicMock()
+            return _discard_task(coro)
 
         hass.async_create_background_task = MagicMock(side_effect=_capture)
 

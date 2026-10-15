@@ -6,6 +6,10 @@ requires-python = ">=3.14.2"
 [tool.pytest]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A never-awaited coroutine is a silently skipped code path (or a mock dropping one);
+# fail instead of warning. It is reported at garbage collection, where pytest wraps it
+# as PytestUnraisableExceptionWarning — possibly under a later test than the culprit.
+filterwarnings = ["error::RuntimeWarning", "error::pytest.PytestUnraisableExceptionWarning"]
 
 [dependency-groups]
 dev = [

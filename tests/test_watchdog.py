@@ -165,6 +165,7 @@ async def test_watchdog_no_action_when_both_workers_alive():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 2:
                 # Second call: simulate loop_stop_event being set
@@ -219,6 +220,7 @@ async def test_watchdog_respawns_dead_states_worker():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 2:
                 runtime.loop_stop_event.set()
@@ -267,6 +269,7 @@ async def test_watchdog_respawns_dead_meta_worker():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 2:
                 runtime.loop_stop_event.set()
@@ -313,6 +316,7 @@ async def test_watchdog_fires_notify_with_last_exception_and_context():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 2:
                 runtime.loop_stop_event.set()
@@ -379,6 +383,7 @@ async def test_watchdog_sleeps_5s_before_respawn():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 2:
                 runtime.loop_stop_event.set()
@@ -429,6 +434,7 @@ async def test_watchdog_skips_respawn_when_stop_event_set():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 2:
                 runtime.loop_stop_event.set()
@@ -486,6 +492,7 @@ async def test_watchdog_defensive_none_exc_and_missing_context():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 2:
                 runtime.loop_stop_event.set()
@@ -539,6 +546,7 @@ async def test_watchdog_poll_body_exception_does_not_kill_loop():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count
+            coro.close()
             call_count += 1
             if call_count >= 3:
                 # After 2 poll cycles, stop the loop
@@ -583,6 +591,7 @@ async def test_watchdog_polls_cadence_interruptible_by_loop_stop_event():
 
         async def _patched_wait_for(coro, timeout):
             nonlocal call_count, poll_count
+            coro.close()
             call_count += 1
             if call_count >= 4:
                 runtime.loop_stop_event.set()

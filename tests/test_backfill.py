@@ -729,3 +729,57 @@ async def test_orchestrator_includes_non_registry_entities():
     assert "sensor.test" in entities, (
         "sensor.test absent from backfill entity set — all_entities_reader result lost"
     )
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_applies_entity_filter_to_db_known_entities():
+    """Excluded entities stay out of backfill even when the entities table lists them."""
+    hass = MagicMock()
+    hass.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args) if callable(fn) else None)
+    hass.states.async_all = MagicMock(return_value=[
+        MagicMock(entity_id="sun.sun"), MagicMock(entity_id="sensor.excluded_live"),
+    ])
+    stop_event = asyncio.Event()
+    backfill_request = asyncio.Event()
+    backfill_request.set()
+    live_queue = MagicMock()
+    live_queue.clear_and_reset_overflow = MagicMock(return_value=0)
+    fetched: list[set[str]] = []
+
+    def fetch_raw(_hass, entities, _t_start, _t_end):
+        fetched.append(set(entities))
+        stop_event.set()
+        return {}
+
+    recorder_inst = MagicMock()
+    recorder_inst.states_manager.oldest_ts = None
+    recorder_inst.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+
+    with patch(
+        "custom_components.timescaledb_recorder.backfill.recorder.get_instance",
+        return_value=recorder_inst,
+    ), patch(
+        "custom_components.timescaledb_recorder.backfill._fetch_slice_raw", fetch_raw,
+    ), patch(
+        "custom_components.timescaledb_recorder.backfill._RECORDER_COMMIT_LAG", timedelta(seconds=0),
+    ), patch(
+        "custom_components.timescaledb_recorder.backfill.clear_buffer_dropping_issue"
+    ), patch(
+        "custom_components.timescaledb_recorder.backfill.notify_backfill_gap"
+    ):
+        await asyncio.wait_for(
+            backfill_orchestrator(
+                hass,
+                live_queue=live_queue,
+                backfill_queue=queue.Queue(maxsize=4),
+                backfill_request=backfill_request,
+                read_watermark=MagicMock(return_value=datetime.now(timezone.utc) - timedelta(hours=1)),
+                all_entities_reader=MagicMock(return_value={"sensor.kept", "sensor.excluded_db"}),
+                entity_filter=lambda eid: not eid.startswith("sensor.excluded"),
+                stop_event=stop_event,
+                threading_stop_event=_threading_stop_event(),
+            ),
+            timeout=5,
+        )
+
+    assert fetched == [{"sensor.kept", "sun.sun"}]

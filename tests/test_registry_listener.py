@@ -2,7 +2,7 @@
 import asyncio
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -306,7 +306,7 @@ def test_entity_extra_stores_aliases_like_ha_storage():
 # Entity registry callback → dict enqueue (live mode)
 # ---------------------------------------------------------------------------
 
-def test_entity_callback_enqueues_dict(listener, mock_meta_queue, mock_entity_registry):
+def test_entity_callback_enqueues_dict(listener, mock_entity_registry):
     """_handle_entity_registry_updated must schedule put_async with a correctly-shaped dict."""
     listener._entity_reg = mock_entity_registry
 
@@ -329,7 +329,7 @@ def test_entity_callback_enqueues_dict(listener, mock_meta_queue, mock_entity_re
     assert "enqueued_at" in item
 
 
-def test_entity_remove_enqueues_params_none(listener, mock_meta_queue):
+def test_entity_remove_enqueues_params_none(listener):
     """Remove action must enqueue params=None — registry entry is already gone."""
     listener._entity_reg = MagicMock()
 
@@ -347,7 +347,7 @@ def test_entity_remove_enqueues_params_none(listener, mock_meta_queue):
     listener._entity_reg.async_get.assert_not_called()
 
 
-def test_entity_rename_sets_old_id(listener, mock_meta_queue, mock_entity_registry):
+def test_entity_rename_sets_old_id(listener, mock_entity_registry):
     """Rename (update with old_entity_id) must populate old_id in the dict."""
     listener._entity_reg = mock_entity_registry
 
@@ -368,7 +368,7 @@ def test_entity_rename_sets_old_id(listener, mock_meta_queue, mock_entity_regist
 # Area registry callback — reorder skip
 # ---------------------------------------------------------------------------
 
-def test_area_reorder_skipped(listener, mock_meta_queue):
+def test_area_reorder_skipped(listener):
     """Reorder events carry no data change and must be silently dropped (Pitfall 6)."""
     event = MagicMock()
     event.data = {"action": "reorder"}

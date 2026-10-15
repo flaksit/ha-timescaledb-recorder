@@ -10,7 +10,7 @@ def test_create_schema_executes_all_statements(mock_psycopg_conn):
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
     + 4 dimension table DDL (entities, devices, areas, labels)
-    + 1 legacy dim_ index rename (issue #15)
+    + 1 legacy dim_ index migration (issue #15)
     + 5 dimension table indexes (entities compound, entities current-row,
       devices, areas, labels)
     + 2 metadata_deadletter DDL (table, index) — issue #17
@@ -220,11 +220,11 @@ def test_dim_indexes_created(mock_psycopg_conn):
     assert "idx_labels_label_time" in all_sql
 
 
-def test_legacy_dim_indexes_renamed_before_create(mock_psycopg_conn):
-    """Renames must precede CREATE INDEX IF NOT EXISTS, or old installs get duplicate indexes."""
+def test_legacy_dim_indexes_migrated_before_create(mock_psycopg_conn):
+    """Legacy index migration must precede CREATE INDEX IF NOT EXISTS, or old installs get duplicate indexes."""
     from custom_components.timescaledb_recorder.const import (
         CREATE_ENTITIES_IDX_SQL,
-        RENAME_LEGACY_DIM_INDEXES_SQL,
+        MIGRATE_LEGACY_DIM_INDEXES_SQL,
     )
 
     conn, cur = mock_psycopg_conn
@@ -232,7 +232,7 @@ def test_legacy_dim_indexes_renamed_before_create(mock_psycopg_conn):
 
     executed = [call.args[0] for call in cur.execute.call_args_list]
     first_create = executed.index(CREATE_ENTITIES_IDX_SQL)
-    assert executed.index(RENAME_LEGACY_DIM_INDEXES_SQL) < first_create
+    assert executed.index(MIGRATE_LEGACY_DIM_INDEXES_SQL) < first_create
 
 
 def test_sync_setup_schema_executes_unique_index(mock_psycopg_conn):

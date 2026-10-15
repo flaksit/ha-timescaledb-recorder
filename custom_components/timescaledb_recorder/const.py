@@ -232,14 +232,32 @@ CREATE TABLE IF NOT EXISTS labels (
 );
 """
 
-# Installs created before the dim_ prefix was dropped have these index names.
-# Rename instead of letting CREATE INDEX IF NOT EXISTS add a duplicate under the
-# new name. Must run before the CREATE_*_IDX_SQL statements below.
-RENAME_LEGACY_DIM_INDEXES_SQL = """
-ALTER INDEX IF EXISTS idx_dim_entities_entity_time RENAME TO idx_entities_entity_time;
-ALTER INDEX IF EXISTS idx_dim_entities_current RENAME TO idx_entities_current;
-ALTER INDEX IF EXISTS idx_dim_devices_device_time RENAME TO idx_devices_device_time;
-ALTER INDEX IF EXISTS idx_dim_labels_label_time RENAME TO idx_labels_label_time;
+# Installs created before the dim_ prefix was dropped have the idx_dim_* names;
+# some also already have identical indexes under the new names. Rename where the
+# new name is free, drop the redundant legacy copy where it is not. Plain
+# ALTER INDEX ... RENAME fails on the latter, and skipping this lets
+# CREATE INDEX IF NOT EXISTS add duplicates on the former. Must run before the
+# CREATE_*_IDX_SQL statements below.
+MIGRATE_LEGACY_DIM_INDEXES_SQL = """
+DO $$
+DECLARE
+    pair text[];
+BEGIN
+    FOREACH pair SLICE 1 IN ARRAY ARRAY[
+        ['idx_dim_entities_entity_time', 'idx_entities_entity_time'],
+        ['idx_dim_entities_current',     'idx_entities_current'],
+        ['idx_dim_devices_device_time',  'idx_devices_device_time'],
+        ['idx_dim_labels_label_time',    'idx_labels_label_time']
+    ] LOOP
+        IF to_regclass(pair[1]) IS NULL THEN
+            CONTINUE;
+        ELSIF to_regclass(pair[2]) IS NULL THEN
+            EXECUTE format('ALTER INDEX %I RENAME TO %I', pair[1], pair[2]);
+        ELSE
+            EXECUTE format('DROP INDEX %I', pair[1]);
+        END IF;
+    END LOOP;
+END $$;
 """
 
 # Indexes for dimension tables.

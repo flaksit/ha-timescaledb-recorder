@@ -74,6 +74,7 @@ class _MockRuntime:
     compress_after_hours: int = 2
     states_stats: object = None
     schema_ready: threading.Event = field(default_factory=threading.Event)
+    minute_rollup: list[dict[str, object]] = field(default_factory=list)
 
 
 def _alive_worker():
@@ -695,6 +696,7 @@ def test_spawn_states_worker_uses_runtime_fields():
         compress_after_hours=4,
         stats=runtime.states_stats,
         schema_ready=runtime.schema_ready,
+        minute_rollup=runtime.minute_rollup,
     )
     assert result is mock_instance
 

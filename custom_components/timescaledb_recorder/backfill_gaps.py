@@ -57,12 +57,12 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 try:
-    from .entity_filter import FILTER_SCHEMA, build_entity_filter
+    from .entity_filter import DOMAIN_SCHEMA, build_entity_filter
 except ImportError:
     # Executed as a plain script, so the package context does not exist and the
     # relative import fails.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from entity_filter import FILTER_SCHEMA, build_entity_filter
+    from entity_filter import DOMAIN_SCHEMA, build_entity_filter
 
 # states has no unique constraint; deduplication handled by fingerprint
 # comparison before this INSERT runs. Placeholders are %s (psycopg3 style).
@@ -70,6 +70,19 @@ INSERT_SQL = """
 INSERT INTO states (entity_id, state, attributes, last_updated, last_changed)
 VALUES (%s, %s, %s, %s, %s)
 """
+
+# Copy of const.STATES_MINUTE_MARK_DIRTY_SQL — this file runs as a plain script
+# and cannot import const. Queues the per-minute rollup's minutes the inserted
+# rows change for recomputation by its job.
+ROLLUP_MARK_DIRTY_SQL = """
+INSERT INTO states_minute_dirty (entity_id, from_ts, to_ts)
+SELECT entity_id, %(from)s,
+       LEAST(now(), COALESCE(%(to)s::timestamptz + make_interval(
+           secs => GREATEST(hold_seconds, COALESCE(zero_hold_seconds, 0))), now()))
+FROM states_minute_entities
+WHERE filled_until IS NOT NULL AND %(from)s::timestamptz < filled_until;
+"""
+ROLLUP_EXISTS_SQL = "SELECT to_regclass('states_minute_dirty') IS NOT NULL;"
 
 PG_COUNT_SQL = """
 SELECT COUNT(*) FROM states
@@ -318,6 +331,19 @@ def insert_batches(
     return inserted
 
 
+def mark_rollup_dirty(
+    conn: psycopg.Connection, inserted_from: datetime | None, inserted_to: datetime | None,
+) -> None:
+    """Queue the rollup minutes the inserted rows affect; no-op before the rollup exists."""
+    if inserted_from is None:
+        return
+    row = conn.execute(ROLLUP_EXISTS_SQL).fetchone()
+    if row is None or not row[0]:
+        return
+    conn.execute(ROLLUP_MARK_DIRTY_SQL, {"from": inserted_from, "to": inserted_to})
+    print("Queued states_minute recomputation for the backfilled range.")
+
+
 _DEFAULT_SQLITE = "/config/home-assistant_v2.db"
 _DEFAULT_HA_CONFIG = "/config"
 _HA_CONFIG_ENTRIES = "/config/.storage/core.config_entries"
@@ -353,7 +379,7 @@ def load_entity_filter(config_dir: str) -> Callable[[str], bool]:
     config = load_yaml(Path(config_dir) / "configuration.yaml", Secrets(Path(config_dir))) or {}
     if not isinstance(config, dict):
         raise ValueError(f"{config_dir}/configuration.yaml is not a mapping")
-    return build_entity_filter(FILTER_SCHEMA(config.get(_HA_DOMAIN) or {}))
+    return build_entity_filter(DOMAIN_SCHEMA(config.get(_HA_DOMAIN) or {}))
 
 
 def resolve_entity_set(
@@ -409,6 +435,8 @@ def main() -> None:
         total_scanned = total_gaps = total_inserted = 0
         buckets_skipped = bucket_idx = 0
         dry_run_sample: list[tuple[Any, ...]] = []
+        inserted_from: datetime | None = None
+        inserted_to: datetime | None = None
 
         ts = start_ts
         while ts < end_ts:
@@ -451,6 +479,9 @@ def main() -> None:
                         dry_run_sample.extend(missing[:5 - len(dry_run_sample)])
 
                     total_inserted += insert_batches(pg_conn, missing, args.batch_size, args.dry_run)
+                    lo, hi = min(r[3] for r in missing), max(r[3] for r in missing)
+                    inserted_from = lo if inserted_from is None else min(inserted_from, lo)
+                    inserted_to = hi if inserted_to is None else max(inserted_to, hi)
                     total_gaps += len(missing)
                     char = "" if args.verbose else "+"
                     if args.verbose:
@@ -478,6 +509,7 @@ def main() -> None:
             print("Running ANALYZE states …", end="", flush=True)
             pg_conn.execute("ANALYZE states")
             print(" done.")
+            mark_rollup_dirty(pg_conn, inserted_from, inserted_to)
 
 
 if __name__ == "__main__":

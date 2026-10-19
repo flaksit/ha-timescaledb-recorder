@@ -5,7 +5,7 @@ from custom_components.timescaledb_recorder.schema import sync_setup_schema
 
 
 def test_create_schema_executes_all_statements(mock_psycopg_conn):
-    """sync_setup_schema must execute exactly 30 SQL statements.
+    """sync_setup_schema must execute exactly 38 SQL statements.
 
     7 hypertable setup statements (CREATE TABLE, create_hypertable, SET compression,
     remove_compression_policy, add_compression_policy, CREATE INDEX, CREATE UNIQUE INDEX)
@@ -18,13 +18,14 @@ def test_create_schema_executes_all_statements(mock_psycopg_conn):
     + 2 convenience views (states_numeric, states_flat)
     + 1 btree_gist extension + 4 SCD2 exclusion constraints (issue #17)
     + 2 lock_timeout set/reset around the constraint DDL
-    = 30 total
+    + 6 minute rollup DDL, 1 entity-set read, 1 job lookup (issue #45)
+    = 38 total
 
     The cursor is obtained via conn.cursor() context manager in sync_setup_schema.
     """
     conn, cur = mock_psycopg_conn
     sync_setup_schema(conn)
-    assert cur.execute.call_count == 30
+    assert cur.execute.call_count == 38
 
 
 def test_create_schema_order(mock_psycopg_conn):
@@ -71,6 +72,9 @@ def test_create_schema_order(mock_psycopg_conn):
     for offset, table in enumerate(("entities", "devices", "areas", "labels")):
         assert f"excl_{table}_period" in calls[25 + offset]
     assert "RESET lock_timeout" in calls[29]
+    # Derived data last: its failure must not leave the core schema half-built.
+    assert "CREATE TABLE IF NOT EXISTS states_minute " in calls[30]
+    assert "states_minute_job" in calls[37]
 
 
 def test_constraint_failure_does_not_abort_schema_setup(mock_psycopg_conn):

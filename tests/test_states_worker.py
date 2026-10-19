@@ -2,7 +2,7 @@
 import queue
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import cast
 from unittest.mock import MagicMock, call, patch
 
@@ -500,8 +500,8 @@ def test_setup_schema_retries_on_transient_error(mock_psycopg_conn):
 def test_setup_schema_retry_wiring_captures_on_transient():
     """Issue #12: retry_until_success for _setup_schema_raw must receive
     on_transient=reset_db_connection and no stall/recovery hooks.
-    __init__ calls retry_until_success five times (insert, watermark, schema,
-    read_all_known_entities, per-row insert); this test captures all calls and inspects index 2."""
+    __init__ calls retry_until_success six times (insert, watermark, schema,
+    read_all_known_entities, per-row insert, rollup dirty); this test captures all calls and inspects index 2."""
     all_calls = []
 
     def fake_retry(*, stop_event, on_transient=None, on_recovery=None,
@@ -522,8 +522,8 @@ def test_setup_schema_retry_wiring_captures_on_transient():
     ):
         t = _make_thread()
 
-    # insert(0), watermark(1), schema(2), read_all(3), insert_row(4).
-    assert len(all_calls) == 5, f"Expected 5 calls to retry_until_success, got {len(all_calls)}"
+    # insert(0), watermark(1), schema(2), read_all(3), insert_row(4), rollup_dirty(5).
+    assert len(all_calls) == 6, f"Expected 6 calls to retry_until_success, got {len(all_calls)}"
     schema_call = all_calls[2]
     on_transient = schema_call["on_transient"]
     assert on_transient is not None
@@ -597,8 +597,8 @@ def test_read_all_known_entities_retry_wiring_captures_on_transient():
     ):
         t = _make_thread()
 
-    # insert(0), watermark(1), schema(2), read_all(3), insert_row(4).
-    assert len(all_calls) == 5, f"Expected 5 calls to retry_until_success, got {len(all_calls)}"
+    # insert(0), watermark(1), schema(2), read_all(3), insert_row(4), rollup_dirty(5).
+    assert len(all_calls) == 6, f"Expected 6 calls to retry_until_success, got {len(all_calls)}"
     read_all_call = all_calls[3]
     on_transient = read_all_call["on_transient"]
     assert on_transient is not None
@@ -950,3 +950,54 @@ def test_schema_ready_stays_unset_when_setup_is_interrupted():
 
     t._run_main_loop()
     t._schema_ready.set.assert_not_called()
+
+
+def _rollup_thread():
+    t = TimescaledbStateRecorderThread(
+        hass=MagicMock(), dsn="postgresql://",
+        live_queue=OverflowQueue(maxsize=100), backfill_queue=queue.Queue(maxsize=3),
+        backfill_request=MagicMock(), stop_event=threading.Event(),
+        chunk_interval_days=7, compress_after_hours=2,
+        minute_rollup=[{"entity_id": "sensor.power", "hold": 120}],
+    )
+    return t
+
+
+def _state(eid, t):
+    return MagicMock(entity_id=eid, state="1", attributes={}, last_updated=t, last_changed=t)
+
+
+def test_backfilled_rollup_rows_are_queued_for_the_rollup_on_done():
+    """Issue #45: backfilled rows land behind the rollup frontier."""
+    from custom_components.timescaledb_recorder.backfill import BACKFILL_DONE
+
+    t = _rollup_thread()
+    t._mark_rollup_dirty = mark = MagicMock()
+    early = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+    late = datetime(2026, 1, 1, 11, tzinfo=timezone.utc)
+    t._backfill_queue.put({"sensor.power": [_state("sensor.power", late)],
+                           "sensor.other": [_state("sensor.other", early - timedelta(hours=1))]})
+    t._backfill_queue.put({"sensor.power": [_state("sensor.power", early)]})
+    _run_backfill_once(t, BACKFILL_DONE)
+    mark.assert_called_once_with(early)
+
+
+def test_backfill_without_rollup_rows_queues_nothing():
+    from custom_components.timescaledb_recorder.backfill import BACKFILL_DONE
+
+    t = _rollup_thread()
+    t._mark_rollup_dirty = mark = MagicMock()
+    t._backfill_queue.put({"sensor.other": [_state("sensor.other", datetime(2026, 1, 1, tzinfo=timezone.utc))]})
+    _run_backfill_once(t, BACKFILL_DONE)
+    mark.assert_not_called()
+
+
+def test_mark_rollup_dirty_raw_runs_mark_sql(mock_psycopg_conn):
+    from custom_components.timescaledb_recorder.const import STATES_MINUTE_MARK_DIRTY_SQL
+
+    conn, cur = mock_psycopg_conn
+    t = _make_thread()
+    t._conn = conn
+    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t._mark_rollup_dirty_raw(since)
+    cur.execute.assert_called_once_with(STATES_MINUTE_MARK_DIRTY_SQL, {"from": since, "to": None})

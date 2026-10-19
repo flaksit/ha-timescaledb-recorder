@@ -1,5 +1,7 @@
 """Idempotent schema setup for the timescaledb_recorder hypertable."""
 import logging
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import psycopg
 
@@ -35,6 +37,22 @@ from .const import (
     SCD2_EXCLUDE_CONSTRAINT_SQL,
     SCD2_OPEN_UNIQUE_IDX_SQL,
     SCHEMA_MIGRATIONS_DDL_SQL,
+    STATES_MINUTE_DDL_SQL,
+    STATES_MINUTE_DIRTY_DDL_SQL,
+    STATES_MINUTE_DIRTY_DELETE_SQL,
+    STATES_MINUTE_ENTITIES_DDL_SQL,
+    STATES_MINUTE_ENTITIES_SELECT_SQL,
+    STATES_MINUTE_ENTITY_DELETE_SQL,
+    STATES_MINUTE_ENTITY_LOCK_SQL,
+    STATES_MINUTE_ENTITY_UPSERT_SQL,
+    STATES_MINUTE_HISTORY_DIRTY_SQL,
+    STATES_MINUTE_HYPERTABLE_SQL,
+    STATES_MINUTE_JOB_ADD_SQL,
+    STATES_MINUTE_JOB_DELETE_SQL,
+    STATES_MINUTE_JOB_ID_SQL,
+    STATES_MINUTE_JOB_PROC_SQL,
+    STATES_MINUTE_REFRESH_FN_SQL,
+    STATES_MINUTE_ROWS_DELETE_SQL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -120,10 +138,69 @@ def setup_scd2_constraints(conn: psycopg.Connection) -> None:
             _LOGGER.debug("Could not reset lock_timeout after SCD2 DDL", exc_info=True)
 
 
+def sync_minute_rollup(
+    conn: psycopg.Connection, entities: Sequence[Mapping[str, Any]],
+) -> None:
+    """Create the per-minute rollup (issue #45) and make its entity set match `entities`.
+
+    `entities` are DOMAIN_SCHEMA-validated minute_rollup entries. An entity that
+    is new, or whose hold values changed, loses its rows and gets its whole
+    history queued for the job; a removed one loses its rows. Unchanged entities
+    are not touched, so a restart costs a handful of statements.
+
+    The job exists only while some entity is configured.
+    """
+    with conn.cursor() as cur:
+        cur.execute(STATES_MINUTE_DDL_SQL)
+        cur.execute(STATES_MINUTE_HYPERTABLE_SQL)
+        cur.execute(STATES_MINUTE_ENTITIES_DDL_SQL)
+        cur.execute(STATES_MINUTE_DIRTY_DDL_SQL)
+        cur.execute(STATES_MINUTE_REFRESH_FN_SQL)
+        cur.execute(STATES_MINUTE_JOB_PROC_SQL)
+
+    wanted = {e["entity_id"]: (e["hold"], e.get("zero_hold")) for e in entities}
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute(STATES_MINUTE_ENTITIES_SELECT_SQL)
+        current = {eid: (hold, zero) for eid, hold, zero in cur.fetchall()}
+        # Row lock first: the job holds it while refreshing the entity, so its
+        # rows cannot be deleted under a refresh still using the old holds.
+        for eid in current.keys() - wanted.keys():
+            params = {"entity_id": eid}
+            cur.execute(STATES_MINUTE_ENTITY_LOCK_SQL, params)
+            cur.execute(STATES_MINUTE_ROWS_DELETE_SQL, params)
+            cur.execute(STATES_MINUTE_ENTITY_DELETE_SQL, params)  # cascades to dirty
+        for eid, (hold, zero_hold) in wanted.items():
+            if current.get(eid) == (hold, zero_hold):
+                continue
+            params = {"entity_id": eid, "hold": hold, "zero_hold": zero_hold}
+            cur.execute(STATES_MINUTE_ENTITY_LOCK_SQL, params)
+            cur.execute(STATES_MINUTE_ROWS_DELETE_SQL, params)
+            cur.execute(STATES_MINUTE_DIRTY_DELETE_SQL, params)
+            cur.execute(STATES_MINUTE_ENTITY_UPSERT_SQL, params)
+            cur.execute(STATES_MINUTE_HISTORY_DIRTY_SQL, params)
+        removed = sorted(current.keys() - wanted.keys())
+        refilled = sorted(e for e in wanted if current.get(e) != wanted[e])
+
+        cur.execute(STATES_MINUTE_JOB_ID_SQL)
+        job_ids = [row[0] for row in cur.fetchall()]
+        if wanted and not job_ids:
+            cur.execute(STATES_MINUTE_JOB_ADD_SQL)
+        elif not wanted:
+            for job_id in job_ids:
+                cur.execute(STATES_MINUTE_JOB_DELETE_SQL, (job_id,))
+
+    if removed or refilled:
+        _LOGGER.info(
+            "Minute rollup: removed %s; history queued for %s", removed or "none",
+            refilled or "none",
+        )
+
+
 def sync_setup_schema(
     conn: psycopg.Connection,
     chunk_interval_days: int = DEFAULT_CHUNK_INTERVAL_DAYS,
     compress_after_hours: int = DEFAULT_COMPRESS_AFTER_HOURS,
+    minute_rollup: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     """Create the hypertable and configure compression policy idempotently.
 
@@ -186,6 +263,16 @@ def sync_setup_schema(
     # Outside the cursor block above: each constraint is attempted on its own
     # cursor so one rejection cannot disturb the others (issue #17).
     setup_scd2_constraints(conn)
+
+    # Best-effort like the constraints: the rollup is derived data, and a
+    # failure here (e.g. a role not allowed to create jobs) must not keep states
+    # ingestion from starting. Connection trouble still propagates to the retry.
+    try:
+        sync_minute_rollup(conn, minute_rollup)
+    except psycopg.OperationalError:
+        raise
+    except psycopg.Error as exc:
+        _LOGGER.warning("Could not set up the per-minute rollup (states_minute): %s", exc)
 
     _LOGGER.debug(
         "Schema setup complete (chunk=%d days, compress_after=%d hours, schedule=%d hours)",

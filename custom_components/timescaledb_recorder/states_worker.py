@@ -20,6 +20,7 @@ import logging
 import queue
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, TYPE_CHECKING
@@ -42,6 +43,7 @@ from .const import (
     SELECT_ALL_KNOWN_ENTITIES_SQL,
     SELECT_WATERMARK_SQL,
     STATES_DEADLETTER_INSERT_SQL,
+    STATES_MINUTE_MARK_DIRTY_SQL,
 )
 from .issues import (
     clear_db_unreachable_issue,
@@ -102,6 +104,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
         compress_after_hours: int,
         stats: StatesWriteStats | None = None,
         schema_ready: threading.Event | None = None,
+        minute_rollup: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         super().__init__(daemon=True, name="timescaledb_states_worker")
         self._hass = hass
@@ -112,6 +115,11 @@ class TimescaledbStateRecorderThread(threading.Thread):
         self._stop_event = stop_event
         self._chunk_interval_days = chunk_interval_days
         self._compress_after_hours = compress_after_hours
+        self._minute_rollup = minute_rollup
+        self._rollup_entity_ids = frozenset(e["entity_id"] for e in minute_rollup)
+        # Earliest last_updated of a rollup entity's row written in the current
+        # backfill cycle; those rows land behind the rollup's frontier.
+        self._backfill_rollup_from: datetime | None = None
         self._conn: psycopg.Connection | None = None
         self.stats = stats if stats is not None else StatesWriteStats()
         self._schema_ready = schema_ready if schema_ready is not None else threading.Event()
@@ -192,6 +200,14 @@ class TimescaledbStateRecorderThread(threading.Thread):
             on_sustained_fail=self._sustained_fail_hook,
             on_poison=self._drop_row,
         )(self.db_calls.track(self._insert_row_raw))
+
+        # Derived data: a non-transient failure is logged and given up on
+        # rather than wedging the backfill-done transition.
+        self._mark_rollup_dirty = retry_until_success(
+            stop_event=stop_event,
+            on_transient=self.reset_db_connection,
+            on_poison=self._rollup_dirty_failed,
+        )(self.db_calls.track(self._mark_rollup_dirty_raw))
 
     @property
     def in_backfill(self) -> bool:
@@ -294,6 +310,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 conn,
                 chunk_interval_days=self._chunk_interval_days,
                 compress_after_hours=self._compress_after_hours,
+                minute_rollup=self._minute_rollup,
             )
 
     def run(self) -> None:
@@ -376,6 +393,10 @@ class TimescaledbStateRecorderThread(threading.Thread):
                         self._last_op = "flush_backfill_done"
                         self._flush(buffer)
                         buffer.clear()
+                    if self._backfill_rollup_from is not None:
+                        self._last_op = "mark_rollup_dirty"
+                        self._mark_rollup_dirty(self._backfill_rollup_from)
+                        self._backfill_rollup_from = None
                     mode = MODE_LIVE
                     self._last_mode = mode
                     last_flush = time.monotonic()
@@ -384,6 +405,7 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 # Writing is not waiting: a slow write is the in-flight check's job.
                 self.backfill_wait_since = None
                 rows = self._slice_to_rows(item)
+                self._note_rollup_rows(rows)
                 buffer.extend(rows)
                 self._last_op = "flush_backfill_chunk"
                 self._flush(buffer)
@@ -541,6 +563,26 @@ class TimescaledbStateRecorderThread(threading.Thread):
                 "this log: %s", self.name, row_data, exc_info=True,
             )
         self._hass.add_job(create_states_dropped_issue, self._hass)
+
+    def _note_rollup_rows(self, rows: list[StateRow]) -> None:
+        times = [r.last_updated for r in rows if r.entity_id in self._rollup_entity_ids]
+        if times:
+            earliest = min(times)
+            if self._backfill_rollup_from is None or earliest < self._backfill_rollup_from:
+                self._backfill_rollup_from = earliest
+
+    def _mark_rollup_dirty_raw(self, since: datetime) -> None:
+        """Queue rollup minutes from `since` through now for the states_minute job."""
+        conn = self.get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(STATES_MINUTE_MARK_DIRTY_SQL, {"from": since, "to": None})
+
+    def _rollup_dirty_failed(self, exc: Exception, since: datetime) -> None:
+        _LOGGER.warning(
+            "%s: could not queue states_minute recomputation from %s (%s); minutes "
+            "since then may lack the backfilled rows until the entity's rollup is rebuilt",
+            self.name, since.isoformat(), exc,
+        )
 
     def _slice_to_rows(self, slice_dict: dict[str, list[Any]]) -> list[StateRow]:
         """Merge per-entity lists, sort by last_updated, convert to StateRow (D-04-d)."""

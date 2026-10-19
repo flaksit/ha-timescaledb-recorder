@@ -9,6 +9,7 @@ A custom integration that writes Home Assistant entity state changes to a Timesc
 - Entity filtering matching recorder semantics — include/exclude by domain, entity ID, or glob
 - JSONB attributes column alongside the state value
 - Automatic hypertable creation and compression policy setup on first start
+- Optional per-minute time-weighted rollup of chosen numeric entities, for dashboards that integrate over months
 - HACS compatible
 
 ## Prerequisites
@@ -97,6 +98,28 @@ After editing `configuration.yaml`, call the reload service to apply the new fil
 **Settings → Developer tools → YAML → YAML configuration reloading → TimescaleDB Recorder**  
 This re-parses `configuration.yaml` and reloads the integration's config entry. A full HA restart also works but is not required.
 
+### Per-minute rollup
+
+Integrating power over months from raw samples is slow: a 1 Hz meter adds 2.6 M rows a month, and every dashboard load walks them all. List such entities under `minute_rollup` and the integration keeps their [time-weighted integral per minute](#per-minute-rollup-states_minute) in `states_minute`, filled by a TimescaleDB job inside the database.
+
+```yaml
+timescaledb_recorder:
+  minute_rollup:
+    - entity_id: sensor.electricity_meter_grid_power
+      hold: 300
+    - entity_id: sensor.water_heater_plug_power
+      hold: 120
+      zero_hold: "720:00:00"
+```
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `entity_id` | yes | A numeric entity |
+| `hold` | yes | How long a reading stays valid when no newer one arrives: seconds or `HH:MM:SS`. Longer silences count as no data. |
+| `zero_hold` | no | `hold` for a reading of exactly 0. Report-on-change devices go quiet while idle at zero, so their 0 stays true far longer than a non-zero reading they refresh every few seconds. |
+
+Adding an entity, or changing its holds, queues its whole history; the job works through it newest first, spending up to 20 s per run until done. Removing an entity deletes its rows. Apply changes with the reload service above.
+
 ## Schema
 
 The `states` table is created automatically on the first HA start after the integration is installed:
@@ -153,6 +176,35 @@ Consequences:
 The range join is not free. Measured over ~48 M rows: an entity-filtered 7-day query runs 99 ms (vs 57 ms for a current-row join), a broad 7-day aggregate 1.7 s (vs 442 ms). Use `states_numeric` when you don't need metadata.
 
 Views are recreated on every integration startup, so they survive a database rebuild or an app reinstall. Read-only roles inherit `SELECT` through the owner's default privileges; no manual `GRANT` is needed.
+
+### Per-minute rollup (`states_minute`)
+
+Created and maintained when [`minute_rollup`](#per-minute-rollup) lists entities:
+
+| Column | Meaning |
+|--------|---------|
+| `entity_id`, `minute` | The entity and the start of a closed UTC minute |
+| `integral` | ∫ value dt over the covered part of the minute (value × seconds) |
+| `covered_seconds` | Seconds of the minute a reading held for (0 < covered ≤ 60) |
+
+A reading holds until the next numeric reading, capped by `hold` (or `zero_hold` for a 0). Non-numeric states such as `unavailable` are skipped, not treated as an end. `integral / covered_seconds` is the mean of the covered part; `integral / 60` counts the uncovered rest as 0. Every minute with any coverage is stored, so choose a threshold on `covered_seconds` that suits the query.
+
+It is a hypertable filled by a job, not a continuous aggregate: a minute's value depends on the last reading *before* it, which a continuous aggregate bucket cannot see.
+
+The job runs every minute. It recomputes the last 15 minutes before each entity's frontier through the current minute (catching rows that arrived late), moves the frontier, then works through `states_minute_dirty` (history of newly added entities, and ranges the automatic backfill or `backfill_gaps.py` wrote behind the frontier). `states_minute_entities.filled_until` is the frontier: minutes before it are final. Compute minutes from there on from raw samples:
+
+```sql
+WITH f AS (SELECT filled_until FROM states_minute_entities
+           WHERE entity_id = 'sensor.electricity_meter_grid_power')
+SELECT minute, integral / 60 AS watts
+FROM states_minute, f
+WHERE entity_id = 'sensor.electricity_meter_grid_power'
+  AND minute >= now() - interval '30 days' AND minute < f.filled_until
+-- UNION ALL the live computation over [filled_until, now()) from states_numeric
+ORDER BY minute;
+```
+
+Job health: `SELECT * FROM timescaledb_information.job_stats WHERE job_id = (SELECT job_id FROM timescaledb_information.jobs WHERE proc_name = 'states_minute_job');` and `timescaledb_information.job_errors`.
 
 ## Querying
 
@@ -434,6 +486,8 @@ Optional arguments:
 | `--entities ENTITY_IDS` | all recorded | Comma-separated entity_ids to backfill; overrides the filter |
 | `--ha-config DIR` | `/config` | HA config directory holding `configuration.yaml` |
 | `--dry-run` | off | Show what would be inserted without writing |
+
+When it inserts rows, it also queues the affected minutes of the [per-minute rollup](#per-minute-rollup-states_minute) for recomputation.
 
 The script is safe to run while HA is active — SQLite is opened read-only and re-running is idempotent. Each bucket does a cheap `COUNT(*)` comparison first; buckets already in sync are skipped with no row fetches.
 

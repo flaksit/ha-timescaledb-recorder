@@ -1543,3 +1543,266 @@ CANONICALIZE_UPDATE_SQL: dict[str, LiteralString] = {
     )
     for table, _key in SCD2_DIMENSIONS
 }
+
+
+# ---- Per-minute rollup (issue #45) --------------------------------------------
+#
+# The time-weighted integral of each configured numeric entity per closed UTC
+# minute, so dashboards that integrate power over months read ~525k rows a year
+# instead of millions of raw samples.
+#
+# Not a continuous aggregate: a minute's value depends on the last sample
+# *before* the minute (carried in until the next sample), and a cagg bucket can
+# only see rows inside it. Window functions are not supported there either, and
+# timescaledb_toolkit's time_weight is not available on the target install. So
+# a plain hypertable, filled by a TimescaleDB job running inside the database —
+# it keeps working while HA restarts and needs no worker thread.
+#
+# Semantics, chosen to reproduce what dashboards computed from raw samples:
+# - Only numeric states count (states_numeric.value IS NOT NULL). A non-numeric
+#   state such as `unavailable` does not end the previous reading; `hold` does.
+# - A reading holds until the next numeric reading, but at most hold_seconds, or
+#   zero_hold_seconds when the reading is exactly 0. Report-on-change devices go
+#   quiet while idle at zero, so their 0 stays true far longer than a non-zero
+#   reading, which they refresh every few seconds.
+# - Every minute with any coverage is stored; readers pick their own threshold
+#   on covered_seconds. integral / covered_seconds is the mean of the covered
+#   part; integral / 60 treats the uncovered rest as 0.
+#
+# Freshness: states_minute_entities.filled_until is the frontier. Minutes before
+# it are final unless states_minute_dirty holds a range for them (history
+# backfill after a config change, or late rows from an HA backfill), which the
+# job works through newest first. Readers compute minutes from the frontier on
+# from raw samples.
+
+STATES_MINUTE_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS states_minute (
+    entity_id        TEXT             NOT NULL,
+    minute           TIMESTAMPTZ      NOT NULL,
+    integral         DOUBLE PRECISION NOT NULL,
+    covered_seconds  DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (entity_id, minute)
+);
+"""
+
+# ~90k rows a month for six entities: month chunks keep the chunk count low.
+# Not compressed: the job rewrites dirty ranges anywhere in history, and the
+# table is small (~53 MB a year for six entities).
+STATES_MINUTE_HYPERTABLE_SQL = """
+SELECT create_hypertable('states_minute', 'minute',
+    chunk_time_interval => interval '30 days', if_not_exists => TRUE);
+"""
+
+STATES_MINUTE_ENTITIES_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS states_minute_entities (
+    entity_id          TEXT        PRIMARY KEY,
+    hold_seconds       INTEGER     NOT NULL CHECK (hold_seconds > 0),
+    zero_hold_seconds  INTEGER     CHECK (zero_hold_seconds > 0),
+    filled_until       TIMESTAMPTZ
+);
+"""
+
+STATES_MINUTE_DIRTY_DDL_SQL = """
+CREATE TABLE IF NOT EXISTS states_minute_dirty (
+    id         BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    entity_id  TEXT        NOT NULL
+               REFERENCES states_minute_entities (entity_id) ON DELETE CASCADE,
+    from_ts    TIMESTAMPTZ NOT NULL,
+    to_ts      TIMESTAMPTZ NOT NULL
+);
+"""
+
+# Recompute minutes [p_from, p_to) of one entity: delete, then insert what the
+# samples give. Idempotent, so overlapping dirty ranges only cost time.
+#
+# The carry-in is the last numeric reading before the range, looked up by index
+# within the longest hold; older readings cannot reach the range. p_to is capped
+# at the current minute so an open minute is never written.
+#
+# Locks the entity's config row, so a config sync (which updates that row)
+# cannot interleave with a refresh computed from the old hold values.
+STATES_MINUTE_REFRESH_FN_SQL = """
+CREATE OR REPLACE FUNCTION states_minute_refresh(
+    p_entity_id TEXT, p_from TIMESTAMPTZ, p_to TIMESTAMPTZ)
+RETURNS INTEGER LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_hold      INTEGER;
+    v_zero_hold INTEGER;
+    v_from      TIMESTAMPTZ := date_trunc('minute', p_from);
+    v_to        TIMESTAMPTZ := LEAST(date_trunc('minute', p_to),
+                                     date_trunc('minute', clock_timestamp()));
+    v_rows      INTEGER;
+BEGIN
+    SELECT hold_seconds, zero_hold_seconds INTO v_hold, v_zero_hold
+    FROM states_minute_entities WHERE entity_id = p_entity_id FOR UPDATE;
+    IF NOT FOUND OR v_to <= v_from THEN
+        RETURN 0;
+    END IF;
+
+    DELETE FROM states_minute
+    WHERE entity_id = p_entity_id AND minute >= v_from AND minute < v_to;
+
+    INSERT INTO states_minute (entity_id, minute, integral, covered_seconds)
+    WITH pts AS (
+        (SELECT last_updated AS t0, value
+         FROM states_numeric
+         WHERE entity_id = p_entity_id
+           AND last_updated < v_from
+           AND last_updated >= v_from - make_interval(
+                   secs => GREATEST(v_hold, COALESCE(v_zero_hold, 0)))
+           AND value IS NOT NULL
+         ORDER BY last_updated DESC
+         LIMIT 1)
+        UNION ALL
+        SELECT last_updated, value
+        FROM states_numeric
+        WHERE entity_id = p_entity_id
+          AND last_updated >= v_from AND last_updated < v_to
+          AND value IS NOT NULL
+    ),
+    seg AS (
+        SELECT t0, value,
+               LEAST(COALESCE(LEAD(t0) OVER (ORDER BY t0), v_to),
+                     t0 + make_interval(secs => CASE
+                         WHEN value = 0 AND v_zero_hold IS NOT NULL THEN v_zero_hold
+                         ELSE v_hold END),
+                     v_to) AS t1
+        FROM pts
+    ),
+    sliced AS (
+        SELECT gs AS minute, seg.value,
+               EXTRACT(epoch FROM LEAST(seg.t1, gs + interval '1 minute')
+                                  - GREATEST(seg.t0, gs)) AS secs
+        FROM seg,
+             LATERAL generate_series(GREATEST(date_trunc('minute', seg.t0), v_from),
+                                     date_trunc('minute', seg.t1 - interval '1 microsecond'),
+                                     interval '1 minute') gs
+        WHERE seg.t1 > seg.t0
+    )
+    SELECT p_entity_id, minute, SUM(value * secs)::double precision,
+           SUM(secs)::double precision
+    FROM sliced
+    GROUP BY minute
+    HAVING SUM(secs) > 0;
+
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    RETURN v_rows;
+END
+$fn$;
+"""
+
+# The job. Each run, with COMMIT after every unit so a long run holds no locks
+# and loses nothing when interrupted:
+# 1. Tail: recompute the last `lookback` before each entity's frontier through
+#    the current minute, then move the frontier. Recomputing the lookback picks
+#    up rows that arrived late (flush interval, short reconnects). A frontier
+#    more than a day behind (job paused, database down) recomputes only the last
+#    day here and queues the rest as dirty, so one run stays bounded.
+# 2. Dirty ranges, newest first, one day per unit, until `budget` is spent
+#    (at least one unit per run, so a tiny budget still makes progress).
+#    Newest first so recent dashboards are right soonest after a config change.
+STATES_MINUTE_JOB_PROC_SQL = """
+CREATE OR REPLACE PROCEDURE states_minute_job(job_id INTEGER, config JSONB)
+LANGUAGE plpgsql AS $proc$
+DECLARE
+    v_lookback INTERVAL := COALESCE((config->>'lookback')::interval, interval '15 minutes');
+    v_budget   INTERVAL := COALESCE((config->>'budget')::interval, interval '20 seconds');
+    v_started  TIMESTAMPTZ := clock_timestamp();
+    v_end      TIMESTAMPTZ := date_trunc('minute', clock_timestamp());
+    v_ids      TEXT[];
+    v_id       TEXT;
+    v_frontier TIMESTAMPTZ;
+    v_from     TIMESTAMPTZ;
+    d          RECORD;
+BEGIN
+    SELECT array_agg(entity_id ORDER BY entity_id) INTO v_ids FROM states_minute_entities;
+
+    FOREACH v_id IN ARRAY COALESCE(v_ids, ARRAY[]::TEXT[]) LOOP
+        SELECT filled_until INTO v_frontier
+        FROM states_minute_entities WHERE entity_id = v_id;
+        IF FOUND THEN
+            v_from := COALESCE(v_frontier, v_end) - v_lookback;
+            IF v_from < v_end - interval '1 day' THEN
+                INSERT INTO states_minute_dirty (entity_id, from_ts, to_ts)
+                VALUES (v_id, v_from, v_end - interval '1 day');
+                v_from := v_end - interval '1 day';
+            END IF;
+            PERFORM states_minute_refresh(v_id, v_from, v_end);
+            UPDATE states_minute_entities SET filled_until = v_end WHERE entity_id = v_id;
+        END IF;
+        COMMIT;
+    END LOOP;
+
+    LOOP
+        SELECT id, entity_id, from_ts, to_ts INTO d
+        FROM states_minute_dirty ORDER BY to_ts DESC, id LIMIT 1;
+        EXIT WHEN NOT FOUND;
+        v_from := GREATEST(d.from_ts, d.to_ts - interval '1 day');
+        PERFORM states_minute_refresh(d.entity_id, v_from, d.to_ts);
+        IF v_from <= d.from_ts THEN
+            DELETE FROM states_minute_dirty WHERE id = d.id;
+        ELSE
+            UPDATE states_minute_dirty SET to_ts = v_from WHERE id = d.id;
+        END IF;
+        COMMIT;
+        EXIT WHEN clock_timestamp() - v_started > v_budget;
+    END LOOP;
+END
+$proc$;
+"""
+
+STATES_MINUTE_JOB_INTERVAL = "1 minute"
+
+# add_job has no if_not_exists; the job is matched by procedure name.
+STATES_MINUTE_JOB_ID_SQL = """
+SELECT job_id FROM timescaledb_information.jobs
+WHERE proc_name = 'states_minute_job' AND proc_schema = current_schema();
+"""
+STATES_MINUTE_JOB_ADD_SQL = f"""
+SELECT add_job('states_minute_job', interval '{STATES_MINUTE_JOB_INTERVAL}');
+"""
+STATES_MINUTE_JOB_DELETE_SQL = "SELECT delete_job(%s);"
+
+# Config sync (schema.sync_minute_rollup). %(...)s parameters.
+STATES_MINUTE_ENTITIES_SELECT_SQL = """
+SELECT entity_id, hold_seconds, zero_hold_seconds FROM states_minute_entities;
+"""
+STATES_MINUTE_ENTITY_LOCK_SQL = """
+SELECT 1 FROM states_minute_entities WHERE entity_id = %(entity_id)s FOR UPDATE;
+"""
+STATES_MINUTE_ROWS_DELETE_SQL = "DELETE FROM states_minute WHERE entity_id = %(entity_id)s;"
+STATES_MINUTE_ENTITY_DELETE_SQL = (
+    "DELETE FROM states_minute_entities WHERE entity_id = %(entity_id)s;"
+)
+# filled_until NULL: the next job run starts the tail at "now - lookback".
+STATES_MINUTE_ENTITY_UPSERT_SQL = """
+INSERT INTO states_minute_entities (entity_id, hold_seconds, zero_hold_seconds, filled_until)
+VALUES (%(entity_id)s, %(hold)s, %(zero_hold)s, NULL)
+ON CONFLICT (entity_id) DO UPDATE
+    SET hold_seconds = EXCLUDED.hold_seconds,
+        zero_hold_seconds = EXCLUDED.zero_hold_seconds,
+        filled_until = NULL;
+"""
+STATES_MINUTE_DIRTY_DELETE_SQL = (
+    "DELETE FROM states_minute_dirty WHERE entity_id = %(entity_id)s;"
+)
+# Queues the entity's whole history. min() reads one end of each chunk's index.
+STATES_MINUTE_HISTORY_DIRTY_SQL = """
+INSERT INTO states_minute_dirty (entity_id, from_ts, to_ts)
+SELECT %(entity_id)s, first_ts, now()
+FROM (SELECT min(last_updated) AS first_ts FROM states
+      WHERE entity_id = %(entity_id)s) f
+WHERE first_ts IS NOT NULL;
+"""
+
+# Rows written behind the frontier (HA backfill, backfill_gaps.py) change the
+# minutes from the earliest of them on. A reading reaches at most its hold past
+# the newest row, so the range ends there; NULL %(to)s means "through now".
+STATES_MINUTE_MARK_DIRTY_SQL = """
+INSERT INTO states_minute_dirty (entity_id, from_ts, to_ts)
+SELECT entity_id, %(from)s,
+       LEAST(now(), COALESCE(%(to)s::timestamptz + make_interval(
+           secs => GREATEST(hold_seconds, COALESCE(zero_hold_seconds, 0))), now()))
+FROM states_minute_entities
+WHERE filled_until IS NOT NULL AND %(from)s::timestamptz < filled_until;
+"""

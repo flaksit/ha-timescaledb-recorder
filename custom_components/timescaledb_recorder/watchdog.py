@@ -82,6 +82,7 @@ def spawn_states_worker(
         compress_after_hours=runtime.compress_after_hours,
         stats=runtime.states_stats,
         schema_ready=runtime.schema_ready,
+        minute_rollup=runtime.minute_rollup,
     )
 
 

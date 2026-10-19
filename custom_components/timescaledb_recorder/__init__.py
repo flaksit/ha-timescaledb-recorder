@@ -50,7 +50,7 @@ from .const import (
     PLATFORMS,
     SIGNAL_OVERFLOW_CHANGE,
 )
-from .entity_filter import FILTER_SCHEMA, build_entity_filter
+from .entity_filter import DOMAIN_SCHEMA, build_entity_filter
 from .state_listener import StateListener
 from .issues import (
     clear_recorder_disabled_issue,
@@ -72,27 +72,27 @@ _LOGGER = logging.getLogger(__name__)
 # HA validates the full configuration.yaml against every component's schema.
 CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: FILTER_SCHEMA,
+        DOMAIN: DOMAIN_SCHEMA,
     },
     extra=probatio.ALLOW_EXTRA,
 )
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Store YAML filter config in hass.data before config entries are set up.
+    """Store the YAML section (filter, minute rollup) in hass.data before entries are set up.
 
     HA guarantees async_setup runs before any async_setup_entry call for this
-    domain, so the filter dict is always present in hass.data by the time
-    _get_entity_filter reads it during entry setup.
+    domain, so the dict is always present in hass.data by the time entry setup
+    reads it.
     """
     domain_config = config.get(DOMAIN, {})
-    hass.data.setdefault(DOMAIN, {})["filter"] = domain_config
+    hass.data.setdefault(DOMAIN, {})["yaml"] = domain_config
 
     async def _async_reload_filter(call) -> None:
         # Re-parse configuration.yaml and reload all config entries so the new
-        # filter takes effect without a full HA restart.
+        # filter and rollup entities take effect without a full HA restart.
         fresh = await async_integration_yaml_config(hass, DOMAIN)
-        hass.data.setdefault(DOMAIN, {})["filter"] = (fresh or {}).get(DOMAIN, {})
+        hass.data.setdefault(DOMAIN, {})["yaml"] = (fresh or {}).get(DOMAIN, {})
         for entry in hass.config_entries.async_entries(DOMAIN):
             await hass.config_entries.async_reload(entry.entry_id)
 
@@ -138,6 +138,8 @@ class TimescaledbRecorderData:
     chunk_interval_days: int                # TimescaleDB chunk interval
     compress_after_hours: int               # TimescaleDB compression policy
     entity_filter: Callable[[str], bool]    # entity filter for orchestrator relaunch kwargs
+    # DOMAIN_SCHEMA-validated minute_rollup entries from configuration.yaml.
+    minute_rollup: list[dict[str, Any]] = field(default_factory=list)
     # Shared with every states worker incarnation so "last write" survives a respawn.
     states_stats: StatesWriteStats = field(default_factory=StatesWriteStats)
     # Set once by the first states worker to finish schema setup, never
@@ -156,7 +158,7 @@ def _get_entity_filter(hass: HomeAssistant, entry):
     is now the authoritative source, stored by async_setup before this runs.
     Falls back to pass-all when no YAML filter is configured.
     """
-    return build_entity_filter(hass.data.get(DOMAIN, {}).get("filter", {}))
+    return build_entity_filter(hass.data.get(DOMAIN, {}).get("yaml", {}))
 
 
 async def _overflow_watcher(
@@ -332,6 +334,7 @@ async def async_setup_entry(
         chunk_interval_days=chunk_interval_days,
         compress_after_hours=compress_after_hours,
         entity_filter=entity_filter,
+        minute_rollup=hass.data.get(DOMAIN, {}).get("yaml", {}).get("minute_rollup", []),
     )
 
     # D-12 step 2: start meta worker via factory — same path watchdog uses for respawn.

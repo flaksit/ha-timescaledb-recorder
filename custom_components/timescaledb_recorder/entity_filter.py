@@ -1,8 +1,9 @@
-"""YAML include/exclude filter: schema and the predicate built from it.
+"""YAML schema of the integration's section, and the entity filter built from it.
 
 Kept free of integration imports so backfill_gaps.py, which runs as a plain
 script inside the HA container, applies exactly the filter the integration does.
 """
+from datetime import timedelta
 from typing import Any
 
 import probatio
@@ -24,6 +25,33 @@ FILTER_SCHEMA_INNER = probatio.Schema({
 FILTER_SCHEMA = probatio.Schema({
     probatio.Optional("include"): FILTER_SCHEMA_INNER,
     probatio.Optional("exclude"): FILTER_SCHEMA_INNER,
+})
+
+
+def _whole_seconds(value: timedelta) -> int:
+    seconds = int(value.total_seconds())
+    if seconds < 1:
+        raise probatio.Invalid("must be at least 1 second")
+    return seconds
+
+
+def _unique_entities(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ids = [e["entity_id"] for e in entries]
+    if dupes := sorted({i for i in ids if ids.count(i) > 1}):
+        raise probatio.Invalid(f"entities listed more than once: {', '.join(dupes)}")
+    return entries
+
+
+# Entities kept in states_minute (issue #45). hold / zero_hold become integer
+# seconds; their meaning is documented at STATES_MINUTE_DDL_SQL in const.py.
+MINUTE_ROLLUP_ENTITY_SCHEMA = probatio.Schema({
+    probatio.Required("entity_id"): cv.entity_id,
+    probatio.Required("hold"): probatio.All(cv.positive_time_period, _whole_seconds),
+    probatio.Optional("zero_hold"): probatio.All(cv.positive_time_period, _whole_seconds),
+})
+
+DOMAIN_SCHEMA = FILTER_SCHEMA.extend({
+    probatio.Optional("minute_rollup"): probatio.All([MINUTE_ROLLUP_ENTITY_SCHEMA], _unique_entities),
 })
 
 

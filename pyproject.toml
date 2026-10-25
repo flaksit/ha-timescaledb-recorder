@@ -17,7 +17,7 @@ dev = [
     "psycopg[binary]==3.3.6",
     "pytest>=9.0",
     "pytest-asyncio>=0.24",
-    "pytest-homeassistant-custom-component==0.13.372",
+    "pytest-homeassistant-custom-component==0.13.375",
 ]
 
 [tool.basedpyright]
